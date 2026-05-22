@@ -68,7 +68,7 @@ type dbSink struct {
 func (s *dbSink) Record(ev Event) error {
 	tool := store.Tool(ev.Tool)
 	switch tool {
-	case store.ToolClaude, store.ToolCursor, store.ToolCodex, store.ToolCopilot, store.ToolHuman:
+	case store.ToolClaude, store.ToolCursor, store.ToolCodex, store.ToolCopilot, store.ToolHuman, store.ToolCopyPaste:
 	default:
 		return fmt.Errorf("watcher sink: unknown tool %q", ev.Tool)
 	}

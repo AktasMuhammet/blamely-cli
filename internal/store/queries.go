@@ -9,11 +9,17 @@ import (
 type Tool string
 
 const (
-	ToolClaude  Tool = "claude"
-	ToolCursor  Tool = "cursor"
-	ToolCodex   Tool = "codex"
-	ToolCopilot Tool = "copilot"
-	ToolHuman   Tool = "human"
+	ToolClaude    Tool = "claude"
+	ToolCursor    Tool = "cursor"
+	ToolCodex     Tool = "codex"
+	ToolCopilot   Tool = "copilot"
+	ToolHuman     Tool = "human"
+	// ToolCopyPaste marks content that arrived via a clipboard paste rather
+	// than being typed. We don't claim AI origin — the source could be a
+	// web AI chat, another project, Stack Overflow, etc. The signal is
+	// "this code was pasted, not typed", which is itself useful in reports
+	// and stops blamely from confidently labelling pasted code as human-typed.
+	ToolCopyPaste Tool = "copypaste"
 )
 
 type Confidence string
@@ -181,6 +187,66 @@ func (db *DB) linesForEdit(editID int64) ([]EditLine, error) {
 		out = append(out, ln)
 	}
 	return out, rows.Err()
+}
+
+// LatestCopilotModelNear returns the model string from the most recent
+// copilot row whose timestamp falls inside [ts-window, ts+window] AND that
+// has a non-null model. Returns "" when no such row exists. Used by the
+// HumanEditWatcher so an in-editor paste that we attribute to Copilot can
+// be tagged with the model the user actually had selected in the chat
+// panel (recorded by CopilotChatWatcher's session-file parse).
+func (db *DB) LatestCopilotModelNear(tsNanos, windowNanos int64) string {
+	row := db.QueryRow(`SELECT model FROM edits
+		WHERE tool='copilot' AND model IS NOT NULL AND model != ''
+		  AND ts >= ? AND ts <= ?
+		ORDER BY ts DESC LIMIT 1`,
+		tsNanos-windowNanos, tsNanos+windowNanos)
+	var model sql.NullString
+	if err := row.Scan(&model); err != nil {
+		return ""
+	}
+	if !model.Valid {
+		return ""
+	}
+	return model.String
+}
+
+// LatestCopilotGenTypeNear returns the gen_type to attribute a file change
+// to when Copilot is active in the [ts-window, ts+window] interval.
+//
+// Resolution order:
+//   1. If ANY chat marker exists in the window, return "chat". Chat is the
+//      more specific signal — it requires either a chat-session JSONL
+//      response chunk or a Copilot extension log line with "chat" in it,
+//      neither of which fire for an inline Tab accept.
+//   2. Otherwise return the gen_type of the most recent specific marker
+//      (skipping "unknown" rows from the globalStorage-only signal).
+//   3. Returns "" when no row matches; callers default accordingly
+//      (humanedit treats "" as "completion" since inline Tab is the
+//      common case when no more-specific signal exists).
+func (db *DB) LatestCopilotGenTypeNear(tsNanos, windowNanos int64) string {
+	from, to := tsNanos-windowNanos, tsNanos+windowNanos
+	// Step 1: chat-preferred.
+	row := db.QueryRow(`SELECT 1 FROM edits
+		WHERE tool='copilot' AND gen_type='chat' AND ts >= ? AND ts <= ?
+		LIMIT 1`, from, to)
+	var dummy int
+	if err := row.Scan(&dummy); err == nil {
+		return "chat"
+	}
+	// Step 2: latest specific marker.
+	row = db.QueryRow(`SELECT gen_type FROM edits
+		WHERE tool='copilot' AND gen_type IS NOT NULL AND gen_type != '' AND gen_type != 'unknown'
+		  AND ts >= ? AND ts <= ?
+		ORDER BY ts DESC LIMIT 1`, from, to)
+	var gt sql.NullString
+	if err := row.Scan(&gt); err != nil {
+		return ""
+	}
+	if !gt.Valid {
+		return ""
+	}
+	return gt.String
 }
 
 // HasCopilotSessionNear returns true when at least one copilot session-active

@@ -62,6 +62,8 @@ func cmdDaemon() *cobra.Command {
 				&tools.CursorWatcher{},
 				&tools.CursorLogWatcher{},
 				&tools.CopilotWatcher{},
+				&tools.CopilotChatWatcher{},
+				&tools.CopilotLogWatcher{},
 			}
 			// DB-backed watchers go through the factory hook so daemon doesn't
 			// import the tools package directly.

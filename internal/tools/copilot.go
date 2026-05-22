@@ -97,8 +97,13 @@ func (c *CopilotWatcher) scan(root string, lastMtime map[string]time.Time, sink 
 			When:       mt,
 			Tool:       "copilot",
 			Confidence: "low",
-			GenType:    "chat", // storage-touch = Copilot Chat panel session
-			RawMeta:    `{"source":"copilot_storage_touch"}`,
+			// globalStorage mutates for BOTH inline-completion accepts
+			// and chat-panel activity (and background telemetry). The
+			// chat-session JSONL watcher and the log watcher emit more
+			// specific gen_types; this baseline signal stays "unknown"
+			// so it doesn't outvote them in the latest-marker lookup.
+			GenType: "unknown",
+			RawMeta: `{"source":"copilot_storage_touch"}`,
 		}
 		if err := sink.Record(ev); err != nil {
 			log.Printf("copilot sink: %v", err)

@@ -37,7 +37,19 @@ func RenderBar(w io.Writer, note *gitnotes.Note, width int) {
 
 	if total == 0 {
 		if del == 0 {
-			fmt.Fprintln(w, "AI vs Human: (no changes)")
+			// Empty-commit (or note with no attributable lines): keep the
+			// visual layout consistent with the populated case by rendering
+			// the bar shape — an all-dim track — alongside the label, so
+			// the output column doesn't collapse to a single line of text.
+			label := "AI vs Human: (no changes)"
+			var bar string
+			if color {
+				bar = ansiDim + strings.Repeat("░", width) + ansiReset
+				label = ansiDim + label + ansiReset
+			} else {
+				bar = strings.Repeat("-", width)
+			}
+			fmt.Fprintf(w, "%s  [%s]\n", label, bar)
 			return
 		}
 		// Deletion-only commit. We don't currently attribute deletions per-line,

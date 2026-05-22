@@ -104,7 +104,6 @@ type LineEntry struct {
 	Model      *string `json:"model,omitempty"`
 	GenType    *string `json:"gen_type,omitempty"`
 	Tokens     *Tokens `json:"tokens,omitempty"`
-	EditID     *int64  `json:"edit_id,omitempty"`
 }
 
 // AttributeAndWrite is the main entry point invoked by the post-commit hook.
@@ -263,6 +262,24 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		}
 	}
 
+	// Copilot model back-fill: some Copilot rows arrive without a model
+	// (the log watcher tails extension logs and can't extract the model
+	// from a log line; only the chat-session JSONL parser knows it). When
+	// the chat-session watcher recorded the model on a separate marker,
+	// fold it into the resolved copilot lines so the commit note carries
+	// it. We use a wider window than the fold-in because the model is
+	// selected once at the start of a chat session and applies to every
+	// edit that comes out of it — 30 minutes covers a long session.
+	const copilotModelWindowNanos = int64(30 * 60 * 1e9)
+	copilotModelBackfill := db.LatestCopilotModelNear(commitNanos, copilotModelWindowNanos)
+	if copilotModelBackfill != "" {
+		for i := range resolved {
+			if resolved[i].tool == store.ToolCopilot && resolved[i].model == "" {
+				resolved[i].model = copilotModelBackfill
+			}
+		}
+	}
+
 	sort.Slice(resolved, func(i, j int) bool {
 		if resolved[i].file != resolved[j].file {
 			return resolved[i].file < resolved[j].file
@@ -375,10 +392,8 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		}
 
 		var tokensForLine *Tokens
-		var editIDForLine *int64
 		if p.edit != nil {
 			editID := p.edit.ID
-			editIDForLine = &editID
 			if !seenEditTokens[editID] {
 				seenEditTokens[editID] = true
 				if hasUsage(p.edit) {
@@ -414,7 +429,6 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			Tool:       string(p.tool),
 			Model:      strPtr(p.model),
 			Tokens:     tokensForLine,
-			EditID:     editIDForLine,
 		}
 		if gt := string(p.genType); gt != "" && gt != string(store.GenTypeUnknown) {
 			entry.GenType = strPtr(gt)
@@ -441,7 +455,15 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		if emitted[path] || renamedFrom[path] || len(delLines) == 0 {
 			continue
 		}
-		fe := FileEntry{Path: path, Deleted: len(delLines)}
+		// Surface the file-level kind so reports can render `[DELETED]`
+		// next to the path. Fall back to "DELETED" when the diff parser
+		// didn't put the file in fileChanges (defensive — diff sections
+		// for removed files normally do).
+		kind := fileChanges[path]
+		if kind == "" {
+			kind = FileDeleted
+		}
+		fe := FileEntry{Path: path, Type: string(kind), Deleted: len(delLines)}
 		for _, n := range delLines {
 			fe.Lines = append(fe.Lines, LineEntry{Line: n, Type: "delete"})
 		}
@@ -482,9 +504,9 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			Lines: a.lines,
 			Model: strPtr(a.model),
 		}
-		// suggested/accepted are AI-only metrics; the human edit row doesn't
-		// have a "model proposal" to compare against.
-		if tool != store.ToolHuman {
+		// suggested/accepted are AI-only metrics. Neither typed-by-user nor
+		// clipboard-paste lines have a "model proposal" to compare against.
+		if !isNonAITool(tool) {
 			t.AcceptedLines = a.lines
 			t.SuggestedLines = suggestedPerTool[tool]
 		}
@@ -493,7 +515,11 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			t.Tokens = &tk
 		}
 		note.ByTool[string(tool)] = t
-		if tool == store.ToolHuman {
+		// Binary AI-vs-Human bar: tool=copypaste lands on the Human side
+		// because we can't prove the clipboard content came from an AI.
+		// It still shows up distinctly in by_tool above so reports can
+		// surface the "pasted, not typed" breakdown.
+		if isNonAITool(tool) {
 			note.Totals.HumanLines += a.lines
 		} else {
 			note.Totals.AILines += a.lines
@@ -521,8 +547,8 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 
 	// Populate by_gen_type from the resolved per-line data.
 	for _, p := range resolved {
-		if p.tool == store.ToolHuman {
-			continue // human lines don't count toward AI gen_type
+		if isNonAITool(p.tool) {
+			continue // human-typed and pasted lines aren't AI gen_type
 		}
 		switch p.genType {
 		case store.GenTypeChat:
@@ -614,15 +640,25 @@ func strPtr(s string) *string {
 
 // authorTypeFor maps an internal tool identifier to the binary author bucket
 // rendered in the note's per-line entries. Deletions (Tool == "") return "".
+// `copypaste` rolls up to "Human" because we can't prove the clipboard
+// source was an AI; the distinct tool name in by_tool keeps the nuance.
 func authorTypeFor(t store.Tool) string {
 	switch t {
 	case "":
 		return ""
-	case store.ToolHuman:
+	case store.ToolHuman, store.ToolCopyPaste:
 		return "Human"
 	default:
 		return "AI"
 	}
+}
+
+// isNonAITool returns true for tool identifiers that should NOT count toward
+// the AI side of the binary AI-vs-Human bar (and shouldn't get
+// suggested/accepted-line metrics). Currently: typed-by-user lines and
+// clipboard-paste lines of unknown origin.
+func isNonAITool(t store.Tool) bool {
+	return t == store.ToolHuman || t == store.ToolCopyPaste
 }
 func equalStrPtr(a, b *string) bool {
 	if a == nil || b == nil {
