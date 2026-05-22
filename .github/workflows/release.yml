@@ -151,8 +151,11 @@ jobs:
           dir="dist/blamely_${{ steps.tag.outputs.tag }}_${{ matrix.goos }}_${{ matrix.goarch }}"
           case "${{ matrix.goos }}" in
             windows)
+              # `zip` isn't shipped with Git Bash on windows-latest runners.
+              # `7z` is preinstalled and produces a standard .zip when invoked
+              # with `a -tzip`. -bd silences progress; -mx=9 = max deflate.
               archive="${dir}.zip"
-              (cd dist && zip -qr "$(basename "$archive")" "$(basename "$dir")")
+              (cd dist && 7z a -tzip -mx=9 -bd "$(basename "$archive")" "$(basename "$dir")" >/dev/null)
               ;;
             *)
               archive="${dir}.tar.gz"
