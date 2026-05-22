@@ -25,8 +25,7 @@ func claudeSettingsAt(t *testing.T, path string) map[string]any {
 // with the given JSON content (empty string = no settings.json).
 func setupFakeHome(t *testing.T, content string) string {
 	t.Helper()
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := fakeHomeDir(t)
 	claudeDir := filepath.Join(home, ".claude")
 	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
 		t.Fatal(err)

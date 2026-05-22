@@ -3,14 +3,17 @@ package install
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
 
 func setupFakeShellHome(t *testing.T, shell string) string {
 	t.Helper()
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	if runtime.GOOS == "windows" {
+		t.Skip("PATH auto-install is not supported on Windows")
+	}
+	home := fakeHomeDir(t)
 	t.Setenv("SHELL", shell)
 	return home
 }

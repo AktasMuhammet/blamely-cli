@@ -8,8 +8,7 @@ import (
 
 func setupFakeCodexHome(t *testing.T, content string) string {
 	t.Helper()
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := fakeHomeDir(t)
 	dir := filepath.Join(home, ".codex")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)

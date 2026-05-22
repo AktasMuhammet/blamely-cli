@@ -9,8 +9,7 @@ import (
 
 func setupFakeCopilotHome(t *testing.T, content string) string {
 	t.Helper()
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := fakeHomeDir(t)
 	hooksDir := filepath.Join(home, ".copilot", "hooks")
 	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
 		t.Fatal(err)
