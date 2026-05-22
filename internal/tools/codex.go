@@ -1,0 +1,467 @@
+package tools
+
+import (
+	"bufio"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/blamely/blamely/internal/config"
+	"github.com/blamely/blamely/internal/daemon"
+	"github.com/blamely/blamely/internal/gitutil"
+)
+
+// CodexWatcher tails ~/.codex/sessions/*.jsonl and emits attribution events
+// for every `apply_patch`-style file mutation. It also captures `model` and
+// token usage from the surrounding response events.
+//
+// The session log format is tolerant — Codex CLI versions vary the exact
+// event shape. We extract from any JSON line that:
+//   - contains a `model` field at the top level or under `.message.model`, OR
+//   - is a tool/function call whose name contains "apply_patch" or "patch", OR
+//   - has a `usage` block alongside any of the above.
+type CodexWatcher struct {
+	// SessionsDir overrides the default ~/.codex/sessions location for tests.
+	SessionsDir string
+}
+
+func (c *CodexWatcher) Name() string { return "codex" }
+
+func (c *CodexWatcher) Run(ctx context.Context, sink daemon.Sink) error {
+	dir := c.SessionsDir
+	if dir == "" {
+		var err error
+		dir, err = config.CodexSessionsDir()
+		if err != nil {
+			return err
+		}
+	}
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		// Wait for the directory to appear (Codex may not be installed yet).
+		log.Printf("codex: %s not found, will poll", dir)
+	}
+
+	tailers := map[string]context.CancelFunc{}
+	defer func() {
+		for _, cancel := range tailers {
+			cancel()
+		}
+	}()
+
+	tick := time.NewTicker(2 * time.Second)
+	defer tick.Stop()
+
+	for {
+		entries, _ := os.ReadDir(dir)
+		seen := map[string]bool{}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+				continue
+			}
+			path := filepath.Join(dir, e.Name())
+			seen[path] = true
+			if _, running := tailers[path]; running {
+				continue
+			}
+			tCtx, cancel := context.WithCancel(ctx)
+			tailers[path] = cancel
+			go func(p string) {
+				if err := tailCodexSession(tCtx, p, sink); err != nil && tCtx.Err() == nil {
+					log.Printf("codex tail %s: %v", p, err)
+				}
+			}(path)
+		}
+		// Stop tailers whose files were rotated/deleted.
+		for path, cancel := range tailers {
+			if !seen[path] {
+				cancel()
+				delete(tailers, path)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-tick.C:
+		}
+	}
+}
+
+// tailCodexSession streams new JSONL events from `path` and emits an Event
+// for every detected file mutation. Carries forward the latest seen model
+// and usage block so apply_patch calls inherit them.
+func tailCodexSession(ctx context.Context, path string, sink daemon.Sink) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open: %w", err)
+	}
+	defer f.Close()
+
+	// On startup we replay the file from the beginning so we don't miss edits
+	// that happened before the daemon started. Production deployments could
+	// also stash a per-file offset in the DB, but v1 keeps it simple.
+	reader := bufio.NewReaderSize(f, 1<<16)
+
+	state := &codexState{sink: sink}
+	// Drain any patches we buffered without seeing a closing `response.complete`
+	// (file rotated / daemon shutting down). Better to have token-less rows
+	// than to lose the attribution.
+	defer state.flush(0, 0, 0, 0, false)
+
+	for {
+		line, err := readLineGrowing(ctx, reader, f)
+		if err != nil {
+			if errors.Is(err, io.EOF) || ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		if len(line) == 0 || line[0] != '{' {
+			continue
+		}
+		processCodexLine(line, state)
+	}
+}
+
+// codexState carries the latest-known model and a buffer of events that
+// have been built from `apply_patch` calls but haven't yet been told the
+// final token usage. In OpenAI-style sessions, `usage` is emitted in
+// `response.complete` AFTER the function calls — so we buffer and flush
+// when usage arrives (or on shutdown).
+type codexState struct {
+	model   string
+	pending []daemon.Event
+	sink    daemon.Sink
+}
+
+// flush sets token fields (if provided) on every pending event and writes
+// them to the sink. Resets the buffer.
+func (s *codexState) flush(input, output, cacheRead, cacheWrite int64, hasTokens bool) {
+	for _, ev := range s.pending {
+		if hasTokens {
+			in, out, cr, cw := input, output, cacheRead, cacheWrite
+			ev.InputTokens = &in
+			ev.OutputTokens = &out
+			ev.CacheReadTokens = &cr
+			ev.CacheWriteTokens = &cw
+		}
+		if err := s.sink.Record(ev); err != nil {
+			log.Printf("codex sink: %v", err)
+		}
+	}
+	s.pending = nil
+}
+
+// codexLine accepts any plausible Codex CLI event shape and extracts the
+// fields we care about. Extra fields are ignored.
+type codexLine struct {
+	Type      string          `json:"type"`
+	Model     string          `json:"model"`
+	Timestamp string          `json:"timestamp"`
+	Message   *struct {
+		Model string `json:"model"`
+		Usage *struct {
+			InputTokens              int64 `json:"input_tokens"`
+			OutputTokens             int64 `json:"output_tokens"`
+			CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+		} `json:"usage"`
+	} `json:"message"`
+	Usage *struct {
+		InputTokens              int64 `json:"input_tokens"`
+		OutputTokens             int64 `json:"output_tokens"`
+		CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+	} `json:"usage"`
+	// Function-call shape:
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
+	// Some Codex versions embed under `function_call`:
+	FunctionCall *struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	} `json:"function_call"`
+	// And some under tool_call:
+	ToolCall *struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	} `json:"tool_call"`
+}
+
+// processCodexLine handles one JSONL event from a Codex session. It carries
+// the latest seen model on the state, buffers patch-derived events, and
+// drains the buffer when a usage block arrives.
+func processCodexLine(raw []byte, st *codexState) {
+	var ln codexLine
+	if err := json.Unmarshal(raw, &ln); err != nil {
+		return
+	}
+	if ln.Model != "" {
+		st.model = ln.Model
+	}
+	if ln.Message != nil && ln.Message.Model != "" {
+		st.model = ln.Message.Model
+	}
+
+	// Function/tool-call → buffer (we don't yet know tokens for this turn).
+	if name, args := pickFunctionCall(&ln); name != "" && looksLikePatch(name) {
+		files := parsePatchFiles(args)
+		when := parseCodexTimestamp(ln.Timestamp)
+		if when.IsZero() {
+			when = time.Now()
+		}
+		for _, f := range files {
+			// Resolve symlinks so the file path matches the repo's resolved
+			// root (macOS /tmp → /private/tmp is the classic foot-gun).
+			abs := f.Path
+			if r, err := filepath.EvalSymlinks(f.Path); err == nil {
+				abs = r
+			}
+			repo, _ := gitutil.RepoID(abs)
+			wt, _ := gitutil.Toplevel(abs)
+			rel := abs
+			if wt != "" {
+				if r, err := filepath.Rel(wt, abs); err == nil && !strings.HasPrefix(r, "..") {
+					rel = r
+				}
+			}
+			st.pending = append(st.pending, daemon.Event{
+				When:       when,
+				Tool:       "codex",
+				Confidence: "high",
+				GenType:    "cli", // Codex is always invoked from the command line
+				RepoPath:   repo,
+				FilePath:   rel,
+				Model:      st.model,
+				Lines:      []daemon.LineRange{{Start: f.StartLine, End: f.EndLine, ContentSHA: f.ContentSHA}},
+				RawMeta:    fmt.Sprintf(`{"source":"codex_session","patch_name":%q}`, name),
+			})
+		}
+	}
+
+	// usage → flush buffered events with tokens, then reset.
+	if u := ln.Usage; u != nil {
+		st.flush(u.InputTokens, u.OutputTokens, u.CacheReadInputTokens, u.CacheCreationInputTokens, true)
+	} else if ln.Message != nil && ln.Message.Usage != nil {
+		u := ln.Message.Usage
+		st.flush(u.InputTokens, u.OutputTokens, u.CacheReadInputTokens, u.CacheCreationInputTokens, true)
+	}
+}
+
+func pickFunctionCall(ln *codexLine) (string, json.RawMessage) {
+	if ln.Name != "" && len(ln.Arguments) > 0 {
+		return ln.Name, ln.Arguments
+	}
+	if ln.FunctionCall != nil && ln.FunctionCall.Name != "" {
+		return ln.FunctionCall.Name, ln.FunctionCall.Arguments
+	}
+	if ln.ToolCall != nil && ln.ToolCall.Name != "" {
+		return ln.ToolCall.Name, ln.ToolCall.Arguments
+	}
+	return "", nil
+}
+
+func looksLikePatch(name string) bool {
+	n := strings.ToLower(name)
+	return n == "apply_patch" || strings.Contains(n, "patch") || n == "shell" /* codex writes via shell+heredoc too */
+}
+
+// patchedFile is one file mutated by an apply_patch call.
+type patchedFile struct {
+	Path       string
+	StartLine  int
+	EndLine    int
+	ContentSHA string
+}
+
+// parsePatchFiles handles three shapes the arguments may take:
+//
+//  1. {"input": "*** Begin Patch\n*** Update File: path/to/foo.go\n@@ ..."}
+//     (the canonical Codex apply_patch envelope)
+//  2. {"path": "...", "patch": "..."}
+//  3. A raw JSON object containing a "file_path" or "path" field with new content.
+//
+// For each file, returns the post-patch line range. If the patch doesn't
+// supply line numbers, we mark it as range [1, len(file)] as a worst-case
+// fallback so the file is still recorded against codex.
+func parsePatchFiles(raw json.RawMessage) []patchedFile {
+	if len(raw) == 0 {
+		return nil
+	}
+	// Arguments may itself be a JSON string containing JSON. Unwrap.
+	if raw[0] == '"' {
+		var s string
+		if err := json.Unmarshal(raw, &s); err == nil {
+			raw = json.RawMessage(s)
+		}
+	}
+	// Try the canonical envelope.
+	var env struct {
+		Input string `json:"input"`
+		Patch string `json:"patch"`
+		Path  string `json:"path"`
+		File  string `json:"file_path"`
+	}
+	_ = json.Unmarshal(raw, &env)
+
+	body := env.Input
+	if body == "" {
+		body = env.Patch
+	}
+	if body == "" && len(raw) > 0 && raw[0] != '{' {
+		body = string(raw)
+	}
+	if body != "" {
+		return parsePatchBody(body)
+	}
+	if env.Path != "" || env.File != "" {
+		path := env.Path
+		if path == "" {
+			path = env.File
+		}
+		return []patchedFile{{Path: path, StartLine: 1, EndLine: 1}}
+	}
+	return nil
+}
+
+// parsePatchBody walks a Codex/OpenAI patch envelope:
+//
+//	*** Begin Patch
+//	*** Update File: relative/or/abs/path.go
+//	@@ optional header
+//	-old line
+//	+new line one
+//	+new line two
+//	*** End Patch
+//
+// We record one (StartLine, EndLine) per file based on the count of added
+// lines. Without true post-edit line numbers (the patch is contextual), we
+// approximate by counting `+` lines; the attribute step then resolves the
+// range against the post-commit file by content match.
+func parsePatchBody(body string) []patchedFile {
+	var out []patchedFile
+	scanner := bufio.NewScanner(strings.NewReader(body))
+	scanner.Buffer(make([]byte, 0, 1<<16), 1<<22)
+
+	var curPath string
+	var added []string
+	flush := func() {
+		if curPath == "" || len(added) == 0 {
+			curPath = ""
+			added = nil
+			return
+		}
+		content := strings.Join(added, "\n")
+		out = append(out, patchedFile{
+			Path:       curPath,
+			StartLine:  1, // anchored later via content_sha
+			EndLine:    len(added),
+			ContentSHA: sha256Of(content),
+		})
+		curPath = ""
+		added = nil
+	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case strings.HasPrefix(line, "*** Update File: "):
+			flush()
+			curPath = strings.TrimPrefix(line, "*** Update File: ")
+		case strings.HasPrefix(line, "*** Add File: "):
+			flush()
+			curPath = strings.TrimPrefix(line, "*** Add File: ")
+		case strings.HasPrefix(line, "*** Delete File: "):
+			flush()
+			curPath = ""
+		case strings.HasPrefix(line, "*** End Patch"):
+			flush()
+		case strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++"):
+			added = append(added, strings.TrimPrefix(line, "+"))
+		}
+	}
+	flush()
+	return out
+}
+
+func sha256Of(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])
+}
+
+func parseCodexTimestamp(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02T15:04:05.000Z",
+		"2006-01-02T15:04:05Z",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+// readLineGrowing reads a single newline-terminated line from r, blocking
+// (with backoff) when EOF is hit so the loop tails the file as it grows.
+// Stops promptly when ctx is canceled.
+func readLineGrowing(ctx context.Context, r *bufio.Reader, f *os.File) ([]byte, error) {
+	backoff := 100 * time.Millisecond
+	const maxBackoff = 2 * time.Second
+	for {
+		line, err := r.ReadBytes('\n')
+		if err == nil {
+			return bytesTrimNewline(line), nil
+		}
+		if !errors.Is(err, io.EOF) {
+			return nil, err
+		}
+		if len(line) > 0 {
+			// Partial last line (no newline). Skip — wait for it to complete.
+			// (Seek back so next ReadBytes sees the full line.)
+			if _, sErr := f.Seek(-int64(len(line)), io.SeekCurrent); sErr != nil {
+				return nil, sErr
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, io.EOF
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+}
+
+func bytesTrimNewline(b []byte) []byte {
+	for len(b) > 0 && (b[len(b)-1] == '\n' || b[len(b)-1] == '\r') {
+		b = b[:len(b)-1]
+	}
+	return b
+}
+
+// findRepoRootForPath resolves symlinks then runs `git -C <dir> rev-parse
+// --show-toplevel`. Returns "" if the file isn't in a git repo.
+func findRepoRootForPath(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		p = r
+	}
+	dir := filepath.Dir(p)
+	if root, ok := gitToplevel(dir); ok {
+		return root
+	}
+	return ""
+}
