@@ -99,12 +99,20 @@ func extractCopilotRanges(p copilotHookPayload) (string, []LineRange, int64) {
 		if err := json.Unmarshal(p.ToolInput, &in); err != nil || in.FilePath == "" {
 			return "", nil, 0
 		}
-		suggested := int64(countLines(in.NewString))
+		// Deletion case: empty new_string with non-empty old_string. We
+		// can't locate the deleted text post-edit, but we credit the AI
+		// with the removal via suggested_lines.
+		if strings.TrimSpace(in.NewString) == "" && in.OldString != "" {
+			return in.FilePath, nil, int64(countLines(in.OldString))
+		}
+		// Same narrowing as Claude: only credit lines actually new vs
+		// old_string, not context lines included for unique matching.
 		lr, _ := LocateNewString(in.FilePath, in.NewString)
 		if lr == nil {
-			return in.FilePath, nil, suggested
+			return in.FilePath, nil, CountAddedLines(in.OldString, in.NewString)
 		}
-		return in.FilePath, []LineRange{*lr}, suggested
+		ranges, suggested := narrowToChangedLines(in.OldString, in.NewString, *lr)
+		return in.FilePath, ranges, suggested
 
 	case "Write":
 		var in writeInput
@@ -126,10 +134,18 @@ func extractCopilotRanges(p copilotHookPayload) (string, []LineRange, int64) {
 		var suggested int64
 		var out []LineRange
 		for _, ed := range in.Edits {
-			suggested += int64(countLines(ed.NewString))
-			if lr, err := LocateNewString(in.FilePath, ed.NewString); err == nil && lr != nil {
-				out = append(out, *lr)
+			if strings.TrimSpace(ed.NewString) == "" && ed.OldString != "" {
+				suggested += int64(countLines(ed.OldString))
+				continue
 			}
+			lr, err := LocateNewString(in.FilePath, ed.NewString)
+			if err != nil || lr == nil {
+				suggested += CountAddedLines(ed.OldString, ed.NewString)
+				continue
+			}
+			narrowed, narrowSuggest := narrowToChangedLines(ed.OldString, ed.NewString, *lr)
+			out = append(out, narrowed...)
+			suggested += narrowSuggest
 		}
 		return in.FilePath, out, suggested
 

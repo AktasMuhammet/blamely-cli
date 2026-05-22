@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/blamely/blamely/internal/gitnotes"
 )
@@ -39,6 +40,19 @@ func RenderSince(since string) error {
 
 func printNote(n *gitnotes.Note) {
 	fmt.Printf("commit %s\n", n.Commit)
+	if n.Branch != "" {
+		fmt.Printf("  branch:        %s\n", n.Branch)
+	}
+	if n.Message != "" {
+		// Show the subject line only (first line) plus a hint that the body
+		// is in the note. Avoids printing multi-line messages in the header
+		// summary.
+		subject := strings.SplitN(n.Message, "\n", 2)[0]
+		fmt.Printf("  message:       %s\n", subject)
+	}
+	if n.CodingTimeNanos > 0 {
+		fmt.Printf("  coding time:   %s\n", formatDuration(time.Duration(n.CodingTimeNanos)))
+	}
 	fmt.Printf("  AI lines:      %d\n", n.Totals.AILines)
 	fmt.Printf("  human lines:   %d\n", n.Totals.HumanLines)
 	if n.Totals.DeletedLines > 0 {
@@ -116,4 +130,26 @@ func printNote(n *gitnotes.Note) {
 		}
 		fmt.Println()
 	}
+}
+
+// formatDuration renders a duration as "Xh Ym" / "Ym Ss" / "Ss" depending on
+// magnitude. Used for the coding-time summary in printNote.
+func formatDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		mins := int(d.Minutes())
+		secs := int(d.Seconds()) - mins*60
+		if secs == 0 {
+			return fmt.Sprintf("%dm", mins)
+		}
+		return fmt.Sprintf("%dm %ds", mins, secs)
+	}
+	hours := int(d.Hours())
+	mins := int(d.Minutes()) - hours*60
+	if mins == 0 {
+		return fmt.Sprintf("%dh", hours)
+	}
+	return fmt.Sprintf("%dh %dm", hours, mins)
 }

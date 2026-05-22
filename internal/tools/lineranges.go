@@ -76,6 +76,49 @@ func sha256Hex(b []byte) string {
 	return hex.EncodeToString(h[:])
 }
 
+// narrowToChangedLines diffs oldStr against newStr, finds the line ranges
+// within newStr whose content didn't exist in oldStr, and translates those
+// (1-based, relative to newStr) into absolute file-line ranges using the
+// already-located range of newStr in the file (`full`).
+//
+// Use case: an AI Edit's new_string usually carries a few unchanged context
+// lines around the actual change so the patch matches uniquely. We don't
+// want those context lines credited to the AI — only the genuinely new
+// lines. The returned `suggested` count is the total number of lines marked
+// new (sum of the returned ranges' sizes). Falls back to `full` when the
+// strings are identical (no-op edit) or the diff yields no changes.
+func narrowToChangedLines(oldStr, newStr string, full LineRange) ([]LineRange, int64) {
+	changed := AddedOrChangedRanges([]byte(oldStr), []byte(newStr))
+	if len(changed) == 0 {
+		return []LineRange{full}, int64(full.End - full.Start + 1)
+	}
+	offset := full.Start - 1
+	var out []LineRange
+	var suggested int64
+	for _, r := range changed {
+		abs := LineRange{Start: offset + r.Start, End: offset + r.End}
+		if abs.End > full.End {
+			abs.End = full.End
+		}
+		out = append(out, abs)
+		suggested += int64(abs.End - abs.Start + 1)
+	}
+	return out, suggested
+}
+
+// CountAddedLines returns the number of net-new lines in newStr vs oldStr —
+// i.e. the same metric narrowToChangedLines yields when an absolute file
+// location is unavailable. Used by Edit/MultiEdit handlers to still credit
+// the AI with `suggested_lines` even when LocateNewString fails (file not
+// on disk yet, etc.).
+func CountAddedLines(oldStr, newStr string) int64 {
+	var n int64
+	for _, r := range AddedOrChangedRanges([]byte(oldStr), []byte(newStr)) {
+		n += int64(r.End - r.Start + 1)
+	}
+	return n
+}
+
 // AddedOrChangedRanges returns the 1-based line ranges in `newContent` that
 // were NOT present (by exact content) in `oldContent`. Used by the human-edit
 // watcher to detect lines the user typed/modified between two file snapshots.

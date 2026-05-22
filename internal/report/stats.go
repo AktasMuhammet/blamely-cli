@@ -126,6 +126,9 @@ func renderStats(w io.Writer, note *gitnotes.Note, meta commitMeta_, sessionNano
 	if author != "" {
 		fmt.Fprintf(w, "  %s\n", dim("author: "+author))
 	}
+	if note.Branch != "" {
+		fmt.Fprintf(w, "  %s\n", dim("branch: "+note.Branch))
+	}
 	fmt.Fprintln(w)
 
 	// Changes
@@ -212,10 +215,15 @@ func renderStats(w io.Writer, note *gitnotes.Note, meta commitMeta_, sessionNano
 			formatK(t.Input), formatK(t.Output), formatK(t.CacheRead), formatK(t.CacheWrite))
 	}
 
-	// Session
-	if sessionNanos > 0 {
-		mins := sessionNanos / int64(time.Minute)
-		fmt.Fprintf(w, "%s  ~%d min\n", bold("Session:"), mins)
+	// Session / coding time. Prefer the value baked into the note (captured
+	// at attribution time); fall back to the live DB lookup for older notes.
+	coding := note.CodingTimeNanos
+	if coding == 0 {
+		coding = sessionNanos
+	}
+	if coding > 0 {
+		mins := coding / int64(time.Minute)
+		fmt.Fprintf(w, "%s  ~%d min  (first edit → commit)\n", bold("Coding time:"), mins)
 	}
 }
 

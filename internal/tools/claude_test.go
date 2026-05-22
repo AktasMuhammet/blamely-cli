@@ -121,3 +121,68 @@ func TestRecordClaudeFromStdin_EmptyObject(t *testing.T) {
 		t.Errorf("empty object should be no-op, got: %v", err)
 	}
 }
+
+// TestExtractClaudeRanges_EditDeletion verifies that an Edit with an empty
+// new_string and a non-empty old_string is treated as a pure deletion:
+// no post-image line range (the text is gone), but `suggested_lines` is
+// credited so the AI gets attribution for the lines it removed.
+func TestExtractClaudeRanges_EditDeletion(t *testing.T) {
+	raw, _ := json.Marshal(map[string]any{
+		"file_path":  "/tmp/x.go",
+		"old_string": "a\nb\nc\nd",
+		"new_string": "",
+	})
+	p := claudeHookPayload{ToolName: "Edit", ToolInput: raw}
+	file, ranges, suggested, err := extractClaudeRanges(p)
+	if err != nil {
+		t.Fatalf("extractClaudeRanges: %v", err)
+	}
+	if file != "/tmp/x.go" {
+		t.Errorf("file: want /tmp/x.go, got %q", file)
+	}
+	if ranges != nil {
+		t.Errorf("ranges should be nil for pure deletion, got %+v", ranges)
+	}
+	if suggested != 4 {
+		t.Errorf("suggested: want 4 (deleted lines), got %d", suggested)
+	}
+}
+
+// TestExtractClaudeRanges_MultiEditMixedDeletion: one sub-edit adds 2 lines,
+// another deletes 4. Suggested should sum both.
+func TestExtractClaudeRanges_MultiEditMixedDeletion(t *testing.T) {
+	raw, _ := json.Marshal(map[string]any{
+		"file_path": "/tmp/m.go",
+		"edits": []map[string]any{
+			{"old_string": "x", "new_string": "x1\nx2"},                  // +2
+			{"old_string": "del1\ndel2\ndel3\ndel4", "new_string": ""},   // -4
+		},
+	})
+	p := claudeHookPayload{ToolName: "MultiEdit", ToolInput: raw}
+	_, _, suggested, err := extractClaudeRanges(p)
+	if err != nil {
+		t.Fatalf("extractClaudeRanges: %v", err)
+	}
+	if suggested != 6 {
+		t.Errorf("suggested: want 6 (2 added + 4 deleted), got %d", suggested)
+	}
+}
+
+// TestExtractClaudeRanges_EditWhitespaceOnly_TreatedAsDeletion: new_string
+// that's just whitespace (e.g. "   " or "\n\n") is also treated as a
+// deletion when old_string was non-empty.
+func TestExtractClaudeRanges_EditWhitespaceOnlyTreatedAsDeletion(t *testing.T) {
+	raw, _ := json.Marshal(map[string]any{
+		"file_path":  "/tmp/w.go",
+		"old_string": "foo\nbar\nbaz",
+		"new_string": "  \n  \n", // whitespace-only
+	})
+	p := claudeHookPayload{ToolName: "Edit", ToolInput: raw}
+	_, ranges, suggested, _ := extractClaudeRanges(p)
+	if ranges != nil {
+		t.Errorf("whitespace-only new_string should produce no ranges, got %+v", ranges)
+	}
+	if suggested != 3 {
+		t.Errorf("suggested should reflect deleted lines (3), got %d", suggested)
+	}
+}

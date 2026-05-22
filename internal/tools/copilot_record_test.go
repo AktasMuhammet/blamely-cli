@@ -23,7 +23,10 @@ func TestExtractCopilotRanges_GenericFallback(t *testing.T) {
 	}
 }
 
-func TestExtractCopilotRanges_EditShape(t *testing.T) {
+func TestExtractCopilotRanges_EditShape_NarrowsToNewLinesOnly(t *testing.T) {
+	// old_string "a" appears unchanged at the top of new_string. Only the
+	// two genuinely-new lines ("b","c") should be credited to the AI, not
+	// the unchanged context line ("a").
 	raw, _ := json.Marshal(map[string]any{
 		"file_path":  "/tmp/x.go",
 		"old_string": "a",
@@ -34,8 +37,8 @@ func TestExtractCopilotRanges_EditShape(t *testing.T) {
 	if file != "/tmp/x.go" {
 		t.Errorf("want /tmp/x.go, got %q", file)
 	}
-	if suggested != 3 {
-		t.Errorf("suggested: want 3, got %d", suggested)
+	if suggested != 2 {
+		t.Errorf("suggested: want 2 (b + c, not the unchanged 'a'), got %d", suggested)
 	}
 }
 
@@ -54,6 +57,43 @@ func TestExtractCopilotRanges_MultiEditSums(t *testing.T) {
 	}
 	if suggested != 3 {
 		t.Errorf("suggested: want 3 (2+1), got %d", suggested)
+	}
+}
+
+func TestExtractCopilotRanges_EditDeletion_CountsSuggested(t *testing.T) {
+	// new_string is empty (deletion), old_string had 3 lines → suggested=3,
+	// no ranges to locate (the text is gone post-edit).
+	raw, _ := json.Marshal(map[string]any{
+		"file_path":  "/tmp/d.go",
+		"old_string": "a\nb\nc",
+		"new_string": "",
+	})
+	p := copilotHookPayload{ToolName: "Edit", ToolInput: raw}
+	file, ranges, suggested := extractCopilotRanges(p)
+	if file != "/tmp/d.go" {
+		t.Errorf("file: want /tmp/d.go, got %q", file)
+	}
+	if ranges != nil {
+		t.Errorf("ranges should be nil for pure deletion, got %+v", ranges)
+	}
+	if suggested != 3 {
+		t.Errorf("suggested: want 3 (deleted lines), got %d", suggested)
+	}
+}
+
+func TestExtractCopilotRanges_MultiEditMixedDeletion(t *testing.T) {
+	// Two sub-edits: one adds 2 lines, one deletes 4 lines.
+	raw, _ := json.Marshal(map[string]any{
+		"file_path": "/tmp/m.go",
+		"edits": []map[string]any{
+			{"old_string": "x", "new_string": "x1\nx2"},          // +2
+			{"old_string": "del1\ndel2\ndel3\ndel4", "new_string": ""}, // -4
+		},
+	})
+	p := copilotHookPayload{ToolName: "MultiEdit", ToolInput: raw}
+	_, _, suggested := extractCopilotRanges(p)
+	if suggested != 6 {
+		t.Errorf("suggested: want 6 (2 added + 4 deleted), got %d", suggested)
 	}
 }
 

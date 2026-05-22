@@ -1,0 +1,50 @@
+name: CI
+
+# Fast feedback on every push / PR. Runs go vet + go test on the three
+# major OSes so platform-specific code (agent_darwin.go, agent_linux.go,
+# agent_windows.go) is exercised before tags are cut.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.26.3'
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Configure git (for tests that shell out to git)
+        shell: bash
+        run: |
+          git config --global user.email "ci@blamely.test"
+          git config --global user.name  "Blamely CI"
+          git config --global init.defaultBranch main
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test ./...

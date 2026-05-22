@@ -32,11 +32,13 @@ const (
 // CommitChange is the diff result of a single commit: every added line, the
 // per-file pre-image line numbers that were deleted, a post→pre rename map
 // so the attribute step can look up edits recorded under the old filename,
-// and the file-level change kind keyed by post-commit path.
+// the file-level change kind keyed by post-commit path, and an analogous
+// copy map for files git detected as copy-with-modifications.
 type CommitChange struct {
 	Added       []AddedLine
 	Deleted     map[string][]int          // pre-commit path → deleted line numbers (pre-image)
-	Renames     map[string]string         // post-commit path → pre-commit path
+	Renames     map[string]string         // post-commit path → pre-commit path (renamed)
+	Copies      map[string]string         // post-commit path → pre-commit path (copied)
 	FileChanges map[string]FileChangeType // post-commit path → file-level change kind
 }
 
@@ -87,6 +89,7 @@ func DiffCommit(repoPath, sha string) (*CommitChange, error) {
 	out := &CommitChange{
 		Deleted:     map[string][]int{},
 		Renames:     map[string]string{},
+		Copies:      map[string]string{},
 		FileChanges: map[string]FileChangeType{},
 	}
 	curFile := ""    // post-commit path (from +++ b/...)
@@ -145,8 +148,10 @@ func DiffCommit(repoPath, sha string) (*CommitChange, error) {
 			pendingCopyFrom = strings.TrimPrefix(line, "copy from ")
 		case strings.HasPrefix(line, "copy to "):
 			to := strings.TrimPrefix(line, "copy to ")
-			_ = pendingCopyFrom
-			pendingCopyFrom = ""
+			if pendingCopyFrom != "" {
+				out.Copies[to] = pendingCopyFrom
+				pendingCopyFrom = ""
+			}
 			setFileChange(to, FileCopied)
 		case strings.HasPrefix(line, "--- a/"):
 			curDelFile = strings.TrimPrefix(line, "--- a/")
@@ -281,6 +286,28 @@ func emptyTreeSHA(repoPath string) (string, error) {
 		return "4b825dc642cb6eb9a060e54bf8d69288fbee4904", nil
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// CommitMessage returns the full commit message body (subject + body) of sha.
+// Empty string on error so callers can tolerate detached/missing state.
+func CommitMessage(repoPath, sha string) string {
+	out, err := exec.Command("git", "-C", repoPath, "show", "-s", "--format=%B", sha).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimRight(string(out), "\n")
+}
+
+// BranchName returns the currently checked-out branch name of repoPath. On
+// detached HEAD or any failure it returns "" so the note can still be
+// produced. This is called immediately after the commit, while HEAD still
+// points to the new commit on the recording branch.
+func BranchName(repoPath string) string {
+	out, err := exec.Command("git", "-C", repoPath, "branch", "--show-current").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func CommitTimestampNanos(repoPath, sha string) (int64, error) {

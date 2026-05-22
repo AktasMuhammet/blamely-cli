@@ -157,15 +157,30 @@ func extractClaudeRanges(p claudeHookPayload) (string, []LineRange, int64, error
 		if in.FilePath == "" {
 			return "", nil, 0, nil
 		}
-		suggested := int64(countLines(in.NewString))
-		lr, err := LocateNewString(in.FilePath, in.NewString)
+		// Deletion case: new_string is empty (or whitespace-only) and
+		// old_string was non-empty. We can't locate the deleted text in the
+		// post-edit file (it's gone), but we still credit the AI with the
+		// removal in `suggested_lines` so the report shows the AI touched
+		// these many lines. Pre-image line numbers are filled in at commit
+		// time by the diff parser; we record the file path here so the
+		// human-edit watcher's `recent AI activity` lookup suppresses any
+		// competing human-edit row for the same file.
+		if strings.TrimSpace(in.NewString) == "" && in.OldString != "" {
+			return in.FilePath, nil, int64(countLines(in.OldString)), nil
+		}
+		// Credit the AI only for the lines that are genuinely new — not for
+		// context lines that happen to be inside new_string for the match to
+		// be precise. We always compute the line-count diff so suggested
+		// stays accurate even when we can't locate the text in the file.
+		fullRange, err := LocateNewString(in.FilePath, in.NewString)
 		if err != nil {
-			return in.FilePath, nil, suggested, err
+			return in.FilePath, nil, CountAddedLines(in.OldString, in.NewString), err
 		}
-		if lr == nil {
-			return in.FilePath, nil, suggested, nil
+		if fullRange == nil {
+			return in.FilePath, nil, CountAddedLines(in.OldString, in.NewString), nil
 		}
-		return in.FilePath, []LineRange{*lr}, suggested, nil
+		ranges, suggested := narrowToChangedLines(in.OldString, in.NewString, *fullRange)
+		return in.FilePath, ranges, suggested, nil
 
 	case "Write":
 		var in writeInput
@@ -196,12 +211,22 @@ func extractClaudeRanges(p claudeHookPayload) (string, []LineRange, int64, error
 		var suggested int64
 		var out []LineRange
 		for _, ed := range in.Edits {
-			suggested += int64(countLines(ed.NewString))
-			lr, err := LocateNewString(in.FilePath, ed.NewString)
-			if err != nil || lr == nil {
+			// Sub-edit deletion: empty NewString means this sub-edit removed
+			// old_string. Credit the AI for the number of lines deleted via
+			// suggested_lines, but don't try to locate the (now-missing) text.
+			if strings.TrimSpace(ed.NewString) == "" && ed.OldString != "" {
+				suggested += int64(countLines(ed.OldString))
 				continue
 			}
-			out = append(out, *lr)
+			lr, err := LocateNewString(in.FilePath, ed.NewString)
+			if err != nil || lr == nil {
+				// Can't locate, but still credit the AI's net-new line count.
+				suggested += CountAddedLines(ed.OldString, ed.NewString)
+				continue
+			}
+			narrowed, narrowSuggest := narrowToChangedLines(ed.OldString, ed.NewString, *lr)
+			out = append(out, narrowed...)
+			suggested += narrowSuggest
 		}
 		return in.FilePath, out, suggested, nil
 

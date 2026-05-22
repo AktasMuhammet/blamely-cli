@@ -207,3 +207,49 @@ func TestAddedOrChangedRanges_AppendAtEnd(t *testing.T) {
 		t.Errorf("want [3,4] for appended lines, got %+v", got)
 	}
 }
+
+func TestNarrowToChangedLines_OnlyTruncatesContextLines(t *testing.T) {
+	// new_string spans absolute file lines 10..14 (5 lines). The first and
+	// last lines are unchanged context (also in old_string). Only the
+	// middle three lines should remain after narrowing, mapped to file
+	// line numbers 11..13.
+	old := "header\nfooter"
+	newStr := "header\nNEW1\nNEW2\nNEW3\nfooter"
+	full := LineRange{Start: 10, End: 14}
+	ranges, suggested := narrowToChangedLines(old, newStr, full)
+	if len(ranges) != 1 {
+		t.Fatalf("expected 1 narrowed range, got %d: %+v", len(ranges), ranges)
+	}
+	if ranges[0].Start != 11 || ranges[0].End != 13 {
+		t.Errorf("expected absolute range [11,13], got %+v", ranges[0])
+	}
+	if suggested != 3 {
+		t.Errorf("expected suggested=3, got %d", suggested)
+	}
+}
+
+func TestNarrowToChangedLines_IdenticalReturnsFull(t *testing.T) {
+	// When old == new (no real change), there are no new lines; we fall
+	// back to recording the full range so the AI still appears in the
+	// edit log (useful for "AI touched this file" signals).
+	full := LineRange{Start: 5, End: 7}
+	ranges, suggested := narrowToChangedLines("a\nb\nc", "a\nb\nc", full)
+	if len(ranges) != 1 || ranges[0] != full {
+		t.Errorf("expected fallback to full range, got %+v", ranges)
+	}
+	if suggested != 3 {
+		t.Errorf("expected suggested=3 (full range size), got %d", suggested)
+	}
+}
+
+func TestCountAddedLines(t *testing.T) {
+	if got := CountAddedLines("a", "a\nb\nc"); got != 2 {
+		t.Errorf("CountAddedLines: want 2, got %d", got)
+	}
+	if got := CountAddedLines("", "a\nb\nc"); got != 3 {
+		t.Errorf("CountAddedLines (empty old): want 3, got %d", got)
+	}
+	if got := CountAddedLines("a\nb", "a\nb"); got != 0 {
+		t.Errorf("CountAddedLines (no change): want 0, got %d", got)
+	}
+}

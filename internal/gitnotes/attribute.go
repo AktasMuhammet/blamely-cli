@@ -16,13 +16,24 @@ const NotesRef = "refs/notes/blamely"
 
 // Note is the JSON payload written to refs/notes/blamely for each commit.
 type Note struct {
-	Schema      int             `json:"schema"`
-	Commit      string          `json:"commit"`
-	Totals      Totals          `json:"totals"`
-	ByTool      map[string]Tool `json:"by_tool"`
-	ByGenType   ByGenType       `json:"by_gen_type"`
-	Files       []FileEntry     `json:"files"`
-	GeneratedBy string          `json:"generated_by"`
+	Schema int    `json:"schema"`
+	Commit string `json:"commit"`
+	// Branch is the currently-checked-out branch when the commit was made,
+	// or "" if HEAD was detached. Useful when the same commit lands on
+	// multiple branches (the note is attached to the commit, not the branch).
+	Branch string `json:"branch,omitempty"`
+	// Message is the full commit message (subject + body) as recorded by git.
+	Message string `json:"message,omitempty"`
+	// CodingTimeNanos is the wall-clock time from the earliest edit observed
+	// for this repo (up to the commit) to the commit timestamp. Zero if no
+	// edits were observed in the lookback window (default 8h, see
+	// store.SessionDurationNanos).
+	CodingTimeNanos int64           `json:"coding_time_nanos,omitempty"`
+	Totals          Totals          `json:"totals"`
+	ByTool          map[string]Tool `json:"by_tool"`
+	ByGenType       ByGenType       `json:"by_gen_type"`
+	Files           []FileEntry     `json:"files"`
+	GeneratedBy     string          `json:"generated_by"`
 }
 
 // ByGenType shows how many lines in the commit were produced by each
@@ -130,6 +141,20 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	note, err := buildNote(db, repoID, sha, commitNanos, change.Added, change.Deleted, change.Renames, change.FileChanges)
 	if err != nil {
 		return nil, err
+	}
+	// Branch + commit message are commit-scoped metadata; capture from git
+	// while we still have the working tree handy.
+	note.Branch = BranchName(repoPath)
+	note.Message = CommitMessage(repoPath, sha)
+	// Coding time: earliest observed edit (within an 8h lookback) → commit
+	// timestamp. Falls back to 0 if no edits were recorded for this repo.
+	note.CodingTimeNanos = db.SessionDurationNanos(repoID, commitNanos)
+	// CopiedFrom is set per-file from change.Copies (the rename half is
+	// handled inside flushFile via the renames map).
+	for i := range note.Files {
+		if from, ok := change.Copies[note.Files[i].Path]; ok {
+			note.Files[i].CopiedFrom = from
+		}
 	}
 	body, err := json.MarshalIndent(note, "", "  ")
 	if err != nil {
@@ -425,6 +450,21 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		})
 		note.Files = append(note.Files, fe)
 		note.Totals.DeletedLines += fe.Deleted
+		fileCount++
+		emitted[path] = true
+	}
+	// Files in fileChanges that have neither additions nor deletions (pure
+	// rename / pure copy). Without this pass the note would omit them
+	// entirely and `git mv foo bar` would leave no trace.
+	for path, kind := range fileChanges {
+		if emitted[path] || renamedFrom[path] {
+			continue
+		}
+		fe := FileEntry{Path: path, Type: string(kind)}
+		if from, ok := renames[path]; ok {
+			fe.RenamedFrom = from
+		}
+		note.Files = append(note.Files, fe)
 		fileCount++
 	}
 	// Keep the files list stable for downstream readers.
