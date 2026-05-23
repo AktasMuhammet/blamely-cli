@@ -3,6 +3,7 @@ package gitnotes
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
 )
@@ -85,7 +86,29 @@ func DiffCommit(repoPath, sha string) (*CommitChange, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("git diff: %w", err)
 	}
+	out, perr := parseDiff(stdout)
+	_ = cmd.Wait()
+	if perr != nil {
+		return nil, perr
+	}
+	return out, nil
+}
 
+// parseDiff reads `git diff --unified=0 -M -C` output and produces a
+// CommitChange. Extracted from DiffCommit so the hunk-pairing logic can be
+// exercised with hand-crafted diff strings in tests.
+//
+// Pairing semantics: within each hunk we buffer the `-` and `+` lines, then
+// pair them positionally. The first min(len(-), len(+)) of each are treated
+// as MODIFICATIONS — the `-` side is discarded (it would otherwise be
+// reported as a "deletion treated as human" even though the change is an
+// in-place replacement) and the `+` side is emitted as an added line subject
+// to the whitespace filter. Excess `-` lines are pure deletes; excess `+`
+// lines are pure adds. This is the only correct way to recognize modifications
+// when an earlier hunk in the same file has shifted line numbers — comparing
+// pre-image delete line numbers against post-image add line numbers
+// produces false negatives the moment the file's net line count drifts.
+func parseDiff(r io.Reader) (*CommitChange, error) {
 	out := &CommitChange{
 		Deleted:     map[string][]int{},
 		Renames:     map[string]string{},
@@ -102,7 +125,45 @@ func DiffCommit(repoPath, sha string) (*CommitChange, error) {
 	diffHeaderPath := ""
 	pendingRenameFrom := ""
 	pendingCopyFrom := ""
-	sc := bufio.NewScanner(stdout)
+
+	// Per-hunk buffers — see function comment for pairing semantics.
+	type hunkAdd struct {
+		line    int
+		content string
+	}
+	var hunkDels []int
+	var hunkAdds []hunkAdd
+
+	flushHunk := func() {
+		n := len(hunkDels)
+		if len(hunkAdds) < n {
+			n = len(hunkAdds)
+		}
+		// Paired adds (modifications) — emit add side, drop delete side.
+		for i := 0; i < n; i++ {
+			a := hunkAdds[i]
+			if curFile != "" && strings.TrimSpace(a.content) != "" {
+				out.Added = append(out.Added, AddedLine{File: curFile, LineNum: a.line})
+			}
+		}
+		// Excess deletes — lines removed without a same-position replacement.
+		for i := n; i < len(hunkDels); i++ {
+			if curDelFile != "" {
+				out.Deleted[curDelFile] = append(out.Deleted[curDelFile], hunkDels[i])
+			}
+		}
+		// Excess adds — lines added without a same-position predecessor.
+		for i := n; i < len(hunkAdds); i++ {
+			a := hunkAdds[i]
+			if curFile != "" && strings.TrimSpace(a.content) != "" {
+				out.Added = append(out.Added, AddedLine{File: curFile, LineNum: a.line})
+			}
+		}
+		hunkDels = hunkDels[:0]
+		hunkAdds = hunkAdds[:0]
+	}
+
+	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 1<<16), 1<<22)
 	setFileChange := func(path string, kind FileChangeType) {
 		if path == "" {
@@ -118,6 +179,9 @@ func DiffCommit(repoPath, sha string) (*CommitChange, error) {
 		line := sc.Text()
 		switch {
 		case strings.HasPrefix(line, "diff --git "):
+			// File boundary: flush the previous file's last hunk before its
+			// curFile/curDelFile get overwritten.
+			flushHunk()
 			// "diff --git a/PRE b/POST" — extract POST as the file's identity.
 			// We treat each new diff section as MODIFIED by default; later
 			// headers (new file/deleted file/rename) override.
@@ -162,6 +226,9 @@ func DiffCommit(repoPath, sha string) (*CommitChange, error) {
 		case strings.HasPrefix(line, "+++ /dev/null"):
 			curFile = "" // deleted file — no post-commit path
 		case strings.HasPrefix(line, "@@"):
+			// New hunk: flush the previous hunk's buffered lines before
+			// resetting line counters.
+			flushHunk()
 			delStart, addStart, ok := parseHunkHeaderBothSides(line)
 			if !ok {
 				continue
@@ -169,20 +236,13 @@ func DiffCommit(repoPath, sha string) (*CommitChange, error) {
 			curLine = addStart
 			curDelLine = delStart
 		case strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++"):
-			if curFile != "" && curLine > 0 {
-				// Skip whitespace-only added lines: blank lines, indentation-
-				// only lines, etc. don't carry meaningful attribution and
-				// would otherwise be misattributed to whichever tool last
-				// wrote near that location.
-				content := line[1:]
-				if strings.TrimSpace(content) != "" {
-					out.Added = append(out.Added, AddedLine{File: curFile, LineNum: curLine})
-				}
+			if curLine > 0 {
+				hunkAdds = append(hunkAdds, hunkAdd{line: curLine, content: line[1:]})
 				curLine++
 			}
 		case strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---"):
-			if curDelFile != "" && curDelLine > 0 {
-				out.Deleted[curDelFile] = append(out.Deleted[curDelFile], curDelLine)
+			if curDelLine > 0 {
+				hunkDels = append(hunkDels, curDelLine)
 			}
 			curDelLine++
 		case strings.HasPrefix(line, " "):
@@ -190,7 +250,7 @@ func DiffCommit(repoPath, sha string) (*CommitChange, error) {
 			curDelLine++
 		}
 	}
-	_ = cmd.Wait()
+	flushHunk()
 	return out, sc.Err()
 }
 

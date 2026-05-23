@@ -1,6 +1,8 @@
 package gitnotes
 
 import (
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -113,5 +115,247 @@ func TestParseHunkHeaderBothSides_Malformed(t *testing.T) {
 		if _, _, ok := parseHunkHeaderBothSides(c); ok {
 			t.Errorf("%q: want ok=false", c)
 		}
+	}
+}
+
+// ---- parseDiff: hunk-level pairing of - and + lines ----
+
+// TestParseDiff_InPlaceModification verifies that a 1-for-1 replacement
+// (the simplest modification: same pre/post line number) is reported as
+// an add only — the matching - line must not appear in Deleted.
+func TestParseDiff_InPlaceModification(t *testing.T) {
+	diff := strings.Join([]string{
+		"diff --git a/foo.go b/foo.go",
+		"--- a/foo.go",
+		"+++ b/foo.go",
+		"@@ -4,1 +4,1 @@",
+		"-old",
+		"+new",
+		"",
+	}, "\n")
+	c, err := parseDiff(strings.NewReader(diff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAdded := []AddedLine{{File: "foo.go", LineNum: 4}}
+	if !reflect.DeepEqual(c.Added, wantAdded) {
+		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)
+	}
+	if len(c.Deleted["foo.go"]) != 0 {
+		t.Errorf("Deleted: want empty, got %v", c.Deleted["foo.go"])
+	}
+}
+
+// TestParseDiff_ModificationAfterLineShift is the bug the dedup-by-line-number
+// approach got wrong: an earlier hunk inserts lines, shifting the file's net
+// line count, then a later hunk replaces a line. The replacement's pre-image
+// line number no longer equals its post-image line number, but it's still a
+// modification — neither side should be reported as a pure deletion.
+func TestParseDiff_ModificationAfterLineShift(t *testing.T) {
+	diff := strings.Join([]string{
+		"diff --git a/foo.go b/foo.go",
+		"--- a/foo.go",
+		"+++ b/foo.go",
+		// Insert 2 lines near the top — shifts every later line down by 2.
+		"@@ -1,0 +2,2 @@",
+		"+new1",
+		"+new2",
+		// In-place replacement at pre-image line 4 → post-image line 6.
+		"@@ -4,1 +6,1 @@",
+		"-oldX",
+		"+newX",
+		"",
+	}, "\n")
+	c, err := parseDiff(strings.NewReader(diff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAdded := []AddedLine{
+		{File: "foo.go", LineNum: 2},
+		{File: "foo.go", LineNum: 3},
+		{File: "foo.go", LineNum: 6},
+	}
+	if !reflect.DeepEqual(c.Added, wantAdded) {
+		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)
+	}
+	if got := c.Deleted["foo.go"]; len(got) != 0 {
+		t.Errorf("Deleted: want empty (replacement is a modification), got %v", got)
+	}
+}
+
+// TestParseDiff_ReplaceMoreWithFewer covers M-to-N replacements where M > N:
+// the first N pairs are modifications, the remaining M-N are pure deletes.
+func TestParseDiff_ReplaceMoreWithFewer(t *testing.T) {
+	diff := strings.Join([]string{
+		"diff --git a/foo.go b/foo.go",
+		"--- a/foo.go",
+		"+++ b/foo.go",
+		// 3 lines removed, 1 added — 1 modification + 2 net deletes.
+		"@@ -10,3 +10,1 @@",
+		"-oldA",
+		"-oldB",
+		"-oldC",
+		"+new",
+		"",
+	}, "\n")
+	c, err := parseDiff(strings.NewReader(diff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAdded := []AddedLine{{File: "foo.go", LineNum: 10}}
+	if !reflect.DeepEqual(c.Added, wantAdded) {
+		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)
+	}
+	// First del (line 10) is paired with the add and dropped. Lines 11, 12 remain.
+	wantDel := []int{11, 12}
+	if got := c.Deleted["foo.go"]; !reflect.DeepEqual(got, wantDel) {
+		t.Errorf("Deleted: want %v, got %v", wantDel, got)
+	}
+}
+
+// TestParseDiff_ReplaceFewerWithMore is the inverse: 1 line removed, 3 added.
+// 1 modification + 2 net adds. No deletions reported.
+func TestParseDiff_ReplaceFewerWithMore(t *testing.T) {
+	diff := strings.Join([]string{
+		"diff --git a/foo.go b/foo.go",
+		"--- a/foo.go",
+		"+++ b/foo.go",
+		"@@ -10,1 +10,3 @@",
+		"-old",
+		"+newA",
+		"+newB",
+		"+newC",
+		"",
+	}, "\n")
+	c, err := parseDiff(strings.NewReader(diff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAdded := []AddedLine{
+		{File: "foo.go", LineNum: 10},
+		{File: "foo.go", LineNum: 11},
+		{File: "foo.go", LineNum: 12},
+	}
+	if !reflect.DeepEqual(c.Added, wantAdded) {
+		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)
+	}
+	if got := c.Deleted["foo.go"]; len(got) != 0 {
+		t.Errorf("Deleted: want empty, got %v", got)
+	}
+}
+
+// TestParseDiff_WhitespaceOnlyModificationSymmetric covers the second bug:
+// the - side previously survived when its paired + was whitespace-only and
+// got filtered, producing a phantom "deletion treated as human". With
+// positional pairing, a whitespace-only + still consumes its matching - so
+// neither side is counted.
+func TestParseDiff_WhitespaceOnlyModificationSymmetric(t *testing.T) {
+	diff := strings.Join([]string{
+		"diff --git a/foo.go b/foo.go",
+		"--- a/foo.go",
+		"+++ b/foo.go",
+		"@@ -7,1 +7,1 @@",
+		"-old",
+		"+   ", // whitespace-only — filtered out as an add, but still pairs.
+		"",
+	}, "\n")
+	c, err := parseDiff(strings.NewReader(diff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Added) != 0 {
+		t.Errorf("Added: want empty (whitespace-only), got %v", c.Added)
+	}
+	if got := c.Deleted["foo.go"]; len(got) != 0 {
+		t.Errorf("Deleted: want empty (paired with whitespace add), got %v", got)
+	}
+}
+
+// TestParseDiff_PureDeletion confirms that hunks with only - lines (no
+// paired +) still produce deletions.
+func TestParseDiff_PureDeletion(t *testing.T) {
+	diff := strings.Join([]string{
+		"diff --git a/foo.go b/foo.go",
+		"--- a/foo.go",
+		"+++ b/foo.go",
+		"@@ -5,2 +4,0 @@",
+		"-gone1",
+		"-gone2",
+		"",
+	}, "\n")
+	c, err := parseDiff(strings.NewReader(diff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Added) != 0 {
+		t.Errorf("Added: want empty, got %v", c.Added)
+	}
+	wantDel := []int{5, 6}
+	if got := c.Deleted["foo.go"]; !reflect.DeepEqual(got, wantDel) {
+		t.Errorf("Deleted: want %v, got %v", wantDel, got)
+	}
+}
+
+// TestParseDiff_PureInsertion confirms that hunks with only + lines (no
+// paired -) still produce adds.
+func TestParseDiff_PureInsertion(t *testing.T) {
+	diff := strings.Join([]string{
+		"diff --git a/foo.go b/foo.go",
+		"--- a/foo.go",
+		"+++ b/foo.go",
+		"@@ -3,0 +4,2 @@",
+		"+inserted1",
+		"+inserted2",
+		"",
+	}, "\n")
+	c, err := parseDiff(strings.NewReader(diff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAdded := []AddedLine{
+		{File: "foo.go", LineNum: 4},
+		{File: "foo.go", LineNum: 5},
+	}
+	if !reflect.DeepEqual(c.Added, wantAdded) {
+		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)
+	}
+	if got := c.Deleted["foo.go"]; len(got) != 0 {
+		t.Errorf("Deleted: want empty, got %v", got)
+	}
+}
+
+// TestParseDiff_FileBoundaryFlushesHunk ensures buffered hunk lines from
+// file A don't leak into file B when a new `diff --git` header arrives
+// (i.e. flushHunk fires at file boundaries, not just hunk boundaries).
+func TestParseDiff_FileBoundaryFlushesHunk(t *testing.T) {
+	diff := strings.Join([]string{
+		"diff --git a/a.go b/a.go",
+		"--- a/a.go",
+		"+++ b/a.go",
+		"@@ -1,1 +1,1 @@",
+		"-oldA",
+		"+newA",
+		"diff --git a/b.go b/b.go",
+		"--- a/b.go",
+		"+++ b/b.go",
+		"@@ -1,1 +1,1 @@",
+		"-oldB",
+		"+newB",
+		"",
+	}, "\n")
+	c, err := parseDiff(strings.NewReader(diff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAdded := []AddedLine{
+		{File: "a.go", LineNum: 1},
+		{File: "b.go", LineNum: 1},
+	}
+	if !reflect.DeepEqual(c.Added, wantAdded) {
+		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)
+	}
+	if len(c.Deleted["a.go"]) != 0 || len(c.Deleted["b.go"]) != 0 {
+		t.Errorf("Deleted: want empty for both files, got a.go=%v b.go=%v",
+			c.Deleted["a.go"], c.Deleted["b.go"])
 	}
 }

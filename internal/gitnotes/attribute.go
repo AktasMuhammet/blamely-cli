@@ -329,35 +329,22 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		}
 		curFileEntry.Added = addedPerFile[curFileEntry.Path]
 		// Deleted line numbers: look up by post-commit path (direct match), then
-		// by the pre-commit name for renames (e.g. `git mv old.go new.go`).
+		// by the pre-commit name for renames (e.g. `git mv old.go new.go`). The
+		// diff parser already filters out modification deletes (paired -/+
+		// inside the same hunk) so everything left here is a genuine deletion.
 		var delLines []int
 		if d, ok := deleted[curFileEntry.Path]; ok {
 			delLines = d
 		} else if old, ok := renames[curFileEntry.Path]; ok {
 			delLines = deleted[old]
 		}
-		// If a line number already has an "add" entry, the delete at the same
-		// number is a "modified" record viewed from the pre-image side. Drop
-		// the delete to avoid duplicate-looking entries; the add already
-		// represents the change at that line.
-		addedLineSet := map[int]bool{}
-		for _, l := range curFileEntry.Lines {
-			if l.Type == "add" {
-				addedLineSet[l.Line] = true
-			}
-		}
-		var keptDel []int
 		for _, n := range delLines {
-			if addedLineSet[n] {
-				continue
-			}
-			keptDel = append(keptDel, n)
 			curFileEntry.Lines = append(curFileEntry.Lines, LineEntry{
 				Line: n,
 				Type: "delete",
 			})
 		}
-		curFileEntry.Deleted = len(keptDel)
+		curFileEntry.Deleted = len(delLines)
 		note.Totals.DeletedLines += curFileEntry.Deleted
 		// File-level change kind from the diff parser.
 		if kind, ok := fileChanges[curFileEntry.Path]; ok {
