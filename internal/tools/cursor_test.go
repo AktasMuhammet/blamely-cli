@@ -3,6 +3,7 @@ package tools
 import (
 	"runtime"
 	"testing"
+	"time"
 )
 
 func TestUriToPath_UnixFile(t *testing.T) {
@@ -51,6 +52,23 @@ func TestUriToPath_WindowsPath(t *testing.T) {
 	// The important thing is: no empty result.
 	if got == "" {
 		t.Errorf("uriToPath for Windows-style URI should not be empty")
+	}
+}
+
+// TestCursorWatcherEmit_NeverWritesAttribution proves that CursorWatcher.emit
+// no longer produces any sink events for a File History snapshot.
+//
+// History snapshots fire on every Cursor save — manual typing included —
+// so any emission here ends up attributing human-typed code to
+// `cursor/chat`. The function is intentionally a no-op now; this test
+// pins that contract so we don't accidentally reintroduce the bug.
+func TestCursorWatcherEmit_NeverWritesAttribution(t *testing.T) {
+	w := &CursorWatcher{}
+	sink := &mockSink{}
+	manifest := &cursorEntries{Resource: "file:///tmp/whatever.go"}
+	w.emit(manifest, "/tmp/whatever.go/snap", time.Now(), sink)
+	if got := len(sink.events); got != 0 {
+		t.Errorf("emit must record zero events; got %d", got)
 	}
 }
 

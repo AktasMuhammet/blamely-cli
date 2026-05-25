@@ -18,10 +18,15 @@ const (
 // claudeHookEvents is every event name we register the blamely command under.
 // Adding to this list automatically gets the install path; uninstall scans
 // the full `hooks` map regardless and will still find our markers.
-var claudeHookEvents = []string{"PostToolUse", "PreToolUse"}
+//
+// PreToolUse is intentionally excluded — see the matching comment in
+// cursorhook.go for the full explanation. Short version: at PreToolUse time
+// Write operations record the OLD file content as an AI claim, covering
+// human-typed lines and making them appear as AI in subsequent commits.
+var claudeHookEvents = []string{"PostToolUse"}
 
 // InstallClaudeHook merges blamely's record-hook into every event we care
-// about under ~/.claude/settings.json (PreToolUse + PostToolUse today).
+// about under ~/.claude/settings.json (PostToolUse today).
 // Idempotent. Preserves all unrelated keys (other matchers, user hooks,
 // settings unrelated to hooks). Returns true if anything new was added.
 func InstallClaudeHook(binaryPath string) (added bool, settingsPath string, err error) {

@@ -23,7 +23,16 @@ const cursorBlamelyMarker = "blamely record cursor"
 
 // cursorHookEvents is every event under which we register the blamely record
 // command in ~/.cursor/hooks.json.
-var cursorHookEvents = []string{"postToolUse", "preToolUse"}
+//
+// preToolUse is intentionally excluded. At preToolUse time the AI has not yet
+// applied its edit, so RecordClaudeFromStdin would call LineRangeForWholeFile
+// on the OLD file content and record a whole-file cursor/chat row that covers
+// any lines the user typed manually since the previous commit. That row lands
+// with a timestamp after the humanedit rows and wins attribution at commit
+// time, making human-typed code show up as AI. postToolUse fires after the
+// edit has landed and captures the correct line ranges — no benefit from
+// preToolUse.
+var cursorHookEvents = []string{"postToolUse"}
 
 // InstallCursorHook merges blamely's record command into every Cursor hook
 // event (postToolUse + preToolUse) in ~/.cursor/hooks.json. Idempotent.

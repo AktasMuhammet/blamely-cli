@@ -67,8 +67,20 @@ type dbSink struct {
 
 func (s *dbSink) Record(ev Event) error {
 	tool := store.Tool(ev.Tool)
+	gt := store.GenType(ev.GenType)
+	if gt == "" {
+		gt = store.GenTypeUnknown
+	}
+	// Empty tool is only legitimate for human-typed code, which the
+	// HumanEditWatcher emits as tool="" + gen_type=human. Anything else
+	// with an empty tool is a watcher bug.
+	if tool == "" && gt != store.GenTypeHuman {
+		return fmt.Errorf("watcher sink: tool required (or use gen_type=human for empty tool)")
+	}
 	switch tool {
-	case store.ToolClaude, store.ToolCursor, store.ToolCodex, store.ToolCopilot, store.ToolHuman, store.ToolCopyPaste:
+	case "",
+		store.ToolClaude, store.ToolCursor, store.ToolCodex, store.ToolCopilot, store.ToolCopyPaste,
+		store.ToolHuman: // accepted for legacy in-flight events; new emissions should use ""
 	default:
 		return fmt.Errorf("watcher sink: unknown tool %q", ev.Tool)
 	}
@@ -79,11 +91,6 @@ func (s *dbSink) Record(ev Event) error {
 	ts := ev.When
 	if ts.IsZero() {
 		ts = time.Now()
-	}
-
-	gt := store.GenType(ev.GenType)
-	if gt == "" {
-		gt = store.GenTypeUnknown
 	}
 	e := store.Edit{
 		TimestampNanos: ts.UnixNano(),

@@ -117,9 +117,29 @@ func findCursorLogFiles(dir string) []string {
 	return out
 }
 
-// tailCursorLog streams a Cursor log file looking for apply-event lines.
-// Each matching line tries to extract a file path and emits a cursor event.
+// isCursorTabLog reports whether path looks like a Cursor Tab completion log.
+// Cursor Tab writes its output to a file named "Cursor Tab.log" inside an
+// extension directory that matches "cursor-always-local".
+func isCursorTabLog(path string) bool {
+	base := filepath.Base(path)
+	dir := filepath.Base(filepath.Dir(path))
+	return base == "Cursor Tab.log" || strings.Contains(dir, "cursor-always-local")
+}
+
+// tailCursorLog streams a Cursor log file looking for Composer/Agent apply
+// events and emits a cursor/chat event for each one found.
+//
+// Cursor Tab completion logs (isCursorTabLog) are skipped entirely: Tab
+// completions fire the log entry on suggestion GENERATION, not on user
+// acceptance, so log-based detection over-counts. Accepted Tab completions
+// are attributed via the VS Code / IntelliJ editor plugin which listens to
+// editor.action.inlineSuggest.commit — the only accept-precise signal.
 func tailCursorLog(ctx context.Context, path string, sink daemon.Sink) error {
+	// Skip Cursor Tab log files — generation != acceptance.
+	if isCursorTabLog(path) {
+		return nil
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
@@ -159,16 +179,57 @@ func tailCursorLog(ctx context.Context, path string, sink daemon.Sink) error {
 	}
 }
 
+// extractCursorTabPath parses the `@@ filepath:line` diff-header line that
+// Cursor Tab writes immediately after "=======>Model output" to identify
+// which file is being completed. Returns the file path on success.
+func extractCursorTabPath(line string) (string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "@@") {
+		return "", false
+	}
+	// Format: "@@ src/main/java/.../Foo.java:72" (one @@ pair, then the path).
+	rest := strings.TrimPrefix(trimmed, "@@")
+	rest = strings.TrimSpace(rest)
+	// Strip a trailing colon+line-number if present.
+	if i := strings.LastIndex(rest, ":"); i > 0 {
+		candidate := rest[:i]
+		if _, err := fmt.Sscanf(rest[i+1:], "%d", new(int)); err == nil {
+			rest = candidate
+		}
+	}
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return "", false
+	}
+	return rest, true
+}
+
 // extractCursorApplyPath looks for apply-event markers in a log line.
 // Returns the file path if one is found.
+//
+// The keyword set is intentionally narrow: it must look like an explicit
+// Composer or Agent APPLY event. We deliberately exclude the generic
+// "applyedit" / "applyEdit" keyword even though Cursor logs it for AI
+// applies — VS Code also emits applyEdit for Tab completions, formatter
+// rewrites, auto-import inserts, and other non-AI edits. Matching it
+// caused two compounding bugs:
+//
+//  1. A Tab completion's applyEdit log line (written AFTER the file save)
+//     emitted a whole-file cursor/chat row newer than the humanedit row for
+//     manually-typed lines in the same session, overriding their attribution.
+//
+//  2. The gen_type was hard-coded to "chat" in emitCursorLogEvent, so Tab
+//     completions showed up as "chat" instead of "completion".
+//
+// Tab completion attribution is handled by the editor plugin
+// (Cursor/VS Code DocumentListener → /edit endpoint).
 func extractCursorApplyPath(line string) (string, bool) {
 	lower := strings.ToLower(line)
-	// Must look like an AI apply event — not just any log line.
-	if !strings.Contains(lower, "composer") &&
+	if !strings.Contains(lower, "composerapply") &&
+		!strings.Contains(lower, "composer.apply") &&
 		!strings.Contains(lower, "agentedit") &&
-		!strings.Contains(lower, "applyedit") &&
-		!strings.Contains(lower, "agent.apply") &&
-		!strings.Contains(lower, "composerapply") {
+		!strings.Contains(lower, "agent.edit") &&
+		!strings.Contains(lower, "agent.apply") {
 		return "", false
 	}
 	// Extract the first file:// URI or /abs/path or C:\abs\path from the line.
@@ -239,6 +300,155 @@ func emitCursorLogEvent(abs string, sink daemon.Sink) {
 	}
 	if err := sink.Record(ev); err != nil {
 		log.Printf("cursor-log sink: %v", err)
+	}
+}
+
+// DebugCursorLogs tails Cursor's log files and prints detected AI-apply
+// events to out. It is the backing implementation of `blamely log cursor`.
+//
+// When debug is false (default) only lines that match an AI-apply keyword are
+// printed. When debug is true every scanned line is printed, prefixed with
+// "[MATCH]" or "[skip]", so users can trace why a Cursor Composer action was
+// or was not detected.
+//
+// The function blocks until ctx is cancelled; it is safe to call from a
+// cobra RunE with cmd.Context().
+func DebugCursorLogs(ctx context.Context, debug bool, out io.Writer) error {
+	dir, err := cursorLogsDir()
+	if err != nil {
+		return fmt.Errorf("cursor logs dir: %w", err)
+	}
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("Cursor log directory not found: %s\n"+
+			"Is Cursor installed and has it been opened at least once?", dir)
+	}
+
+	fmt.Fprintf(out, "Scanning Cursor logs in %s\n", dir)
+	if debug {
+		fmt.Fprintf(out, "Debug mode: all scanned lines are shown.\n")
+		fmt.Fprintf(out, "  [MATCH]            = Composer/Agent apply event (recorded by daemon)\n")
+		fmt.Fprintf(out, "  [Tab shown]        = Cursor Tab suggestion shown (tracked via editor plugin, not log)\n")
+		fmt.Fprintf(out, "  [skip]             = line scanned, no apply keyword found\n")
+	} else {
+		fmt.Fprintf(out, "Showing detected AI-apply events only (use --debug to see all lines).\n")
+	}
+	fmt.Fprintln(out)
+
+	tailers := map[string]context.CancelFunc{}
+	defer func() {
+		for _, cancel := range tailers {
+			cancel()
+		}
+	}()
+
+	tick := time.NewTicker(3 * time.Second)
+	defer tick.Stop()
+	for {
+		files := findCursorLogFiles(dir)
+		for _, f := range files {
+			if _, running := tailers[f]; running {
+				continue
+			}
+			tCtx, cancel := context.WithCancel(ctx)
+			tailers[f] = cancel
+			go func(path string) {
+				if err := debugTailCursorLog(tCtx, path, debug, out); err != nil && tCtx.Err() == nil {
+					fmt.Fprintf(out, "[error] %s: %v\n", path, err)
+				}
+			}(f)
+		}
+		// Prune tailers for files that have gone away.
+		seen := make(map[string]bool, len(files))
+		for _, f := range files {
+			seen[f] = true
+		}
+		for path, cancel := range tailers {
+			if !seen[path] {
+				cancel()
+				delete(tailers, path)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-tick.C:
+		}
+	}
+}
+
+// debugTailCursorLog tails one log file and writes each line to out.
+// In debug mode every line is printed; otherwise only matching lines.
+// Handles both Composer apply logs and Cursor Tab completion logs.
+func debugTailCursorLog(ctx context.Context, path string, debug bool, out io.Writer) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open: %w", err)
+	}
+	defer f.Close()
+
+	// Seek to end so we only show new lines written after the command starts.
+	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+		return fmt.Errorf("seek: %w", err)
+	}
+
+	isTabLog := isCursorTabLog(path)
+	shortPath := filepath.Base(filepath.Dir(path)) + "/" + filepath.Base(path)
+	r := bufio.NewReaderSize(f, 1<<16)
+	backoff := 200 * time.Millisecond
+	const maxBackoff = 2 * time.Second
+	modelOutputPending := false
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				return err
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(backoff):
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+			}
+			continue
+		}
+		backoff = 200 * time.Millisecond
+		trimmed := strings.TrimRight(line, "\r\n")
+
+		if isTabLog {
+			if strings.Contains(line, "=======>Model output") {
+				modelOutputPending = true
+				if debug {
+					fmt.Fprintf(out, "[wait]  %s  %s\n", shortPath, trimmed)
+				}
+				continue
+			}
+			if modelOutputPending {
+				if filePath, ok := extractCursorTabPath(line); ok {
+					modelOutputPending = false
+					fmt.Fprintf(out, "[Tab shown - not tracked] %s  →  %s\n", shortPath, filePath)
+				} else {
+					if !strings.HasPrefix(strings.TrimSpace(line), "@@") {
+						modelOutputPending = false
+					}
+					if debug {
+						fmt.Fprintf(out, "[skip]  %s  %s\n", shortPath, trimmed)
+					}
+				}
+				continue
+			}
+		} else {
+			if filePath, ok := extractCursorApplyPath(line); ok {
+				fmt.Fprintf(out, "[MATCH] %s  →  %s\n", shortPath, filePath)
+				continue
+			}
+		}
+
+		if debug {
+			fmt.Fprintf(out, "[skip]  %s  %s\n", shortPath, trimmed)
+		}
 	}
 }
 

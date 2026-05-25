@@ -17,14 +17,20 @@ const (
 	ansiBold  = "\x1b[1m"
 )
 
-// RenderBar writes a stacked horizontal bar comparing AI vs Human lines in
-// the commit covered by `note`. Layout:
+// RenderBar writes a commit attribution summary to w. Layout (color mode):
 //
-//	AI 59% (20)  [████████████████████░░░░░░░░░░░░░░░░░░░░]  Human 41% (14)
+//	blamely  ·  abc123def456  ·  main  ·  "commit message"
 //
-// The AI label is on the LEFT of the bar (green) and the Human label is on
-// the RIGHT (blue). Color is on by default; disable it with NO_COLOR=1.
-// Width defaults to 40 cells.
+//	AI 72%  [████████████████████████████░░░░░░░░░░░░]  Human 28%
+//	  claude 60 (claude-opus-4-7) — 1200 in / 500 out tok
+//
+//	Generation:
+//	  chat         72  ████████████████████  72.7%
+//	  cli           0  ░░░░░░░░░░░░░░░░░░░░
+//	  completion   27  ████████░░░░░░░░░░░░  27.3%
+//	  human         0  ░░░░░░░░░░░░░░░░░░░░
+//
+// Color is on by default; disable with NO_COLOR=1. Width defaults to 40.
 func RenderBar(w io.Writer, note *gitnotes.Note, width int) {
 	if width <= 0 {
 		width = 40
@@ -35,12 +41,34 @@ func RenderBar(w io.Writer, note *gitnotes.Note, width int) {
 	total := ai + hu
 	color := colorEnabled()
 
+	// Commit header — rendered when there's a SHA so the bar is self-identifying.
+	if note.Commit != "" {
+		sha := note.Commit
+		if len(sha) > 12 {
+			sha = sha[:12]
+		}
+		parts := []string{sha}
+		if note.Branch != "" {
+			parts = append(parts, note.Branch)
+		}
+		if note.Message != "" {
+			subject := strings.SplitN(note.Message, "\n", 2)[0]
+			if len(subject) > 52 {
+				subject = subject[:49] + "..."
+			}
+			parts = append(parts, "\""+subject+"\"")
+		}
+		header := "blamely  ·  " + strings.Join(parts, "  ·  ")
+		if color {
+			fmt.Fprintf(w, "\n%s%s%s\n\n", ansiBold, header, ansiReset)
+		} else {
+			fmt.Fprintf(w, "\n%s\n\n", header)
+		}
+	}
+
 	if total == 0 {
 		if del == 0 {
-			// Empty-commit (or note with no attributable lines): keep the
-			// visual layout consistent with the populated case by rendering
-			// the bar shape — an all-dim track — alongside the label, so
-			// the output column doesn't collapse to a single line of text.
+			// Empty commit: render an all-dim track so the column stays consistent.
 			label := "AI vs Human: (no changes)"
 			var bar string
 			if color {
@@ -52,12 +80,8 @@ func RenderBar(w io.Writer, note *gitnotes.Note, width int) {
 			fmt.Fprintf(w, "%s  [%s]\n", label, bar)
 			return
 		}
-		// Deletion-only commit. We don't currently attribute deletions per-line,
-		// so by convention they count as a 100% human action (deleting code is
-		// always a deliberate user act, even when the line being removed came
-		// from an AI originally).
-		humanCells := strings.Repeat("-", width)
-		humanBar := humanCells
+		// Deletion-only commit. Deletions are 100% human by convention.
+		humanBar := strings.Repeat("-", width)
 		humanLabel := fmt.Sprintf("Human 100%% (%d deleted)", del)
 		if color {
 			humanBar = ansiBlue + strings.Repeat("░", width) + ansiReset
@@ -67,7 +91,7 @@ func RenderBar(w io.Writer, note *gitnotes.Note, width int) {
 		return
 	}
 
-	// Round-half-up split so AI and Human cells sum to width exactly.
+	// Main AI/Human stacked bar.
 	aiCells := (ai*width + total/2) / total
 	if aiCells > width {
 		aiCells = width
@@ -86,18 +110,16 @@ func RenderBar(w io.Writer, note *gitnotes.Note, width int) {
 	aiPct := float64(ai) * 100 / float64(total)
 	huPct := float64(hu) * 100 / float64(total)
 
-	aiLabel := fmt.Sprintf("AI %.0f%% (%d)", aiPct, ai)
-	huLabel := fmt.Sprintf("Human %.0f%% (%d)", huPct, hu)
+	aiLabel := fmt.Sprintf("AI %.0f%%", aiPct)
+	huLabel := fmt.Sprintf("Human %.0f%%", huPct)
 	if color {
 		aiLabel = ansiGreen + ansiBold + aiLabel + ansiReset
 		huLabel = ansiBlue + ansiBold + huLabel + ansiReset
 	}
 
-	// AI label on the LEFT, Human label on the RIGHT.
 	fmt.Fprintf(w, "%s  [%s%s]  %s\n", aiLabel, aiPart, huPart, huLabel)
 
-	// Deletions side note. We don't currently attribute deletions per-line, so
-	// they're surfaced as a separate count rather than rolled into the bar.
+	// Deletions side note — not attributed per-line, treated as human.
 	if del > 0 {
 		delLabel := fmt.Sprintf("Deleted: %d lines (treated as 100%% human)", del)
 		if color {
@@ -106,9 +128,9 @@ func RenderBar(w io.Writer, note *gitnotes.Note, width int) {
 		fmt.Fprintln(w, "  "+delLabel)
 	}
 
-	// Per-tool breakdown when there's more than one AI tool with non-zero lines.
+	// Per-tool breakdown when at least one AI tool has non-zero lines.
 	var aiToolLines []string
-	for _, name := range []string{"claude", "cursor", "codex", "copilot"} {
+	for _, name := range []string{"claude", "cursor", "codex", "copilot", "gemini"} {
 		t, ok := note.ByTool[name]
 		if !ok || t.Lines == 0 {
 			continue
@@ -136,44 +158,61 @@ func RenderBar(w io.Writer, note *gitnotes.Note, width int) {
 		}
 	}
 
-	// Generation-type breakdown — only printed when there are AI lines.
-	if total == 0 || (note.ByGenType.Chat == 0 && note.ByGenType.CLI == 0 && note.ByGenType.Completion == 0) {
-		return
+	// Generation-type breakdown. Always rendered when there are added lines so
+	// the breakdown shows the full picture including modes with zero contribution.
+	// Uses █/░ block chars (not # or -) so the main-bar char counts stay clean.
+	g := note.ByGenType
+	genSum := g.Chat + g.CLI + g.Completion + g.Human
+	if genSum == 0 {
+		genSum = 1 // avoid division by zero; all bars render as empty
 	}
-	label := "Generation:"
-	if color {
-		label = ansiBold + label + ansiReset
-	}
-	fmt.Fprintln(w, label)
 
+	fmt.Fprintln(w)
+	genLabel := "Generation:"
+	if color {
+		genLabel = ansiBold + genLabel + ansiReset
+	}
+	fmt.Fprintln(w, genLabel)
+
+	const miniBarW = 20
 	type genRow struct {
 		name  string
 		lines int
-		color string
+		clr   string
 	}
-	rows := []genRow{
-		{"chat       ", note.ByGenType.Chat, ansiGreen},
-		{"cli        ", note.ByGenType.CLI, "\x1b[36m"}, // cyan
-		{"completion ", note.ByGenType.Completion, "\x1b[35m"}, // magenta
+	genRows := []genRow{
+		{"chat      ", g.Chat, ansiGreen},
+		{"cli       ", g.CLI, "\x1b[36m"},       // cyan
+		{"completion", g.Completion, "\x1b[35m"}, // magenta
+		{"human     ", g.Human, ansiBlue},
 	}
-	for _, r := range rows {
-		if r.lines == 0 {
-			continue
+	for _, r := range genRows {
+		filled := int(float64(miniBarW)*float64(r.lines)/float64(genSum) + 0.5)
+		if filled > miniBarW {
+			filled = miniBarW
 		}
+		pctStr := ""
+		if r.lines > 0 {
+			pct := float64(r.lines) * 100 / float64(genSum)
+			pctStr = fmt.Sprintf("  %5.1f%%", pct)
+		}
+		var bar string
 		if color {
-			fmt.Fprintf(w, "  %s%s%s%d lines\n", r.color, r.name, ansiReset, r.lines)
+			if r.lines > 0 {
+				bar = r.clr + strings.Repeat("█", filled) +
+					ansiDim + strings.Repeat("░", miniBarW-filled) + ansiReset
+			} else {
+				bar = ansiDim + strings.Repeat("░", miniBarW) + ansiReset
+			}
 		} else {
-			fmt.Fprintf(w, "  %s%d lines\n", r.name, r.lines)
+			bar = strings.Repeat("█", filled) + strings.Repeat("░", miniBarW-filled)
 		}
+		fmt.Fprintf(w, "  %-12s %4d  %s%s\n", r.name, r.lines, bar, pctStr)
 	}
 }
 
 // colorEnabled reports whether ANSI color codes should be emitted.
 // On by default, off when NO_COLOR is set (https://no-color.org).
-// We deliberately don't gate on isatty(stdout) because the bar is meant to
-// be read directly even when captured by `git commit | tee` or similar; the
-// few extra bytes are harmless and most terminals strip ANSI when redirected
-// to a file via the user's own pipeline.
 func colorEnabled() bool {
 	return os.Getenv("NO_COLOR") == ""
 }

@@ -166,11 +166,6 @@ func (v *VelocityWatcher) handleChange(
 		return
 	}
 
-	tool, genType := v.classifySource(ctx)
-	if tool == "" {
-		return // can't attribute — skip
-	}
-
 	abs := path
 	if r, err := filepath.EvalSymlinks(path); err == nil {
 		abs = r
@@ -182,6 +177,11 @@ func (v *VelocityWatcher) handleChange(
 		if r, err := filepath.Rel(wt, abs); err == nil && !strings.HasPrefix(r, "..") {
 			rel = r
 		}
+	}
+
+	tool, genType := v.classifySource(ctx, repoID)
+	if tool == "" {
+		return // can't attribute — skip
 	}
 	lr, err := LineRangeForWholeFile(abs)
 	if err != nil || lr == nil {
@@ -205,9 +205,9 @@ func (v *VelocityWatcher) handleChange(
 
 // classifySource decides which AI tool caused the velocity event.
 // Returns ("", "") if we can't make a reliable attribution.
-func (v *VelocityWatcher) classifySource(ctx context.Context) (tool, genType string) {
+func (v *VelocityWatcher) classifySource(ctx context.Context, repoID string) (tool, genType string) {
 	// 1. Copilot: was a Copilot session active recently?
-	if v.DB.HasCopilotSessionNear(time.Now().UnixNano(), int64(copilotWindow)) {
+	if v.DB.HasCopilotSessionNear(repoID, time.Now().UnixNano(), int64(copilotWindow)) {
 		return "copilot", "completion"
 	}
 	// 2. Cursor tab completion: is Cursor.app running?

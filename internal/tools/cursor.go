@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -16,26 +15,30 @@ import (
 
 	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/daemon"
-	"github.com/blamely/blamely/internal/gitutil"
 )
 
-// CursorWatcher attributes file changes to Cursor when they coincide with a
-// Cursor "History" backup write. Cursor maintains an undo history at:
+// CursorWatcher observes Cursor's File History directory as a low-grade
+// "Cursor is active" signal. It does NOT emit per-file attribution rows.
 //
 //   macOS  : ~/Library/Application Support/Cursor/User/History/
 //   Linux  : ~/.config/Cursor/User/History/
 //   Windows: %APPDATA%/Cursor/User/History/
 //
-// Each history entry is a directory containing an entries.json (the workspace
-// file path) and one or more snapshot files. When Cursor writes a new
-// snapshot, we read entries.json to find which workspace file was modified
-// and record an attribution event.
+// Why no rows? File History fires on every save — manual typing, paste,
+// formatter reflow, AND AI Composer/Apply. There's no signal in the
+// snapshot itself about source. An earlier version of this watcher emitted
+// whole-file `tool=cursor, gen_type=chat` rows for every snapshot; that
+// silently swallowed human typing in Cursor (humanedit's rangeClaimedByAI
+// suppresses any human range fully covered by an AI claim, and a
+// whole-file range covers everything). The user-visible symptom was
+// commits typed by hand showing 100% AI attribution.
 //
-// Confidence is HIGH when Cursor is the only IDE active on the file (the
-// History backup is unambiguous), but we can't easily distinguish manual
-// typing in Cursor from AI Composer/Apply edits without parsing Cursor's
-// internal workspace SQLite. So v1 records ALL Cursor-edited lines with
-// confidence=medium and notes "all-cursor (AI or manual)" in raw_meta.
+// The real Cursor AI signals are:
+//   - CursorLogWatcher    — picks up explicit Composer/Apply log events.
+//   - The editor plugin   — picks up Tab completions via DocumentListener.
+//
+// This watcher now just keeps the History scan around for future signals
+// (e.g. corroborating a CursorLogWatcher event with a near-time snapshot).
 type CursorWatcher struct {
 	// HistoryDir overrides the default for tests.
 	HistoryDir string
@@ -221,51 +224,13 @@ func readCursorEntries(path string) (*cursorEntries, error) {
 	return &ce, nil
 }
 
+// emit is intentionally a no-op. See the package-level comment on
+// CursorWatcher for why History snapshots are not used for attribution.
+// The signature is retained so the scan loop continues to compile and we
+// can re-introduce a real signal here later (e.g. a non-file-path
+// "Cursor session active" marker for cross-watcher corroboration).
 func (c *CursorWatcher) emit(manifest *cursorEntries, snapshot string, when time.Time, sink daemon.Sink) {
-	abs := uriToPath(manifest.Resource)
-	if abs == "" {
-		return
-	}
-	if _, err := os.Stat(abs); err != nil {
-		// File was deleted/moved — skip.
-		return
-	}
-	// Resolve symlinks so the file path matches the worktree's resolved root.
-	if r, err := filepath.EvalSymlinks(abs); err == nil {
-		abs = r
-	}
-	repo, _ := gitutil.RepoID(abs)
-	wt, _ := gitutil.Toplevel(abs)
-	rel := abs
-	if wt != "" {
-		if r, err := filepath.Rel(wt, abs); err == nil && !strings.HasPrefix(r, "..") {
-			rel = r
-		}
-	}
-
-	// We don't know which lines were touched by the AI vs manually. v1 marks
-	// the whole file as cursor-touched at the time of the snapshot, with
-	// medium confidence. The attribute step will only assign to cursor the
-	// lines that ALSO appear in the commit diff — manual interleaving is
-	// captured implicitly because any line later touched by the human (after
-	// the snapshot) will get a more-recent edit row from fsnotify (future).
-	lr, err := LineRangeForWholeFile(abs)
-	if err != nil || lr == nil {
-		return
-	}
-	ev := daemon.Event{
-		When:       when,
-		Tool:       "cursor",
-		Confidence: "medium",
-		GenType:    "chat", // Cursor history = Composer session (chat panel)
-		RepoPath:   repo,
-		FilePath:   rel,
-		Lines:      []daemon.LineRange{{Start: lr.Start, End: lr.End, ContentSHA: lr.ContentSHA}},
-		RawMeta:    fmt.Sprintf(`{"source":"cursor_history","snapshot":%q}`, filepath.Base(snapshot)),
-	}
-	if err := sink.Record(ev); err != nil {
-		log.Printf("cursor sink: %v", err)
-	}
+	_, _, _, _ = manifest, snapshot, when, sink
 }
 
 // uriToPath decodes a "file:///" URI into a local path. Returns "" if the

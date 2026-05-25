@@ -39,6 +39,9 @@ type claudeHookPayload struct {
 	// Cursor-specific fields
 	CursorVersion string `json:"cursor_version"`
 	Model         string `json:"model"` // Cursor puts the model in the top-level payload
+	// GenType may be set by Cursor to "completion" for Tab accepts vs "chat"
+	// for Composer edits. When empty we infer from the session context.
+	GenType string `json:"gen_type"`
 }
 
 type editInput struct {
@@ -106,17 +109,38 @@ func RecordClaudeFromStdin(r io.Reader) error {
 		tool = "cursor"
 	}
 
-	// Both Claude Code and Cursor Composer are conversational (chat) sessions.
+	// Determine generation type.
+	//
+	// Claude Code is always a chat session.
+	//
+	// For Cursor we distinguish two sources:
+	//   - Composer (chat): fires from within a conversation → session_id or
+	//     conversation_id is set in the payload.
+	//   - Cursor Tab (inline completion): no conversation context → both IDs
+	//     are empty. When Cursor sets gen_type explicitly in the payload we
+	//     honour that directly; otherwise we use the session-presence heuristic.
+	genType := "chat"
+	if isCursor {
+		switch {
+		case p.GenType != "":
+			// Cursor explicitly told us what this is.
+			genType = p.GenType
+		case p.SessionID == "" && p.ConversationID == "":
+			// No conversation context → inline Tab completion.
+			genType = "completion"
+		}
+	}
+
 	payload := daemon.EditPayload{
 		Tool:           tool,
 		Confidence:     "high",
-		GenType:        "chat",
+		GenType:        genType,
 		RepoPath:       repoPath,
 		FilePath:       rel,
 		SuggestedLines: suggested,
 		Lines:          toDaemonRanges(ranges),
-		RawMeta: fmt.Sprintf(`{"session_id":%q,"tool":%q,"cursor_version":%q}`,
-			p.SessionID, p.ToolName, p.CursorVersion),
+		RawMeta: fmt.Sprintf(`{"session_id":%q,"tool":%q,"cursor_version":%q,"transcript_path":%q}`,
+			p.SessionID, p.ToolName, p.CursorVersion, p.TranscriptPath),
 	}
 
 	if isCursor {

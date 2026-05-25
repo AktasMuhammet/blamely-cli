@@ -12,7 +12,6 @@ import (
 	"github.com/blamely/blamely/internal/gitnotes"
 	"github.com/blamely/blamely/internal/install"
 	"github.com/blamely/blamely/internal/report"
-	"github.com/blamely/blamely/internal/store"
 	"github.com/blamely/blamely/internal/tools"
 )
 
@@ -45,6 +44,7 @@ func main() {
 	root.AddCommand(cmdHistory())
 	root.AddCommand(cmdStatus())
 	root.AddCommand(cmdDoctor())
+	root.AddCommand(cmdLog())
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -57,6 +57,12 @@ func cmdDaemon() *cobra.Command {
 		Use:   "daemon",
 		Short: "Run the long-lived attribution daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Watchers use direct, observable signals (hooks, log parsers,
+			// editor plugin events). The velocity/heuristic watcher has been
+			// removed: inline completions are now attributed at high confidence
+			// by the VS Code and IntelliJ plugins via the
+			// editor.action.inlineSuggest.commit command and AnActionListener
+			// APIs respectively, both of which POST directly to /edit.
 			daemon.Watchers = []daemon.Watcher{
 				&tools.CodexWatcher{},
 				&tools.CursorWatcher{},
@@ -65,14 +71,6 @@ func cmdDaemon() *cobra.Command {
 				&tools.CopilotChatWatcher{},
 				&tools.CopilotLogWatcher{},
 			}
-			// DB-backed watchers go through the factory hook so daemon doesn't
-			// import the tools package directly.
-			daemon.DBWatcherFactory = func(db *store.DB) daemon.Watcher {
-				return &tools.VelocityWatcher{DB: db}
-			}
-			daemon.DBWatcherFactories = append(daemon.DBWatcherFactories,
-				func(db *store.DB) daemon.Watcher { return &tools.HumanEditWatcher{DB: db} },
-			)
 			return daemon.Run(cmd.Context())
 		},
 	}
@@ -309,6 +307,32 @@ func cmdStatus() *cobra.Command {
 			return daemon.PrintStatus()
 		},
 	}
+}
+
+func cmdLog() *cobra.Command {
+	parent := &cobra.Command{
+		Use:   "log",
+		Short: "Live-tail tool logs for debugging attribution",
+	}
+	parent.AddCommand(cmdLogCursor())
+	return parent
+}
+
+func cmdLogCursor() *cobra.Command {
+	var debug bool
+	c := &cobra.Command{
+		Use:   "cursor",
+		Short: "Tail Cursor logs and show detected AI-apply events",
+		Long: "Watches Cursor's extension-host log files and prints every line that\n" +
+			"blamely's CursorLogWatcher would record as a Composer/Agent apply event.\n\n" +
+			"Use --debug to see every scanned line (with [MATCH] or [skip] prefix)\n" +
+			"so you can trace why a specific Composer action was or was not detected.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return tools.DebugCursorLogs(cmd.Context(), debug, os.Stdout)
+		},
+	}
+	c.Flags().BoolVar(&debug, "debug", false, "show all scanned lines, not just matches")
+	return c
 }
 
 func cmdDoctor() *cobra.Command {

@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -9,11 +10,15 @@ import (
 type Tool string
 
 const (
-	ToolClaude    Tool = "claude"
-	ToolCursor    Tool = "cursor"
-	ToolCodex     Tool = "codex"
-	ToolCopilot   Tool = "copilot"
-	ToolHuman     Tool = "human"
+	ToolClaude  Tool = "claude"
+	ToolCursor  Tool = "cursor"
+	ToolCodex   Tool = "codex"
+	ToolCopilot Tool = "copilot"
+	// ToolHuman is retained ONLY to recognise legacy rows written before the
+	// human/tool split. New code never writes this value — human-typed code
+	// is represented by tool="" + gen_type=GenTypeHuman. Readers normalise
+	// legacy ToolHuman rows on the fly.
+	ToolHuman Tool = "human"
 	// ToolCopyPaste marks content that arrived via a clipboard paste rather
 	// than being typed. We don't claim AI origin — the source could be a
 	// web AI chat, another project, Stack Overflow, etc. The signal is
@@ -37,7 +42,11 @@ const (
 	GenTypeChat       GenType = "chat"       // Conversational AI session (Claude Code, Cursor Composer, Copilot Chat)
 	GenTypeCLI        GenType = "cli"        // Command-line tool (Codex CLI, claude CLI)
 	GenTypeCompletion GenType = "completion" // Inline/tab completion (Copilot Tab, Cursor Tab)
-	GenTypeUnknown    GenType = "unknown"
+	// GenTypeHuman is for code typed by the user. Paired with an empty tool
+	// field — humans aren't a tool. This is what HumanEditWatcher emits and
+	// what attribute.go falls back to when no AI signal claims a line.
+	GenTypeHuman   GenType = "human"
+	GenTypeUnknown GenType = "unknown"
 )
 
 type Edit struct {
@@ -126,8 +135,11 @@ func (db *DB) InsertEdit(e Edit) (int64, error) {
 	return id, nil
 }
 
-// EditsForFileSince returns edits touching repo/file with ts >= sinceNanos,
-// newest first. Used by the attribution join.
+// EditsForFileSince returns edits touching repo/file with ts >= sinceNanos.
+// Sorted by confidence DESC then ts DESC so that high-confidence records
+// (PostToolUse hooks) are always preferred over medium/low-confidence records
+// (log watchers, VelocityWatcher) for the same line, regardless of which
+// fired last. Within the same confidence level, newest wins.
 func (db *DB) EditsForFileSince(repo, file string, sinceNanos int64) ([]Edit, error) {
 	rows, err := db.Query(`
 		SELECT id, ts, repo_path, file_path, tool, confidence, gen_type,
@@ -135,7 +147,9 @@ func (db *DB) EditsForFileSince(repo, file string, sinceNanos int64) ([]Edit, er
 			hash_before, hash_after, raw_meta, suggested_lines
 		FROM edits
 		WHERE repo_path = ? AND file_path = ? AND ts >= ?
-		ORDER BY ts DESC`,
+		ORDER BY
+			CASE confidence WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
+			ts DESC`,
 		repo, file, sinceNanos,
 	)
 	if err != nil {
@@ -190,17 +204,16 @@ func (db *DB) linesForEdit(editID int64) ([]EditLine, error) {
 }
 
 // LatestCopilotModelNear returns the model string from the most recent
-// copilot row whose timestamp falls inside [ts-window, ts+window] AND that
-// has a non-null model. Returns "" when no such row exists. Used by the
-// HumanEditWatcher so an in-editor paste that we attribute to Copilot can
-// be tagged with the model the user actually had selected in the chat
-// panel (recorded by CopilotChatWatcher's session-file parse).
-func (db *DB) LatestCopilotModelNear(tsNanos, windowNanos int64) string {
+// copilot row for repoPath whose timestamp falls inside [ts-window, ts+window]
+// AND that has a non-null model. Returns "" when no such row exists. Used by
+// the attribution step to back-fill the model onto Copilot-attributed lines.
+// repoPath filters to the same repository to avoid cross-repo model bleed.
+func (db *DB) LatestCopilotModelNear(repoPath string, tsNanos, windowNanos int64) string {
 	row := db.QueryRow(`SELECT model FROM edits
-		WHERE tool='copilot' AND model IS NOT NULL AND model != ''
+		WHERE tool='copilot' AND repo_path=? AND model IS NOT NULL AND model != ''
 		  AND ts >= ? AND ts <= ?
 		ORDER BY ts DESC LIMIT 1`,
-		tsNanos-windowNanos, tsNanos+windowNanos)
+		repoPath, tsNanos-windowNanos, tsNanos+windowNanos)
 	var model sql.NullString
 	if err := row.Scan(&model); err != nil {
 		return ""
@@ -250,13 +263,15 @@ func (db *DB) LatestCopilotGenTypeNear(tsNanos, windowNanos int64) string {
 }
 
 // HasCopilotSessionNear returns true when at least one copilot session-active
-// marker exists in the DB with a timestamp inside [ts-window, ts+window].
+// marker exists in the DB for repoPath with a timestamp inside [ts-window, ts+window].
 // Used by the attribution step to fold in Copilot attribution for lines that
 // have no other AI edit record.
-func (db *DB) HasCopilotSessionNear(tsNanos, windowNanos int64) bool {
+// repoPath filters to the same repository so Copilot activity in an unrelated
+// repo open in a different editor window doesn't pollute this commit's attribution.
+func (db *DB) HasCopilotSessionNear(repoPath string, tsNanos, windowNanos int64) bool {
 	row := db.QueryRow(`SELECT COUNT(*) FROM edits
-		WHERE tool='copilot' AND ts >= ? AND ts <= ?`,
-		tsNanos-windowNanos, tsNanos+windowNanos)
+		WHERE tool='copilot' AND repo_path=? AND ts >= ? AND ts <= ?`,
+		repoPath, tsNanos-windowNanos, tsNanos+windowNanos)
 	var count int
 	_ = row.Scan(&count)
 	return count > 0
@@ -301,23 +316,98 @@ type CommitRow struct {
 	TS       int64 // unix nanos
 }
 
-// SessionDurationNanos estimates how long the user worked before a commit by
-// looking at the earliest edit in the DB that contributed to that commit.
-// Specifically it finds min(edits.ts) for the given repo where ts <= commitNanos,
-// then returns commitNanos - min(ts). Returns 0 if no edits are found.
+// SessionDurationNanos estimates how long the user worked on the current
+// commit by finding the earliest edit in the window between the previous
+// commit (in the same repo) and this commit, then returning
+// commitNanos - min(ts).
+//
+// Coding time resets at every commit: edits older than the previous commit's
+// timestamp do NOT contribute to this commit's session. If no prior commit
+// exists for the repo, the window opens 8 hours before this commit. Returns
+// 0 when no edits land inside the window.
 func (db *DB) SessionDurationNanos(repoPath string, commitNanos int64) int64 {
-	const lookback = int64(8 * 60 * 60 * 1e9) // 8-hour max session window
-	row := db.QueryRow(`
-		SELECT COALESCE(MIN(ts), 0) FROM edits
-		WHERE repo_path = ? AND ts <= ? AND ts >= ? AND file_path != ''`,
-		repoPath, commitNanos, commitNanos-lookback,
-	)
+	const maxLookback = int64(8 * 60 * 60 * 1e9) // 8h cap for the first-commit case
+
+	// Floor the window at the previous commit's timestamp so each commit's
+	// coding time covers only edits made AFTER the previous commit was
+	// recorded. A rebase or out-of-order import that puts the previous
+	// commit's ts after the current one is harmless — the SELECT below
+	// ignores commits at or after commitNanos.
+	var prevCommitTS int64
+	_ = db.QueryRow(`
+		SELECT COALESCE(MAX(ts), 0) FROM commits
+		WHERE repo_path = ? AND ts < ?`,
+		repoPath, commitNanos,
+	).Scan(&prevCommitTS)
+
+	lowerBound := commitNanos - maxLookback
+	if prevCommitTS > lowerBound {
+		lowerBound = prevCommitTS
+	}
+
+	// Strict `>` on the lower bound: we want edits made AFTER the previous
+	// commit, not at the exact instant of it (which would belong to the
+	// previous session by definition).
 	var minTS int64
-	_ = row.Scan(&minTS)
+	_ = db.QueryRow(`
+		SELECT COALESCE(MIN(ts), 0) FROM edits
+		WHERE repo_path = ? AND ts <= ? AND ts > ? AND file_path != ''`,
+		repoPath, commitNanos, lowerBound,
+	).Scan(&minTS)
+
 	if minTS == 0 {
 		return 0
 	}
 	return commitNanos - minTS
+}
+
+// PreviousCommitTimestampNanos returns the timestamp of the most recent commit
+// recorded in the DB before beforeNanos for the given repo. Returns 0 when no
+// prior commit exists (i.e. this is the first commit blamely has seen for the
+// repo). Used by buildNote to establish the lower bound for AI edit lookups so
+// stale records from a previous coding session don't claim human-typed lines.
+func (db *DB) PreviousCommitTimestampNanos(repoPath string, beforeNanos int64) int64 {
+	var ts int64
+	_ = db.QueryRow(
+		`SELECT COALESCE(MAX(ts), 0) FROM commits WHERE repo_path = ? AND ts < ?`,
+		repoPath, beforeNanos,
+	).Scan(&ts)
+	return ts
+}
+
+// TranscriptPathsForPeriod returns the distinct non-empty transcript_path
+// values stored in raw_meta for edits in the given repo and time window.
+// These are the Claude Code transcript files (.jsonl) associated with the
+// edits that contributed to a commit.
+func (db *DB) TranscriptPathsForPeriod(repoPath string, sinceNanos, untilNanos int64) ([]string, error) {
+	rows, err := db.Query(`
+		SELECT DISTINCT raw_meta FROM edits
+		WHERE repo_path = ? AND ts >= ? AND ts <= ?
+		  AND raw_meta LIKE '%transcript_path%'`,
+		repoPath, sinceNanos, untilNanos)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	seen := map[string]bool{}
+	var out []string
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			continue
+		}
+		var m struct {
+			TranscriptPath string `json:"transcript_path"`
+		}
+		if err := json.Unmarshal([]byte(raw), &m); err != nil || m.TranscriptPath == "" {
+			continue
+		}
+		if !seen[m.TranscriptPath] {
+			seen[m.TranscriptPath] = true
+			out = append(out, m.TranscriptPath)
+		}
+	}
+	return out, rows.Err()
 }
 
 // KnownRepoPaths returns all distinct repo_path values from the edits table.

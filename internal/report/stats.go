@@ -147,7 +147,7 @@ func renderStats(w io.Writer, note *gitnotes.Note, meta commitMeta_, sessionNano
 	// AI attribution
 	if note.Totals.AILines > 0 {
 		fmt.Fprintf(w, "%s\n", bold("AI attribution:"))
-		for _, name := range []string{"claude", "cursor", "codex", "copilot"} {
+		for _, name := range []string{"claude", "cursor", "codex", "copilot", "gemini"} {
 			t, ok := note.ByTool[name]
 			if !ok || t.Lines == 0 {
 				continue
@@ -277,7 +277,7 @@ func fileToolBreakdown(f gitnotes.FileEntry) string {
 		counts[l.Tool]++
 	}
 	var parts []string
-	for _, name := range []string{"claude", "cursor", "codex", "copilot", "human"} {
+	for _, name := range []string{"claude", "cursor", "codex", "copilot", "gemini", "human"} {
 		if c := counts[name]; c > 0 {
 			parts = append(parts, fmt.Sprintf("%s %d", name, c))
 		}

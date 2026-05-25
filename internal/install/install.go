@@ -180,6 +180,17 @@ func Run() error {
 		}
 	}
 
+	// 5. Default exclude file. We never overwrite an existing one — users
+	// edit ~/.blamely/exclude to customise what's skipped from attribution,
+	// and a fresh install must keep their edits intact.
+	if excludePath, created, eerr := config.EnsureDefaultExcludeFile(); eerr != nil {
+		fmt.Printf("  • Could not write default exclude file: %v\n", eerr)
+	} else if created {
+		fmt.Printf("  ✓ Default exclude list written to %s\n", excludePath)
+	} else {
+		fmt.Printf("  • Exclude list already present at %s\n", excludePath)
+	}
+
 	if err := SaveState(s); err != nil {
 		return fmt.Errorf("save state: %w", err)
 	}

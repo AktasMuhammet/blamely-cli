@@ -6,6 +6,8 @@ import (
 	"io"
 	"os/exec"
 	"strings"
+
+	"github.com/blamely/blamely/internal/config"
 )
 
 // AddedLine is one line that was added (or modified) by the commit.
@@ -62,6 +64,10 @@ func ChangedLines(repoPath, sha string) ([]AddedLine, error) {
 // DiffCommit is ChangedLines + rename tracking. Uses `git diff -M` so
 // renames are surfaced as `rename from` / `rename to` headers instead of
 // add+delete pairs.
+//
+// Files matching ~/.blamely/exclude or the repo's .gitignore are filtered
+// out at parse time — they never appear in CommitChange and therefore
+// never enter attribution or reports.
 func DiffCommit(repoPath, sha string) (*CommitChange, error) {
 	parent, hasParent, err := parentSHA(repoPath, sha)
 	if err != nil {
@@ -86,7 +92,11 @@ func DiffCommit(repoPath, sha string) (*CommitChange, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("git diff: %w", err)
 	}
-	out, perr := parseDiff(stdout)
+	// Lenient exclude-list load: any error (file missing, permission denied)
+	// yields a nil filter, which the parser treats as "exclude nothing". A
+	// broken exclude config must never break attribution.
+	excl, _ := config.LoadExcludeListForRepo(repoPath)
+	out, perr := parseDiff(stdout, excl)
 	_ = cmd.Wait()
 	if perr != nil {
 		return nil, perr
@@ -108,7 +118,7 @@ func DiffCommit(repoPath, sha string) (*CommitChange, error) {
 // when an earlier hunk in the same file has shifted line numbers — comparing
 // pre-image delete line numbers against post-image add line numbers
 // produces false negatives the moment the file's net line count drifts.
-func parseDiff(r io.Reader) (*CommitChange, error) {
+func parseDiff(r io.Reader, excl *config.ExcludeList) (*CommitChange, error) {
 	out := &CommitChange{
 		Deleted:     map[string][]int{},
 		Renames:     map[string]string{},
@@ -125,6 +135,11 @@ func parseDiff(r io.Reader) (*CommitChange, error) {
 	diffHeaderPath := ""
 	pendingRenameFrom := ""
 	pendingCopyFrom := ""
+	// skipFile is set when the current file matched an exclude rule. While
+	// true, every subsequent line (hunk header, +/-, file-mode lines) is
+	// ignored until the next `diff --git` header resets the flag. Excluded
+	// files leave no trace in CommitChange.
+	skipFile := false
 
 	// Per-hunk buffers — see function comment for pairing semantics.
 	type hunkAdd struct {
@@ -177,22 +192,40 @@ func parseDiff(r io.Reader) (*CommitChange, error) {
 	}
 	for sc.Scan() {
 		line := sc.Text()
-		switch {
-		case strings.HasPrefix(line, "diff --git "):
-			// File boundary: flush the previous file's last hunk before its
-			// curFile/curDelFile get overwritten.
+		// File boundary: handle the `diff --git` header BEFORE the skip
+		// gate so an excluded file can't carry skipFile into the next file.
+		if strings.HasPrefix(line, "diff --git ") {
+			// Flush the previous file's last hunk before its curFile /
+			// curDelFile get overwritten.
 			flushHunk()
-			// "diff --git a/PRE b/POST" — extract POST as the file's identity.
-			// We treat each new diff section as MODIFIED by default; later
-			// headers (new file/deleted file/rename) override.
 			diffHeaderPath = postPathFromDiffHeader(line)
+			pendingRenameFrom = ""
+			pendingCopyFrom = ""
+			// Reset the per-file skip flag and re-evaluate against the new
+			// path. Excluded files leave no trace: no FileChanges entry,
+			// no Added, no Deleted.
+			skipFile = excl.Match(diffHeaderPath)
+			if skipFile {
+				// Also clear the working state so any trailing tokens from
+				// the previous file (e.g. an unflushed +/- buffer slot)
+				// don't get attributed to this excluded file.
+				curFile = ""
+				curDelFile = ""
+				curLine = 0
+				curDelLine = 0
+				continue
+			}
 			if diffHeaderPath != "" {
 				if _, ok := out.FileChanges[diffHeaderPath]; !ok {
 					out.FileChanges[diffHeaderPath] = FileModified
 				}
 			}
-			pendingRenameFrom = ""
-			pendingCopyFrom = ""
+			continue
+		}
+		if skipFile {
+			continue
+		}
+		switch {
 		case strings.HasPrefix(line, "new file mode"):
 			setFileChange(diffHeaderPath, FileAdded)
 		case strings.HasPrefix(line, "deleted file mode"):

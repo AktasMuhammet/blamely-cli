@@ -208,6 +208,67 @@ func TestAddedOrChangedRanges_AppendAtEnd(t *testing.T) {
 	}
 }
 
+// TestAddedOrChangedRanges_NewLine verifies that a genuinely new line
+// (content not present anywhere in the old file) is flagged.
+func TestAddedOrChangedRanges_NewLine(t *testing.T) {
+	old := []byte("line1\nline2\n")
+	new_ := []byte("line1\nline_new\nline2\n")
+	ranges := AddedOrChangedRanges(old, new_)
+	if len(ranges) != 1 || ranges[0].Start != 2 || ranges[0].End != 2 {
+		t.Errorf("expected [2,2], got %v", ranges)
+	}
+}
+
+// TestAddedOrChangedRanges_ModifiedLine verifies that a line whose content
+// changed (old content gone, new content added) is flagged.
+func TestAddedOrChangedRanges_ModifiedLine(t *testing.T) {
+	old := []byte("func foo() {\n  return 1\n}\n")
+	new_ := []byte("func foo() {\n  return 2\n}\n")
+	ranges := AddedOrChangedRanges(old, new_)
+	if len(ranges) != 1 || ranges[0].Start != 2 || ranges[0].End != 2 {
+		t.Errorf("expected [2,2] for changed return value, got %v", ranges)
+	}
+}
+
+// TestAddedOrChangedRanges_UnchangedFileYieldsNoRanges confirms that
+// identical old/new content produces an empty result.
+func TestAddedOrChangedRanges_UnchangedFileYieldsNoRanges(t *testing.T) {
+	content := []byte("a\nb\nc\n")
+	if got := AddedOrChangedRanges(content, content); len(got) != 0 {
+		t.Errorf("identical content: expected no ranges, got %v", got)
+	}
+}
+
+// TestAddedOrChangedRanges_DuplicateLineIsDetected is a regression test for
+// the multiset fix: a file with N identical lines, after adding an (N+1)th
+// identical line, must flag the extra as a new line.
+func TestAddedOrChangedRanges_DuplicateLineIsDetected(t *testing.T) {
+	old := []byte("func foo() {\n\treturn 1\n}\nfunc bar() {\n\treturn 2\n}\n")
+	new_ := []byte("func foo() {\n\treturn 1\n}\nfunc bar() {\n\treturn 2\n}\nfunc baz() {\n\treturn 3\n}\n")
+	ranges := AddedOrChangedRanges(old, new_)
+	if len(ranges) != 1 {
+		t.Fatalf("expected 1 range for 3 new lines, got %d: %v", len(ranges), ranges)
+	}
+	if ranges[0].Start != 7 || ranges[0].End != 9 {
+		t.Errorf("expected [7,9] for appended func, got %v", ranges[0])
+	}
+}
+
+// TestAddedOrChangedRanges_InsertedDuplicateLine verifies inserting a line
+// whose content exists elsewhere in the old file IS flagged once the count
+// exceeds the old occurrence count.
+func TestAddedOrChangedRanges_InsertedDuplicateLine(t *testing.T) {
+	old := []byte("func a() {\n\treturn nil\n}\n")
+	new_ := []byte("func a() {\n\treturn nil\n}\nfunc b() {\n\treturn nil\n}\n")
+	ranges := AddedOrChangedRanges(old, new_)
+	if len(ranges) != 1 {
+		t.Fatalf("expected 1 range, got %d: %v", len(ranges), ranges)
+	}
+	if ranges[0].Start != 4 || ranges[0].End != 6 {
+		t.Errorf("expected [4,6], got %v", ranges[0])
+	}
+}
+
 func TestNarrowToChangedLines_OnlyTruncatesContextLines(t *testing.T) {
 	// new_string spans absolute file lines 10..14 (5 lines). The first and
 	// last lines are unchanged context (also in old_string). Only the

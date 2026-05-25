@@ -251,15 +251,139 @@ func TestMarkCommitNoted(t *testing.T) {
 	}
 }
 
+// ---- SessionDurationNanos ----
+
+func TestSessionDurationNanos_FirstCommit_UsesEarliestEditInWindow(t *testing.T) {
+	db := openTestDB(t)
+	const repo = "/repo"
+	commitTS := int64(10_000_000_000_000) // arbitrary base
+
+	// Edit 1 hour before the commit. No prior commits exist, so the lookup
+	// window is bounded by the 8h cap on the lower side.
+	editTS := commitTS - int64(time.Hour)
+	if _, err := db.InsertEdit(Edit{
+		TimestampNanos: editTS,
+		RepoPath:       repo,
+		FilePath:       "foo.go",
+		Tool:           ToolHuman,
+		Confidence:     ConfidenceHigh,
+	}); err != nil {
+		t.Fatalf("InsertEdit: %v", err)
+	}
+
+	got := db.SessionDurationNanos(repo, commitTS)
+	if want := int64(time.Hour); got != want {
+		t.Errorf("session duration: want %v, got %v", time.Duration(want), time.Duration(got))
+	}
+}
+
+func TestSessionDurationNanos_ResetsAfterPreviousCommit(t *testing.T) {
+	// Regression test for the per-commit reset bug. If commit A is at T,
+	// then commit B at T+15min, then commit B's session duration must be
+	// computed from edits AFTER A — not from the earliest edit in the
+	// last 8 hours.
+	db := openTestDB(t)
+	const repo = "/repo"
+	prevCommitTS := int64(10_000_000_000_000)
+	currCommitTS := prevCommitTS + int64(15*time.Minute)
+
+	// Mark the previous commit at T.
+	if err := db.MarkCommitNoted("prev_sha", repo, prevCommitTS); err != nil {
+		t.Fatalf("MarkCommitNoted: %v", err)
+	}
+
+	// Edit from BEFORE the previous commit (2 hours back). Must NOT
+	// contribute to the current commit's session.
+	if _, err := db.InsertEdit(Edit{
+		TimestampNanos: prevCommitTS - int64(2*time.Hour),
+		RepoPath:       repo,
+		FilePath:       "old.go",
+		Tool:           ToolHuman,
+	}); err != nil {
+		t.Fatalf("InsertEdit old: %v", err)
+	}
+
+	// Edit 10 minutes before the current commit (so 5 min after the
+	// previous commit). This is the earliest qualifying edit and should
+	// produce a 10-minute coding time.
+	if _, err := db.InsertEdit(Edit{
+		TimestampNanos: currCommitTS - int64(10*time.Minute),
+		RepoPath:       repo,
+		FilePath:       "new.go",
+		Tool:           ToolHuman,
+	}); err != nil {
+		t.Fatalf("InsertEdit new: %v", err)
+	}
+
+	got := db.SessionDurationNanos(repo, currCommitTS)
+	if want := int64(10 * time.Minute); got != want {
+		t.Errorf("session duration: want %v (10 min), got %v", time.Duration(want), time.Duration(got))
+	}
+}
+
+func TestSessionDurationNanos_NoEditsInWindow(t *testing.T) {
+	db := openTestDB(t)
+	const repo = "/repo"
+	commitTS := int64(10_000_000_000_000)
+
+	// Mark a prior commit. No edits between it and the new commit.
+	if err := db.MarkCommitNoted("prev", repo, commitTS-int64(time.Hour)); err != nil {
+		t.Fatalf("MarkCommitNoted: %v", err)
+	}
+	// Edit that predates the prior commit (must be ignored).
+	if _, err := db.InsertEdit(Edit{
+		TimestampNanos: commitTS - int64(2*time.Hour),
+		RepoPath:       repo,
+		FilePath:       "x.go",
+		Tool:           ToolHuman,
+	}); err != nil {
+		t.Fatalf("InsertEdit: %v", err)
+	}
+
+	if got := db.SessionDurationNanos(repo, commitTS); got != 0 {
+		t.Errorf("session duration: want 0 (no edits in window), got %v", time.Duration(got))
+	}
+}
+
+func TestSessionDurationNanos_OnlyCountsOwnRepo(t *testing.T) {
+	db := openTestDB(t)
+	commitTS := int64(10_000_000_000_000)
+
+	// Edit in a DIFFERENT repo, near the commit time. Must not contribute.
+	if _, err := db.InsertEdit(Edit{
+		TimestampNanos: commitTS - int64(20*time.Minute),
+		RepoPath:       "/other-repo",
+		FilePath:       "a.go",
+		Tool:           ToolHuman,
+	}); err != nil {
+		t.Fatalf("InsertEdit other: %v", err)
+	}
+	// Edit in the target repo, 5 min before commit.
+	if _, err := db.InsertEdit(Edit{
+		TimestampNanos: commitTS - int64(5*time.Minute),
+		RepoPath:       "/repo",
+		FilePath:       "b.go",
+		Tool:           ToolHuman,
+	}); err != nil {
+		t.Fatalf("InsertEdit target: %v", err)
+	}
+
+	got := db.SessionDurationNanos("/repo", commitTS)
+	if want := int64(5 * time.Minute); got != want {
+		t.Errorf("session duration: want 5 min, got %v", time.Duration(got))
+	}
+}
+
 func TestHasCopilotSessionNear_Present(t *testing.T) {
 	db := openTestDB(t)
 	now := int64(1_000_000_000_000)
 	_, _ = db.InsertEdit(Edit{
 		TimestampNanos: now,
+		RepoPath:       "/repo/a",
 		Tool:           ToolCopilot,
 		Confidence:     ConfidenceLow,
 	})
-	if !db.HasCopilotSessionNear(now, int64(60*1e9)) {
+	if !db.HasCopilotSessionNear("/repo/a", now, int64(60*1e9)) {
 		t.Error("expected HasCopilotSessionNear=true when marker is present in window")
 	}
 }
@@ -269,10 +393,11 @@ func TestHasCopilotSessionNear_OutsideWindow(t *testing.T) {
 	now := int64(1_000_000_000_000)
 	_, _ = db.InsertEdit(Edit{
 		TimestampNanos: now - int64(120*1e9), // 2 minutes before — outside 60s window
+		RepoPath:       "/repo/a",
 		Tool:           ToolCopilot,
 		Confidence:     ConfidenceLow,
 	})
-	if db.HasCopilotSessionNear(now, int64(60*1e9)) {
+	if db.HasCopilotSessionNear("/repo/a", now, int64(60*1e9)) {
 		t.Error("expected HasCopilotSessionNear=false when marker is outside window")
 	}
 }
@@ -282,11 +407,72 @@ func TestHasCopilotSessionNear_WrongTool(t *testing.T) {
 	now := int64(1_000_000_000_000)
 	_, _ = db.InsertEdit(Edit{
 		TimestampNanos: now,
+		RepoPath:       "/repo/a",
 		Tool:           ToolHuman, // not copilot
 		Confidence:     ConfidenceHigh,
 	})
-	if db.HasCopilotSessionNear(now, int64(60*1e9)) {
+	if db.HasCopilotSessionNear("/repo/a", now, int64(60*1e9)) {
 		t.Error("expected HasCopilotSessionNear=false for non-copilot tool")
+	}
+}
+
+func TestHasCopilotSessionNear_WrongRepo(t *testing.T) {
+	db := openTestDB(t)
+	now := int64(1_000_000_000_000)
+	_, _ = db.InsertEdit(Edit{
+		TimestampNanos: now,
+		RepoPath:       "/repo/other", // Copilot active in a DIFFERENT repo
+		Tool:           ToolCopilot,
+		Confidence:     ConfidenceLow,
+	})
+	if db.HasCopilotSessionNear("/repo/a", now, int64(60*1e9)) {
+		t.Error("expected HasCopilotSessionNear=false when Copilot session is in a different repo")
+	}
+}
+
+func TestPreviousCommitTimestampNanos_NoPrior(t *testing.T) {
+	db := openTestDB(t)
+	// No commits in the DB → should return 0 (include all AI records).
+	got := db.PreviousCommitTimestampNanos("/repo/a", int64(1_000_000_000_000))
+	if got != 0 {
+		t.Errorf("want 0 when no prior commits, got %d", got)
+	}
+}
+
+func TestPreviousCommitTimestampNanos_ReturnsMostRecent(t *testing.T) {
+	db := openTestDB(t)
+	repo := "/repo/a"
+	now := int64(1_000_000_000_000)
+	// Two prior commits at T-300 and T-100; the function must return T-100.
+	_ = db.MarkCommitNoted("sha1", repo, now-300)
+	_ = db.MarkCommitNoted("sha2", repo, now-100)
+	got := db.PreviousCommitTimestampNanos(repo, now)
+	if got != now-100 {
+		t.Errorf("want %d (T-100), got %d", now-100, got)
+	}
+}
+
+func TestPreviousCommitTimestampNanos_ExcludesCurrentCommit(t *testing.T) {
+	db := openTestDB(t)
+	repo := "/repo/a"
+	now := int64(1_000_000_000_000)
+	// A commit at exactly `now` must NOT be returned (strict ts < beforeNanos).
+	_ = db.MarkCommitNoted("sha1", repo, now)
+	_ = db.MarkCommitNoted("sha2", repo, now-50)
+	got := db.PreviousCommitTimestampNanos(repo, now)
+	if got != now-50 {
+		t.Errorf("want %d (T-50, not T=now), got %d", now-50, got)
+	}
+}
+
+func TestPreviousCommitTimestampNanos_WrongRepo(t *testing.T) {
+	db := openTestDB(t)
+	now := int64(1_000_000_000_000)
+	// A commit in a different repo must not affect the result.
+	_ = db.MarkCommitNoted("sha1", "/repo/other", now-100)
+	got := db.PreviousCommitTimestampNanos("/repo/a", now)
+	if got != 0 {
+		t.Errorf("want 0 (no prior commit for /repo/a), got %d", got)
 	}
 }
 

@@ -123,18 +123,15 @@ func CountAddedLines(oldStr, newStr string) int64 {
 // were NOT present (by exact content) in `oldContent`. Used by the human-edit
 // watcher to detect lines the user typed/modified between two file snapshots.
 //
-// Semantics: any line in the new file whose content doesn't appear ANYWHERE
-// in the old file is treated as "changed". Consecutive changed lines are
-// collapsed into a single LineRange. Pure reorderings (same lines, different
-// order) report no changes — that's fine for attribution: the content the
-// human is interacting with was already there.
+// Semantics: each occurrence of a line in `oldContent` "covers" exactly one
+// occurrence of the same content in `newContent` (left-to-right, greedy).
+// Any new occurrence beyond the old count is treated as changed/added.
+// Consecutive changed lines are collapsed into a single LineRange.
 //
-// Limitations:
-//   - If the user duplicates an existing line, the duplicate is NOT flagged
-//     (its content was already in the old set). Acceptable: attribution
-//     wouldn't change anyway.
-//   - The range covers a *contiguous run* of changed lines. Two separate edits
-//     in the same file produce two ranges.
+// This multiset approach correctly detects duplicate lines: if the old file
+// has two closing braces and the new file has three, the extra brace is
+// flagged. The old set-membership approach missed this and silently dropped
+// human-typed lines whose content already existed elsewhere in the file.
 func AddedOrChangedRanges(oldContent, newContent []byte) []LineRange {
 	oldLines := bytes.Split(oldContent, []byte{'\n'})
 	newLines := bytes.Split(newContent, []byte{'\n'})
@@ -145,24 +142,28 @@ func AddedOrChangedRanges(oldContent, newContent []byte) []LineRange {
 	if n := len(newLines); n > 0 && len(newLines[n-1]) == 0 {
 		newLines = newLines[:n-1]
 	}
-	oldSet := make(map[string]struct{}, len(oldLines))
+	// Count how many times each line content appears in the old file.
+	remaining := make(map[string]int, len(oldLines))
 	for _, l := range oldLines {
-		oldSet[string(l)] = struct{}{}
+		remaining[string(l)]++
 	}
 	var out []LineRange
 	curStart := 0
 	for i, l := range newLines {
 		lineNum := i + 1
-		_, present := oldSet[string(l)]
-		if !present {
+		key := string(l)
+		if remaining[key] > 0 {
+			// This occurrence is "covered" by an old-file occurrence.
+			remaining[key]--
+			if curStart != 0 {
+				out = append(out, LineRange{Start: curStart, End: lineNum - 1})
+				curStart = 0
+			}
+		} else {
+			// Extra occurrence — this line is new or duplicated beyond old count.
 			if curStart == 0 {
 				curStart = lineNum
 			}
-			continue
-		}
-		if curStart != 0 {
-			out = append(out, LineRange{Start: curStart, End: lineNum - 1})
-			curStart = 0
 		}
 	}
 	if curStart != 0 {

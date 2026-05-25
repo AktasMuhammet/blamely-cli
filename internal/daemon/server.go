@@ -158,23 +158,30 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 }
 
 func validateAndStore(db *store.DB, p EditPayload) error {
-	if p.Tool == "" || p.RepoPath == "" || p.FilePath == "" {
-		return fmt.Errorf("tool, repo_path, file_path required")
+	if p.RepoPath == "" || p.FilePath == "" {
+		return fmt.Errorf("repo_path, file_path required")
 	}
 	tool := store.Tool(strings.ToLower(p.Tool))
+	gt := store.GenType(strings.ToLower(p.GenType))
+	if gt == "" {
+		gt = store.GenTypeUnknown
+	}
+	// Tool is required EXCEPT for human edits, which travel as
+	// tool="" + gen_type=human. Anything else with an empty tool is a
+	// caller bug.
+	if tool == "" && gt != store.GenTypeHuman {
+		return fmt.Errorf("tool required (or use gen_type=human for empty tool)")
+	}
 	switch tool {
-	case store.ToolClaude, store.ToolCursor, store.ToolCodex, store.ToolCopilot, store.ToolHuman, store.ToolCopyPaste:
+	case "",
+		store.ToolClaude, store.ToolCursor, store.ToolCodex, store.ToolCopilot, store.ToolCopyPaste,
+		store.ToolHuman: // accepted only so the daemon doesn't reject legacy clients mid-upgrade
 	default:
 		return fmt.Errorf("unknown tool %q", p.Tool)
 	}
 	conf := store.Confidence(p.Confidence)
 	if conf == "" {
 		conf = defaultConfidence(tool)
-	}
-
-	gt := store.GenType(p.GenType)
-	if gt == "" {
-		gt = store.GenTypeUnknown
 	}
 	e := store.Edit{
 		TimestampNanos: time.Now().UnixNano(),

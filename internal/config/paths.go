@@ -13,6 +13,7 @@ const (
 	stateFileName      = "state.json"
 	hooksDirName       = "git-hooks"
 	logFileName        = "daemon.log"
+	excludeFileName    = "exclude"
 	claudeDirName      = ".claude"
 	claudeSettings     = "settings.json"
 	codexDirName       = ".codex"
@@ -81,6 +82,16 @@ func LogFile() (string, error) {
 		return "", err
 	}
 	return filepath.Join(d, logFileName), nil
+}
+
+// ExcludeFile returns the path to the user's exclude list. Paths matching
+// this list are skipped at diff time and never appear in attribution.
+func ExcludeFile() (string, error) {
+	d, err := BlamelyDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, excludeFileName), nil
 }
 
 func ClaudeSettingsPath() (string, error) {

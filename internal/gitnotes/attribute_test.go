@@ -222,8 +222,13 @@ func TestBuildNote_PerLineShape_NoCollapse_GenType_Deletions(t *testing.T) {
 		t.Errorf("claude model: want claude-opus, got %v", c.Model)
 	}
 
-	if hum, ok := note.ByTool["human"]; !ok || hum.Lines != 2 {
-		t.Errorf("expected human:2 in by_tool, got %v ok=%v", hum, ok)
+	// Humans are NOT a tool: no entry in by_tool, the count surfaces under
+	// totals.human_lines and by_gen_type.human instead.
+	if _, ok := note.ByTool["human"]; ok {
+		t.Errorf("by_tool must not contain 'human' — humans aren't a tool")
+	}
+	if note.ByGenType.Human != 2 {
+		t.Errorf("by_gen_type.human: want 2, got %d", note.ByGenType.Human)
 	}
 
 	// Files: one file, lines fully expanded (no Range field), deletions present.
@@ -267,6 +272,24 @@ func TestBuildNote_PerLineShape_NoCollapse_GenType_Deletions(t *testing.T) {
 			t.Errorf("delete line %d should have empty Tool, got %q", l.Line, l.Tool)
 		}
 	}
+	// Human-typed adds (lines 4 and 5 in this fixture) must have an
+	// empty Tool (humans aren't a tool) and gen_type=human.
+	humanLinesSeen := 0
+	for _, l := range f.Lines {
+		if l.Type != "add" || l.AuthorType != "Human" {
+			continue
+		}
+		humanLinesSeen++
+		if l.Tool != "" {
+			t.Errorf("human add line %d: Tool should be empty, got %q", l.Line, l.Tool)
+		}
+		if l.GenType == nil || *l.GenType != "human" {
+			t.Errorf("human add line %d: gen_type should be 'human', got %v", l.Line, l.GenType)
+		}
+	}
+	if humanLinesSeen != 2 {
+		t.Errorf("expected 2 human add lines (4 and 5), saw %d", humanLinesSeen)
+	}
 
 	// Totals
 	if note.Totals.AILines != 3 {
@@ -277,6 +300,224 @@ func TestBuildNote_PerLineShape_NoCollapse_GenType_Deletions(t *testing.T) {
 	}
 	if note.Totals.DeletedLines != 2 {
 		t.Errorf("deleted_lines: want 2, got %d", note.Totals.DeletedLines)
+	}
+}
+
+// TestBuildNote_SecondCommit_HumanOverridesAI is the core regression test for
+// the "AI generates code → commit1 → human edits → commit2 shows human"
+// scenario. With the new commit-time attribution model, commit2's sinceNanos
+// is set to commit1's timestamp, so the AI edit recorded before commit1 is
+// excluded from the lookup. The line therefore falls to the human default.
+func TestBuildNote_SecondCommit_HumanOverridesAI(t *testing.T) {
+	db := openTestDB(t)
+	repo := "/r"
+	now := time.Now().UnixNano()
+	commit1Nanos := now - int64(60*time.Second) // commit1 happened 60s ago
+	commit2Nanos := now                          // current commit
+
+	// AI (claude) wrote lines 1-5 during session1, recorded before commit1.
+	_, err := db.InsertEdit(store.Edit{
+		TimestampNanos: commit1Nanos - int64(30*time.Second), // 90s before commit2
+		RepoPath:       repo,
+		FilePath:       "foo.go",
+		Tool:           store.ToolClaude,
+		Confidence:     store.ConfidenceHigh,
+		GenType:        store.GenTypeChat,
+		Lines:          []store.EditLine{{StartLine: 1, EndLine: 5}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// commit1 is recorded in the DB (MarkCommitNoted). This becomes prevCommitTS
+	// for commit2's buildNote call, bounding the AI record lookup.
+	if err := db.MarkCommitNoted("commit1sha", repo, commit1Nanos); err != nil {
+		t.Fatal(err)
+	}
+
+	// Commit2 diff: the human modified line 3 (no AI record exists since commit1).
+	added := []AddedLine{{File: "foo.go", LineNum: 3}}
+
+	note, err := buildNote(db, repo, "deadbeef", commit2Nanos, added, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("buildNote: %v", err)
+	}
+
+	if len(note.Files) != 1 || len(note.Files[0].Lines) != 1 {
+		t.Fatalf("expected 1 file with 1 line, got files=%v", note.Files)
+	}
+	l := note.Files[0].Lines[0]
+
+	// AI edit at T-90s is before prevCommitTS=commit1Nanos → excluded.
+	// Line 3 has no AI record in the current session → defaults to Human.
+	if l.AuthorType != "Human" {
+		t.Errorf("line 3: AuthorType want Human, got %q", l.AuthorType)
+	}
+	if l.Tool != "" {
+		t.Errorf("line 3: Tool want '' (human, not a tool), got %q", l.Tool)
+	}
+	if l.GenType == nil || *l.GenType != "human" {
+		t.Errorf("line 3: GenType want 'human', got %v", l.GenType)
+	}
+
+	if note.Totals.HumanLines != 1 {
+		t.Errorf("human_lines: want 1, got %d", note.Totals.HumanLines)
+	}
+	if note.Totals.AILines != 0 {
+		t.Errorf("ai_lines: want 0, got %d", note.Totals.AILines)
+	}
+	if note.ByGenType.Human != 1 {
+		t.Errorf("by_gen_type.human: want 1, got %d", note.ByGenType.Human)
+	}
+	if note.ByGenType.Chat != 0 {
+		t.Errorf("by_gen_type.chat: want 0, got %d", note.ByGenType.Chat)
+	}
+}
+
+// TestBuildNote_GenTypeCompletion verifies that lines recorded with
+// gen_type=completion (e.g. Cursor Tab or Copilot Tab accepted via the editor
+// plugin) are surfaced correctly in by_gen_type.completion, as AI lines in
+// totals, and with gen_type="completion" in each per-line entry.
+func TestBuildNote_GenTypeCompletion(t *testing.T) {
+	db := openTestDB(t)
+	repo := "/r"
+	commitNanos := time.Now().UnixNano()
+
+	_, err := db.InsertEdit(store.Edit{
+		TimestampNanos: commitNanos - int64(5*time.Second),
+		RepoPath:       repo,
+		FilePath:       "bar.go",
+		Tool:           store.ToolCursor,
+		Confidence:     store.ConfidenceHigh,
+		GenType:        store.GenTypeCompletion,
+		Lines:          []store.EditLine{{StartLine: 1, EndLine: 3}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	added := []AddedLine{
+		{File: "bar.go", LineNum: 1},
+		{File: "bar.go", LineNum: 2},
+		{File: "bar.go", LineNum: 3},
+	}
+
+	note, err := buildNote(db, repo, "abc123", commitNanos, added, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("buildNote: %v", err)
+	}
+
+	// All 3 lines: cursor/completion, not chat or human.
+	if note.ByGenType.Completion != 3 {
+		t.Errorf("by_gen_type.completion: want 3, got %d", note.ByGenType.Completion)
+	}
+	if note.ByGenType.Chat != 0 {
+		t.Errorf("by_gen_type.chat: want 0, got %d", note.ByGenType.Chat)
+	}
+	if note.ByGenType.Human != 0 {
+		t.Errorf("by_gen_type.human: want 0, got %d", note.ByGenType.Human)
+	}
+	if note.Totals.AILines != 3 {
+		t.Errorf("ai_lines: want 3, got %d", note.Totals.AILines)
+	}
+
+	if len(note.Files) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(note.Files))
+	}
+	for _, l := range note.Files[0].Lines {
+		if l.Type != "add" {
+			continue
+		}
+		if l.AuthorType != "AI" {
+			t.Errorf("line %d: AuthorType want AI, got %q", l.Line, l.AuthorType)
+		}
+		if l.GenType == nil || *l.GenType != "completion" {
+			t.Errorf("line %d: GenType want 'completion', got %v", l.Line, l.GenType)
+		}
+	}
+
+	// cursor should appear in by_tool with 3 lines.
+	ct, ok := note.ByTool["cursor"]
+	if !ok {
+		t.Fatal("by_tool missing 'cursor' entry")
+	}
+	if ct.Lines != 3 {
+		t.Errorf("by_tool[cursor].lines: want 3, got %d", ct.Lines)
+	}
+}
+
+// TestBuildNote_MixedCommit_AIAndHumanInSameCommit verifies that a single
+// commit where the AI wrote some lines and the human typed others correctly
+// splits attribution. AI lines have explicit DB records; human lines have no
+// record and fall to the human default (tool="", gen_type=human).
+func TestBuildNote_MixedCommit_AIAndHumanInSameCommit(t *testing.T) {
+	db := openTestDB(t)
+	repo := "/r"
+	commitNanos := time.Now().UnixNano()
+
+	// Cursor Composer wrote lines 1-3 (chat). Lines 4-5 have no record — human.
+	_, err := db.InsertEdit(store.Edit{
+		TimestampNanos: commitNanos - int64(30*time.Second),
+		RepoPath:       repo,
+		FilePath:       "mix.go",
+		Tool:           store.ToolCursor,
+		Confidence:     store.ConfidenceHigh,
+		GenType:        store.GenTypeChat,
+		Lines:          []store.EditLine{{StartLine: 1, EndLine: 3}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	added := []AddedLine{
+		{File: "mix.go", LineNum: 1},
+		{File: "mix.go", LineNum: 2},
+		{File: "mix.go", LineNum: 3},
+		{File: "mix.go", LineNum: 4},
+		{File: "mix.go", LineNum: 5},
+	}
+
+	note, err := buildNote(db, repo, "mixed01", commitNanos, added, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("buildNote: %v", err)
+	}
+
+	if note.Totals.AILines != 3 {
+		t.Errorf("ai_lines: want 3, got %d", note.Totals.AILines)
+	}
+	if note.Totals.HumanLines != 2 {
+		t.Errorf("human_lines: want 2, got %d", note.Totals.HumanLines)
+	}
+	if note.ByGenType.Chat != 3 {
+		t.Errorf("by_gen_type.chat: want 3, got %d", note.ByGenType.Chat)
+	}
+	if note.ByGenType.Human != 2 {
+		t.Errorf("by_gen_type.human: want 2, got %d", note.ByGenType.Human)
+	}
+
+	if len(note.Files) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(note.Files))
+	}
+	for _, l := range note.Files[0].Lines {
+		if l.Type != "add" {
+			continue
+		}
+		switch {
+		case l.Line <= 3:
+			if l.AuthorType != "AI" || l.Tool != "cursor" {
+				t.Errorf("line %d: want AI/cursor, got AuthorType=%q Tool=%q", l.Line, l.AuthorType, l.Tool)
+			}
+			if l.GenType == nil || *l.GenType != "chat" {
+				t.Errorf("line %d: want gen_type=chat, got %v", l.Line, l.GenType)
+			}
+		case l.Line >= 4:
+			if l.AuthorType != "Human" || l.Tool != "" {
+				t.Errorf("line %d: want Human/'', got AuthorType=%q Tool=%q", l.Line, l.AuthorType, l.Tool)
+			}
+			if l.GenType == nil || *l.GenType != "human" {
+				t.Errorf("line %d: want gen_type=human, got %v", l.Line, l.GenType)
+			}
+		}
 	}
 }
 

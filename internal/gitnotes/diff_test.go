@@ -1,9 +1,13 @@
 package gitnotes
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/blamely/blamely/internal/config"
 )
 
 func TestParseHunkHeader_Normal(t *testing.T) {
@@ -133,7 +137,7 @@ func TestParseDiff_InPlaceModification(t *testing.T) {
 		"+new",
 		"",
 	}, "\n")
-	c, err := parseDiff(strings.NewReader(diff))
+	c, err := parseDiff(strings.NewReader(diff), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +170,7 @@ func TestParseDiff_ModificationAfterLineShift(t *testing.T) {
 		"+newX",
 		"",
 	}, "\n")
-	c, err := parseDiff(strings.NewReader(diff))
+	c, err := parseDiff(strings.NewReader(diff), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +202,7 @@ func TestParseDiff_ReplaceMoreWithFewer(t *testing.T) {
 		"+new",
 		"",
 	}, "\n")
-	c, err := parseDiff(strings.NewReader(diff))
+	c, err := parseDiff(strings.NewReader(diff), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +231,7 @@ func TestParseDiff_ReplaceFewerWithMore(t *testing.T) {
 		"+newC",
 		"",
 	}, "\n")
-	c, err := parseDiff(strings.NewReader(diff))
+	c, err := parseDiff(strings.NewReader(diff), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +263,7 @@ func TestParseDiff_WhitespaceOnlyModificationSymmetric(t *testing.T) {
 		"+   ", // whitespace-only — filtered out as an add, but still pairs.
 		"",
 	}, "\n")
-	c, err := parseDiff(strings.NewReader(diff))
+	c, err := parseDiff(strings.NewReader(diff), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +287,7 @@ func TestParseDiff_PureDeletion(t *testing.T) {
 		"-gone2",
 		"",
 	}, "\n")
-	c, err := parseDiff(strings.NewReader(diff))
+	c, err := parseDiff(strings.NewReader(diff), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +312,7 @@ func TestParseDiff_PureInsertion(t *testing.T) {
 		"+inserted2",
 		"",
 	}, "\n")
-	c, err := parseDiff(strings.NewReader(diff))
+	c, err := parseDiff(strings.NewReader(diff), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +347,7 @@ func TestParseDiff_FileBoundaryFlushesHunk(t *testing.T) {
 		"+newB",
 		"",
 	}, "\n")
-	c, err := parseDiff(strings.NewReader(diff))
+	c, err := parseDiff(strings.NewReader(diff), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,4 +362,75 @@ func TestParseDiff_FileBoundaryFlushesHunk(t *testing.T) {
 		t.Errorf("Deleted: want empty for both files, got a.go=%v b.go=%v",
 			c.Deleted["a.go"], c.Deleted["b.go"])
 	}
+}
+
+// TestParseDiff_ExcludeListSkipsFile confirms that a diff covering both an
+// excluded and a non-excluded file emits entries ONLY for the non-excluded
+// one. Mirrors the "Java target/ shouldn't appear in attribution" scenario.
+func TestParseDiff_ExcludeListSkipsFile(t *testing.T) {
+	excl := loadExcludeListFromContent(t, "target/\n*.class\n")
+	diff := strings.Join([]string{
+		// File 1: excluded by `target/` rule.
+		"diff --git a/target/Build.class b/target/Build.class",
+		"new file mode 100644",
+		"--- /dev/null",
+		"+++ b/target/Build.class",
+		"@@ -0,0 +1,3 @@",
+		"+CLASSFILE_BYTE_0",
+		"+CLASSFILE_BYTE_1",
+		"+CLASSFILE_BYTE_2",
+		// File 2: not excluded.
+		"diff --git a/src/Main.java b/src/Main.java",
+		"--- a/src/Main.java",
+		"+++ b/src/Main.java",
+		"@@ -10,0 +11,2 @@",
+		"+    System.out.println(\"hi\");",
+		"+    System.out.println(\"bye\");",
+		// File 3: excluded by `*.class` glob — proves multiple rules compose.
+		"diff --git a/build/Other.class b/build/Other.class",
+		"--- a/build/Other.class",
+		"+++ b/build/Other.class",
+		"@@ -1,1 +1,1 @@",
+		"-OLD_BYTECODE",
+		"+NEW_BYTECODE",
+		"",
+	}, "\n")
+
+	c, err := parseDiff(strings.NewReader(diff), excl)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Only src/Main.java should appear.
+	wantAdded := []AddedLine{
+		{File: "src/Main.java", LineNum: 11},
+		{File: "src/Main.java", LineNum: 12},
+	}
+	if !reflect.DeepEqual(c.Added, wantAdded) {
+		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)
+	}
+	for _, excludedPath := range []string{"target/Build.class", "build/Other.class"} {
+		if _, ok := c.FileChanges[excludedPath]; ok {
+			t.Errorf("FileChanges should not contain excluded path %q", excludedPath)
+		}
+		if len(c.Deleted[excludedPath]) != 0 {
+			t.Errorf("Deleted should not contain %q, got %v", excludedPath, c.Deleted[excludedPath])
+		}
+	}
+}
+
+// loadExcludeListFromContent writes the given content to a tempfile under
+// t.TempDir() and loads it via config.LoadExcludeListFrom, so the diff
+// regression test exercises the exact loader used at runtime.
+func loadExcludeListFromContent(t *testing.T, content string) *config.ExcludeList {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "exclude")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write exclude file: %v", err)
+	}
+	list, err := config.LoadExcludeListFrom(path)
+	if err != nil {
+		t.Fatalf("LoadExcludeListFrom: %v", err)
+	}
+	return list
 }

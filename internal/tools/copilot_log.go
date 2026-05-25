@@ -112,6 +112,13 @@ func (c *CopilotLogWatcher) refresh(ctx context.Context, running map[string]cont
 			tCtx, cancel := context.WithCancel(ctx)
 			running[p] = cancel
 			go func(path string) {
+				// Cursor Tab log files live inside the Cursor logs tree but are
+				// not Copilot events — they're handled (or intentionally skipped)
+				// by CursorLogWatcher. Tailing them here would mis-attribute
+				// cursor completions as copilot.
+				if isCursorTabLog(path) {
+					return
+				}
 				if err := tailCopilotLog(tCtx, path, sink); err != nil && tCtx.Err() == nil {
 					log.Printf("copilot-log tail %s: %v", path, err)
 				}
