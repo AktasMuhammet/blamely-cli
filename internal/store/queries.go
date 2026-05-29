@@ -203,17 +203,21 @@ func (db *DB) linesForEdit(editID int64) ([]EditLine, error) {
 	return out, rows.Err()
 }
 
-// LatestCopilotModelNear returns the model string from the most recent
-// copilot row for repoPath whose timestamp falls inside [ts-window, ts+window]
+// LatestChatModelNear returns the model string from the most recent row for
+// the given tool + repoPath whose timestamp falls inside [ts-window, ts+window]
 // AND that has a non-null model. Returns "" when no such row exists. Used by
-// the attribution step to back-fill the model onto Copilot-attributed lines.
-// repoPath filters to the same repository to avoid cross-repo model bleed.
-func (db *DB) LatestCopilotModelNear(repoPath string, tsNanos, windowNanos int64) string {
+// the ingest step to back-fill the model onto chat-attributed lines.
+//
+// The query also matches session markers with repo_path='' (emitted by the
+// chat-session watcher, which has no file context) so that the chat-selected
+// model is visible even when the edit row from the plugin/hook arrives before
+// the watcher has had a chance to emit a repo-scoped row.
+func (db *DB) LatestChatModelNear(tool Tool, repoPath string, tsNanos, windowNanos int64) string {
 	row := db.QueryRow(`SELECT model FROM edits
-		WHERE tool='copilot' AND repo_path=? AND model IS NOT NULL AND model != ''
+		WHERE tool=? AND (repo_path=? OR repo_path='') AND model IS NOT NULL AND model != ''
 		  AND ts >= ? AND ts <= ?
 		ORDER BY ts DESC LIMIT 1`,
-		repoPath, tsNanos-windowNanos, tsNanos+windowNanos)
+		string(tool), repoPath, tsNanos-windowNanos, tsNanos+windowNanos)
 	var model sql.NullString
 	if err := row.Scan(&model); err != nil {
 		return ""
@@ -224,34 +228,34 @@ func (db *DB) LatestCopilotModelNear(repoPath string, tsNanos, windowNanos int64
 	return model.String
 }
 
-// LatestCopilotGenTypeNear returns the gen_type to attribute a file change
-// to when Copilot is active in the [ts-window, ts+window] interval.
+// LatestChatGenTypeNear returns the gen_type to attribute a file change to when
+// the given tool is active in the [ts-window, ts+window] interval.
 //
 // Resolution order:
 //   1. If ANY chat marker exists in the window, return "chat". Chat is the
 //      more specific signal — it requires either a chat-session JSONL
-//      response chunk or a Copilot extension log line with "chat" in it,
-//      neither of which fire for an inline Tab accept.
+//      response chunk or an extension log line with "chat" in it, neither of
+//      which fire for an inline Tab accept.
 //   2. Otherwise return the gen_type of the most recent specific marker
 //      (skipping "unknown" rows from the globalStorage-only signal).
 //   3. Returns "" when no row matches; callers default accordingly
-//      (humanedit treats "" as "completion" since inline Tab is the
-//      common case when no more-specific signal exists).
-func (db *DB) LatestCopilotGenTypeNear(tsNanos, windowNanos int64) string {
+//      (the inline Tab accept is the common case when no more-specific signal
+//      exists).
+func (db *DB) LatestChatGenTypeNear(tool Tool, tsNanos, windowNanos int64) string {
 	from, to := tsNanos-windowNanos, tsNanos+windowNanos
 	// Step 1: chat-preferred.
 	row := db.QueryRow(`SELECT 1 FROM edits
-		WHERE tool='copilot' AND gen_type='chat' AND ts >= ? AND ts <= ?
-		LIMIT 1`, from, to)
+		WHERE tool=? AND gen_type='chat' AND ts >= ? AND ts <= ?
+		LIMIT 1`, string(tool), from, to)
 	var dummy int
 	if err := row.Scan(&dummy); err == nil {
 		return "chat"
 	}
 	// Step 2: latest specific marker.
 	row = db.QueryRow(`SELECT gen_type FROM edits
-		WHERE tool='copilot' AND gen_type IS NOT NULL AND gen_type != '' AND gen_type != 'unknown'
+		WHERE tool=? AND gen_type IS NOT NULL AND gen_type != '' AND gen_type != 'unknown'
 		  AND ts >= ? AND ts <= ?
-		ORDER BY ts DESC LIMIT 1`, from, to)
+		ORDER BY ts DESC LIMIT 1`, string(tool), from, to)
 	var gt sql.NullString
 	if err := row.Scan(&gt); err != nil {
 		return ""
@@ -405,6 +409,53 @@ func (db *DB) TranscriptPathsForPeriod(repoPath string, sinceNanos, untilNanos i
 		if !seen[m.TranscriptPath] {
 			seen[m.TranscriptPath] = true
 			out = append(out, m.TranscriptPath)
+		}
+	}
+	return out, rows.Err()
+}
+
+// ChatSessionRef pairs a chat-session JSONL path with the tool that owns it,
+// as recorded in the raw_meta of a chat-session marker.
+type ChatSessionRef struct {
+	Path string
+	Tool Tool
+}
+
+// ChatSessionPathsForPeriod returns the distinct chat_session_path values (with
+// their owning tool) stored in raw_meta for edits in the time window. These are
+// the VS Code / Cursor chat-session JSONL files the chat-session watcher tagged
+// while a chat panel was producing responses.
+//
+// Unlike TranscriptPathsForPeriod the repo filter also accepts repo_path=''
+// rows: chat-session markers carry no file/repo context, so they're stored with
+// an empty repo_path and must still be matched for the commit's window.
+func (db *DB) ChatSessionPathsForPeriod(repoPath string, sinceNanos, untilNanos int64) ([]ChatSessionRef, error) {
+	rows, err := db.Query(`
+		SELECT DISTINCT raw_meta FROM edits
+		WHERE (repo_path = ? OR repo_path = '') AND ts >= ? AND ts <= ?
+		  AND raw_meta LIKE '%chat_session_path%'`,
+		repoPath, sinceNanos, untilNanos)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	seen := map[string]bool{}
+	var out []ChatSessionRef
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			continue
+		}
+		var m struct {
+			ChatSessionPath string `json:"chat_session_path"`
+			Tool            string `json:"tool"`
+		}
+		if err := json.Unmarshal([]byte(raw), &m); err != nil || m.ChatSessionPath == "" {
+			continue
+		}
+		if !seen[m.ChatSessionPath] {
+			seen[m.ChatSessionPath] = true
+			out = append(out, ChatSessionRef{Path: m.ChatSessionPath, Tool: Tool(m.Tool)})
 		}
 	}
 	return out, rows.Err()

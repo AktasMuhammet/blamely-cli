@@ -117,6 +117,10 @@ func (s *dbSink) Record(ev Event) error {
 	if ev.RawMeta != "" {
 		e.RawMeta = sql.NullString{Valid: true, String: ev.RawMeta}
 	}
+	// Same chat enrichment as the HTTP path: upgrade gen_type + backfill model
+	// from recent chat-session markers for copilot/cursor edits arriving via a
+	// log/velocity watcher (which can't tell a chat apply from a Tab accept).
+	enrichChatEdit(s.db, &e)
 	for _, r := range ev.Lines {
 		if r.Start <= 0 || r.End < r.Start {
 			continue

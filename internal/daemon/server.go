@@ -196,6 +196,9 @@ func validateAndStore(db *store.DB, p EditPayload) error {
 		e.Model.Valid = true
 		e.Model.String = p.Model
 	}
+
+	enrichChatEdit(db, &e)
+
 	setNullInt(&e.InputTokens, p.InputTokens)
 	setNullInt(&e.OutputTokens, p.OutputTokens)
 	setNullInt(&e.CacheReadTokens, p.CacheReadTokens)
@@ -222,6 +225,38 @@ func validateAndStore(db *store.DB, p EditPayload) error {
 	}
 	_, err := db.InsertEdit(e)
 	return err
+}
+
+// chatEnrichWindowNanos is the look-back/forward window for correlating a
+// committed edit with the chat-session markers emitted by the chat watcher.
+const chatEnrichWindowNanos = int64(60 * 1e9) // 60 seconds
+
+// enrichChatEdit upgrades a chat-tool edit's gen_type + model from recent
+// chat-session markers. The plugin / log / velocity paths can't tell a
+// chat-panel apply from an inline Tab accept, so a chat-generated edit arrives
+// as gen_type=completion with no model. The chat-session watcher writes
+// gen_type=chat markers (carrying the selected model) whenever a response
+// streams into the chat JSONL; we look those up here so the committed edit
+// reflects the chat panel correctly. Runs for both copilot and cursor; a marker
+// only exists when the user actually used that tool's chat panel, so a pure
+// Tab-completion session is left as gen_type=completion.
+func enrichChatEdit(db *store.DB, e *store.Edit) {
+	switch e.Tool {
+	case store.ToolCopilot, store.ToolCursor:
+	default:
+		return
+	}
+	now := e.TimestampNanos
+	if e.GenType != store.GenTypeChat {
+		if recent := db.LatestChatGenTypeNear(e.Tool, now, chatEnrichWindowNanos); recent == string(store.GenTypeChat) {
+			e.GenType = store.GenTypeChat
+		}
+	}
+	if !e.Model.Valid || e.Model.String == "" {
+		if m := db.LatestChatModelNear(e.Tool, e.RepoPath, now, chatEnrichWindowNanos); m != "" {
+			e.Model = sql.NullString{Valid: true, String: m}
+		}
+	}
 }
 
 func defaultConfidence(t store.Tool) store.Confidence {

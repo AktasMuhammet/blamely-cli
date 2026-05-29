@@ -315,7 +315,44 @@ func cmdLog() *cobra.Command {
 		Short: "Live-tail tool logs for debugging attribution",
 	}
 	parent.AddCommand(cmdLogCursor())
+	parent.AddCommand(cmdLogCopilot())
+	parent.AddCommand(cmdLogCodex())
+	parent.AddCommand(cmdLogClaude())
 	return parent
+}
+
+func cmdLogCopilot() *cobra.Command {
+	return &cobra.Command{
+		Use:   "copilot",
+		Short: "Trace GitHub Copilot chat + completion detection events",
+		Long: "Runs blamely's Copilot watchers (chat-session JSONL + editor/JetBrains\n" +
+			"logs) against a printing sink and shows every attribution event they\n" +
+			"would record — tool, gen_type (chat/completion), model, and file.\n" +
+			"Nothing is written to the database.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return tools.DebugCopilotLogs(cmd.Context(), os.Stdout)
+		},
+	}
+}
+
+func cmdLogCodex() *cobra.Command {
+	return &cobra.Command{
+		Use:   "codex",
+		Short: "Trace Codex CLI session detection events",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return tools.DebugCodexLogs(cmd.Context(), os.Stdout)
+		},
+	}
+}
+
+func cmdLogClaude() *cobra.Command {
+	return &cobra.Command{
+		Use:   "claude",
+		Short: "Explain how to trace Claude Code attribution (hook-driven)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return tools.DebugClaudeLogs(cmd.Context(), os.Stdout)
+		},
+	}
 }
 
 func cmdLogCursor() *cobra.Command {

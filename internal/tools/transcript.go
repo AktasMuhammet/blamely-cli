@@ -36,6 +36,13 @@ type transcriptEntry struct {
 	Type string `json:"type"`
 	Role string `json:"role"`
 
+	// Entrypoint is set on user turns by the claude CLI/SDK. Known values:
+	//   "cli"           – `claude -p "..."` (non-interactive command)
+	//   "sdk-ts"        – TypeScript SDK (programmatic)
+	//   "claude-vscode" – Claude Code in VSCode (interactive)
+	// Absent on assistant turns and on Cursor transcripts.
+	Entrypoint string `json:"entrypoint"`
+
 	Message struct {
 		Model string `json:"model"`
 		Usage struct {
@@ -44,11 +51,80 @@ type transcriptEntry struct {
 			CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
 			CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 		} `json:"usage"`
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
+		// Content may be a plain string (some user turns) or an array of typed
+		// content blocks. RawMessage keeps the outer struct parseable regardless
+		// of which shape arrives.
+		Content json.RawMessage `json:"content"`
 	} `json:"message"`
+}
+
+// ReadTranscriptGenType returns the gen_type ("chat" or "cli") for a Claude
+// transcript JSONL by inspecting the first user turn's "entrypoint" field.
+// Entrypoints "cli" and "sdk-ts" map to "cli"; all others (including
+// "claude-vscode") map to "chat". Returns "chat" when the file is missing or
+// has no user turn with an entrypoint.
+func ReadTranscriptGenType(path string) string {
+	if path == "" {
+		return "chat"
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "chat"
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 1<<16), 1<<22)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 || line[0] != '{' {
+			continue
+		}
+		var e transcriptEntry
+		if err := json.Unmarshal(line, &e); err != nil {
+			continue
+		}
+		if e.role() != "user" || e.Entrypoint == "" {
+			continue
+		}
+		switch e.Entrypoint {
+		case "cli", "sdk-ts":
+			return "cli"
+		default:
+			return "chat"
+		}
+	}
+	return "chat"
+}
+
+// extractText returns the first non-empty human-readable text from a content
+// field that is either a plain JSON string or an array of content blocks.
+// For arrays, "text" and "human_turn" block types are accepted; tool_use and
+// tool_result blocks are skipped so they don't pollute conversation snippets.
+func extractText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	// Plain string: some Claude Code versions encode user messages this way.
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return strings.TrimSpace(s)
+	}
+	// Array of typed content blocks.
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &blocks) == nil {
+		for _, b := range blocks {
+			if b.Type == "text" || b.Type == "human_turn" {
+				if t := strings.TrimSpace(b.Text); t != "" {
+					return t
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // role returns the normalised "user" or "assistant" string for either format.
@@ -91,14 +167,7 @@ func scanConversation(r io.Reader, maxTurns, maxChars int) ([]ConvTurn, error) {
 		if role != "user" && role != "assistant" {
 			continue
 		}
-		// Extract the first text block from content.
-		text := ""
-		for _, c := range e.Message.Content {
-			if c.Type == "text" && strings.TrimSpace(c.Text) != "" {
-				text = c.Text
-				break
-			}
-		}
+		text := extractText(e.Message.Content)
 		if text == "" {
 			continue
 		}

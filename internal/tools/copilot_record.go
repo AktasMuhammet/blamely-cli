@@ -89,24 +89,86 @@ func RecordCopilotFromStdin(r io.Reader) error {
 	return postToDaemon(payload)
 }
 
-// extractCopilotRanges is intentionally permissive: it accepts Edit / Write /
-// MultiEdit shapes (same as Claude) and any payload whose tool_input has a
-// usable `file_path` + `new_string`/`content`.
+// extractCopilotRanges is intentionally permissive: it accepts Copilot's native
+// agent tool shapes (str_replace_editor, create_file, insert_edit_into_file) as
+// well as Claude-compatible shapes (Edit/Write/MultiEdit) and a generic fallback
+// that tries any payload with a recognisable file path + content field.
 func extractCopilotRanges(p copilotHookPayload) (string, []LineRange, int64) {
 	switch p.ToolName {
+	// ── GitHub Copilot agent / chat tools ────────────────────────────────────
+	// These are the tool names Copilot sends from its chat panel in VS Code and
+	// Cursor. The payloads use "path" not "file_path", and field names differ
+	// from Claude's conventions.
+
+	case "str_replace_editor":
+		// Payload: {command, path, old_str, new_str} for replacements, or
+		//          {command, path, content} for "create" operations.
+		var in struct {
+			Command string `json:"command"`
+			Path    string `json:"path"`
+			OldStr  string `json:"old_str"`
+			NewStr  string `json:"new_str"`
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal(p.ToolInput, &in); err != nil || in.Path == "" {
+			return "", nil, 0
+		}
+		body := in.NewStr
+		if body == "" {
+			body = in.Content
+		}
+		if strings.TrimSpace(body) == "" && in.OldStr != "" {
+			return in.Path, nil, int64(countLines(in.OldStr))
+		}
+		lr, _ := LocateNewString(in.Path, body)
+		if lr == nil {
+			return in.Path, nil, CountAddedLines(in.OldStr, body)
+		}
+		ranges, suggested := narrowToChangedLines(in.OldStr, body, *lr)
+		return in.Path, ranges, suggested
+
+	case "create_file":
+		// Payload: {path, content}
+		var in struct {
+			Path    string `json:"path"`
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal(p.ToolInput, &in); err != nil || in.Path == "" {
+			return "", nil, 0
+		}
+		suggested := int64(countLines(in.Content))
+		lr, _ := LineRangeForWholeFile(in.Path)
+		if lr == nil {
+			return in.Path, nil, suggested
+		}
+		return in.Path, []LineRange{*lr}, suggested
+
+	case "insert_edit_into_file":
+		// Payload: {path, code, explanation?}
+		var in struct {
+			Path string `json:"path"`
+			Code string `json:"code"`
+		}
+		if err := json.Unmarshal(p.ToolInput, &in); err != nil || in.Path == "" {
+			return "", nil, 0
+		}
+		suggested := int64(countLines(in.Code))
+		lr, _ := LocateNewString(in.Path, in.Code)
+		if lr == nil {
+			return in.Path, nil, suggested
+		}
+		return in.Path, []LineRange{*lr}, suggested
+
+	// ── Claude-compatible shapes (also used by some Copilot variants) ─────────
+
 	case "Edit":
 		var in editInput
 		if err := json.Unmarshal(p.ToolInput, &in); err != nil || in.FilePath == "" {
 			return "", nil, 0
 		}
-		// Deletion case: empty new_string with non-empty old_string. We
-		// can't locate the deleted text post-edit, but we credit the AI
-		// with the removal via suggested_lines.
 		if strings.TrimSpace(in.NewString) == "" && in.OldString != "" {
 			return in.FilePath, nil, int64(countLines(in.OldString))
 		}
-		// Same narrowing as Claude: only credit lines actually new vs
-		// old_string, not context lines included for unique matching.
 		lr, _ := LocateNewString(in.FilePath, in.NewString)
 		if lr == nil {
 			return in.FilePath, nil, CountAddedLines(in.OldString, in.NewString)
@@ -150,37 +212,59 @@ func extractCopilotRanges(p copilotHookPayload) (string, []LineRange, int64) {
 		return in.FilePath, out, suggested
 
 	default:
-		// Generic fallback: try to read {file_path, new_string|content} out of
-		// tool_input regardless of tool_name. Many Copilot payload variants
-		// land here.
+		// Generic fallback: try multiple field-name conventions. Copilot uses
+		// "path"; Claude/older hooks use "file_path". Content body may be in
+		// "new_string", "new_str", "content", or "code".
 		var generic struct {
 			FilePath  string `json:"file_path"`
+			Path      string `json:"path"`
 			NewString string `json:"new_string"`
+			NewStr    string `json:"new_str"`
 			Content   string `json:"content"`
+			Code      string `json:"code"`
 		}
-		if err := json.Unmarshal(p.ToolInput, &generic); err == nil && generic.FilePath != "" {
-			body := generic.NewString
-			if body == "" {
-				body = generic.Content
-			}
-			suggested := int64(countLines(body))
-			if body != "" {
-				if lr, _ := LocateNewString(generic.FilePath, body); lr != nil {
-					return generic.FilePath, []LineRange{*lr}, suggested
-				}
-			}
-			return generic.FilePath, nil, suggested
+		if err := json.Unmarshal(p.ToolInput, &generic); err != nil {
+			return "", nil, 0
 		}
-		return "", nil, 0
+		fp := generic.FilePath
+		if fp == "" {
+			fp = generic.Path
+		}
+		if fp == "" {
+			return "", nil, 0
+		}
+		body := generic.NewString
+		if body == "" {
+			body = generic.NewStr
+		}
+		if body == "" {
+			body = generic.Content
+		}
+		if body == "" {
+			body = generic.Code
+		}
+		suggested := int64(countLines(body))
+		if body != "" {
+			if lr, _ := LocateNewString(fp, body); lr != nil {
+				return fp, []LineRange{*lr}, suggested
+			}
+		}
+		return fp, nil, suggested
 	}
 }
 
 func copilotGenType(toolName string) string {
-	t := strings.ToLower(toolName)
-	if strings.Contains(t, "chat") || strings.Contains(t, "ask") || strings.Contains(t, "panel") {
+	// Copilot's native agent/chat tool names — always produced by the chat panel.
+	switch toolName {
+	case "str_replace_editor", "create_file", "insert_edit_into_file":
 		return "chat"
 	}
-	// Default for Copilot's Edit/Write/Apply etc. is inline completion.
+	t := strings.ToLower(toolName)
+	if strings.Contains(t, "chat") || strings.Contains(t, "ask") || strings.Contains(t, "panel") ||
+		strings.Contains(t, "insert") || strings.Contains(t, "create") {
+		return "chat"
+	}
+	// Default for inline tab-completion tools (Edit/Write/Apply etc.).
 	return "completion"
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -83,6 +84,22 @@ func RecordClaudeFromStdin(r io.Reader) error {
 
 	isCursor := p.CursorVersion != ""
 
+	// Cursor often omits transcript_path from the hook payload. Derive it from
+	// cwd + session_id using the known storage layout:
+	//   ~/.cursor/projects/<cwd-encoded>/agent-transcripts/<uuid>/<uuid>.jsonl
+	// where <cwd-encoded> is the cwd with leading slash removed and / → -.
+	if isCursor && p.TranscriptPath == "" && p.SessionID != "" && p.Cwd != "" {
+		p.TranscriptPath = cursorTranscriptPath(p.Cwd, p.SessionID)
+	}
+
+	// Claude CLI also sometimes omits transcript_path. Derive it from cwd +
+	// session_id using the Claude storage layout:
+	//   ~/.claude/projects/<cwd-encoded>/<session-id>.jsonl
+	// where <cwd-encoded> replaces ALL slashes (including the leading /) with -.
+	if !isCursor && p.TranscriptPath == "" && p.SessionID != "" && p.Cwd != "" {
+		p.TranscriptPath = claudeTranscriptPath(p.Cwd, p.SessionID)
+	}
+
 	filePath, ranges, suggested, err := extractClaudeRanges(p)
 	if err != nil {
 		return err
@@ -111,7 +128,9 @@ func RecordClaudeFromStdin(r io.Reader) error {
 
 	// Determine generation type.
 	//
-	// Claude Code is always a chat session.
+	// For Claude CLI/Code: read the "entrypoint" field from the first user turn
+	// of the transcript. "cli" and "sdk-ts" entrypoints map to GenTypeCLI;
+	// interactive entrypoints (e.g. "claude-vscode") map to GenTypeChat.
 	//
 	// For Cursor we distinguish two sources:
 	//   - Composer (chat): fires from within a conversation → session_id or
@@ -120,15 +139,13 @@ func RecordClaudeFromStdin(r io.Reader) error {
 	//     are empty. When Cursor sets gen_type explicitly in the payload we
 	//     honour that directly; otherwise we use the session-presence heuristic.
 	genType := "chat"
-	if isCursor {
-		switch {
-		case p.GenType != "":
-			// Cursor explicitly told us what this is.
-			genType = p.GenType
-		case p.SessionID == "" && p.ConversationID == "":
-			// No conversation context → inline Tab completion.
-			genType = "completion"
-		}
+	switch {
+	case isCursor && p.GenType != "":
+		genType = p.GenType
+	case isCursor && p.SessionID == "" && p.ConversationID == "":
+		genType = "completion"
+	case !isCursor:
+		genType = ReadTranscriptGenType(p.TranscriptPath)
 	}
 
 	payload := daemon.EditPayload{
@@ -222,6 +239,14 @@ func extractClaudeRanges(p claudeHookPayload) (string, []LineRange, int64, error
 		if lr == nil {
 			return in.FilePath, nil, suggested, nil
 		}
+		// Use a large sentinel for EndLine: if a subsequent Edit in the same
+		// session inserts lines before the end of this file, the stored range
+		// would become stale (shifted lines would be outside [1, N] and fall
+		// through to "human"). Setting EndLine to a large value ensures the
+		// Write covers all lines regardless of later insertions.
+		// AcceptedLines in the note uses the actual matched commit-line count,
+		// not this stored range, so stats are unaffected.
+		lr.End = 1 << 30
 		return in.FilePath, []LineRange{*lr}, suggested, nil
 
 	case "MultiEdit":
@@ -292,6 +317,43 @@ func toDaemonRanges(rs []LineRange) []daemon.Range {
 }
 
 func int64Ptr(v int64) *int64 { return &v }
+
+// cursorTranscriptPath derives the Cursor agent-transcript JSONL path for a
+// given project working directory and session UUID. Cursor stores transcripts at:
+//   ~/.cursor/projects/<cwd-encoded>/agent-transcripts/<uuid>/<uuid>.jsonl
+// where <cwd-encoded> is the cwd with leading slash removed and / replaced by -.
+// Returns "" if the file doesn't exist yet (e.g. session hasn't been written).
+func cursorTranscriptPath(cwd, sessionID string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	proj := strings.TrimPrefix(filepath.ToSlash(cwd), "/")
+	proj = strings.ReplaceAll(proj, "/", "-")
+	p := filepath.Join(home, ".cursor", "projects", proj, "agent-transcripts", sessionID, sessionID+".jsonl")
+	if _, err := os.Stat(p); err != nil {
+		return ""
+	}
+	return p
+}
+
+// claudeTranscriptPath derives the Claude CLI/Code transcript JSONL path for a
+// given project working directory and session UUID. Claude stores transcripts at:
+//   ~/.claude/projects/<cwd-encoded>/<session-id>.jsonl
+// where <cwd-encoded> replaces ALL slashes (including the leading /) with -.
+// Returns "" if the file doesn't exist.
+func claudeTranscriptPath(cwd, sessionID string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	proj := strings.ReplaceAll(filepath.ToSlash(cwd), "/", "-")
+	p := filepath.Join(home, ".claude", "projects", proj, sessionID+".jsonl")
+	if _, err := os.Stat(p); err != nil {
+		return ""
+	}
+	return p
+}
 
 // resolveSymlinks returns the canonical path with symlinks resolved.
 // Falls back to the input if EvalSymlinks fails (e.g. for newly created paths).

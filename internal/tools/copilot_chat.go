@@ -1,9 +1,12 @@
 package tools
 
-// CopilotChatWatcher reads the VS Code / Cursor chat-session JSONL files
-// that Copilot Chat persists per workspace, and emits a copilot session
-// marker each time the model produces a new response — tagged with the
-// model the user has selected.
+// CopilotChatWatcher reads the VS Code / Cursor chat-session JSONL files that
+// the chat panel persists per workspace, and emits a session marker each time
+// the model produces a new response — tagged with the selected model AND the
+// owning tool. The same chatSessions/ directory holds both GitHub Copilot Chat
+// and Cursor's own chat; we classify each session by its selectedModel
+// identifier ("copilot/…" ⇒ copilot, otherwise ⇒ cursor) so the two are
+// attributed separately rather than all being credited to Copilot.
 //
 // Why this matters
 // ----------------
@@ -17,10 +20,11 @@ package tools
 //     line whose key path ends in `response`), so we mark activity at
 //     the moment text actually streams in, not when storage flushes.
 //
-// The model flows downstream via store.LatestCopilotModelNear: when the
-// user pastes Copilot's reply into a workspace file, HumanEditWatcher
-// re-stamps the row as tool=copilot and picks up the most-recent model
-// from this watcher's emissions.
+// The model + gen_type flow downstream via store.LatestChatModelNear /
+// LatestChatGenTypeNear: when the chat-panel apply lands as a plugin/log edit,
+// the daemon's enrichChatEdit re-stamps the row with the chat gen_type and the
+// most-recent model from this watcher's emissions. The chat_session_path in
+// raw_meta lets the attribution step re-open the JSONL for conversation + tokens.
 //
 // File layout (per inspection — undocumented, subject to change):
 //
@@ -42,6 +46,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -52,6 +57,7 @@ import (
 
 	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/daemon"
+	"github.com/blamely/blamely/internal/store"
 )
 
 // copilotChatPollInterval controls how often we re-scan the workspaceStorage
@@ -75,9 +81,10 @@ func (c *CopilotChatWatcher) Name() string { return "copilot-chat" }
 
 // sessionState is the per-file bookkeeping carried between scans.
 type sessionState struct {
-	offset    int64     // bytes read so far from this jsonl
-	model     string    // last-known selectedModel.identifier for this session
-	lastTouch time.Time // for stale eviction
+	offset    int64      // bytes read so far from this jsonl
+	model     string     // last-known display model for this session (provider prefix stripped)
+	tool      store.Tool // tool the session belongs to, classified from selectedModel
+	lastTouch time.Time  // for stale eviction
 }
 
 func (c *CopilotChatWatcher) Run(ctx context.Context, sink daemon.Sink) error {
@@ -196,22 +203,28 @@ func (c *CopilotChatWatcher) handleLine(path, line string, st *sessionState, sin
 	}
 	switch cl.Kind {
 	case 0:
-		// Initial snapshot — pull selectedModel.identifier if present.
-		if m := extractSelectedModel(cl.V); m != "" {
-			st.model = m
+		// Initial snapshot — the selected model lives at
+		// inputState.selectedModel (NOT the top level), so reach into it
+		// before handing the blob to extractSelectedModel.
+		var snap struct {
+			InputState struct {
+				SelectedModel json.RawMessage `json:"selectedModel"`
+			} `json:"inputState"`
+		}
+		if json.Unmarshal(cl.V, &snap) == nil {
+			st.applyModel(extractSelectedModel(snap.InputState.SelectedModel))
 		}
 	case 1:
-		// Scalar update at a key path. We watch for modelState updates;
-		// otherwise nothing to do.
-		if keyPathHasSuffix(cl.K, "modelState") {
-			if m := extractSelectedModel(cl.V); m != "" {
-				st.model = m
-			}
+		// Scalar update at a key path. The selected model arrives at
+		// ["inputState","selectedModel"]. (Note: "modelState" is a per-request
+		// status enum {value,completedAt}, NOT the model — don't read it here.)
+		if keyPathHasSuffix(cl.K, "selectedModel") {
+			st.applyModel(extractSelectedModel(cl.V))
 		}
 	case 2:
-		// Append at a key path — `response` chunks are how Copilot streams
-		// its reply. The first response chunk for a request is the signal
-		// "Copilot just generated code/text in the chat panel".
+		// Append at a key path — `response` chunks are how the chat panel
+		// streams its reply. The first response chunk for a request is the
+		// signal "the model just generated code/text in the chat panel".
 		if !keyPathHasSuffix(cl.K, "response") {
 			return
 		}
@@ -221,18 +234,61 @@ func (c *CopilotChatWatcher) handleLine(path, line string, st *sessionState, sin
 		if prime && time.Since(fileMTime) > 2*copilotChatPollInterval {
 			return
 		}
+		tool := st.tool
+		if tool == "" {
+			// Model not seen yet (deltas can arrive before the snapshot's
+			// selectedModel). Default to copilot — the historical behaviour —
+			// rather than dropping the signal entirely.
+			tool = store.ToolCopilot
+		}
 		ev := daemon.Event{
 			When:       scanTime,
-			Tool:       "copilot",
+			Tool:       string(tool),
 			Confidence: "low",
 			GenType:    "chat",
 			Model:      st.model,
-			RawMeta:    `{"source":"copilot_chat_session"}`,
+			// chat_session_path lets the attribution step re-open this JSONL
+			// to extract the conversation + token usage for the commit's note.
+			RawMeta: fmt.Sprintf(`{"source":"copilot_chat_session","tool":%q,"chat_session_path":%q}`,
+				string(tool), path),
 		}
 		if err := sink.Record(ev); err != nil {
 			log.Printf("copilot-chat sink: %v", err)
 		}
 	}
+}
+
+// applyModel records the session's display model and re-classifies the owning
+// tool from a raw selectedModel.identifier (e.g. "copilot/gpt-5-mini"). Empty
+// identifiers are ignored so a transient delta doesn't wipe a known model.
+func (st *sessionState) applyModel(identifier string) {
+	if identifier == "" {
+		return
+	}
+	st.tool = classifyChatTool(identifier)
+	st.model = displayModel(identifier)
+}
+
+// classifyChatTool decides which tool a chat session belongs to from its
+// selectedModel identifier. GitHub Copilot Chat prefixes every model with
+// "copilot/" (e.g. "copilot/gpt-5-mini", "copilot/claude-opus-4.6"); anything
+// else is Cursor's own chat. The same chatSessions/ directory under Cursor's
+// workspaceStorage holds both, so this prefix is how we keep them separate.
+func classifyChatTool(identifier string) store.Tool {
+	if strings.HasPrefix(strings.ToLower(identifier), "copilot/") {
+		return store.ToolCopilot
+	}
+	return store.ToolCursor
+}
+
+// displayModel strips the provider prefix from a chat model identifier so the
+// report's per-model rollup keys read "gpt-5-mini" rather than
+// "copilot/gpt-5-mini". Identifiers without a "/" are returned unchanged.
+func displayModel(identifier string) string {
+	if i := strings.IndexByte(identifier, '/'); i >= 0 {
+		return identifier[i+1:]
+	}
+	return identifier
 }
 
 // extractSelectedModel pulls selectedModel.identifier from the bytes of a

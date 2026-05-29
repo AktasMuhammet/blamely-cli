@@ -121,7 +121,6 @@ type LineEntry struct {
 	Tool    string  `json:"tool,omitempty"`
 	Model   *string `json:"model,omitempty"`
 	GenType *string `json:"gen_type,omitempty"`
-	Tokens  *Tokens `json:"tokens,omitempty"`
 }
 
 // AttributeAndWrite is the main entry point invoked by the post-commit hook.
@@ -173,20 +172,10 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 			note.Files[i].CopiedFrom = from
 		}
 	}
-	body, err := json.MarshalIndent(note, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("marshal note: %w", err)
-	}
-	if err := writeNote(repoPath, sha, body); err != nil {
-		return nil, err
-	}
-	if err := db.MarkCommitNoted(sha, repoID, commitNanos); err != nil {
-		return nil, err
-	}
-
 	// Attach conversation from any AI transcript files linked to edits in this
 	// commit's session. transcript_path is written into raw_meta by the Claude
 	// hook as of blamely 0.2; older edits silently produce no conversation.
+	// Must run BEFORE MarshalIndent/writeNote so it ends up in the persisted note.
 	sinceConv := db.PreviousCommitTimestampNanos(repoID, commitNanos)
 	const slackNanos = int64(5 * 1e9)
 	if paths, err := db.TranscriptPathsForPeriod(repoID, sinceConv, commitNanos+slackNanos); err == nil {
@@ -202,7 +191,71 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 		}
 	}
 
+	// Copilot / Cursor chat panels persist a delta-encoded chat JSONL rather
+	// than a Claude-style transcript. Pull its conversation (if no Claude
+	// transcript already supplied one) and its per-session token usage, which
+	// is the only place Copilot/Cursor token counts are observable locally.
+	until := commitNanos + slackNanos
+	if refs, err := db.ChatSessionPathsForPeriod(repoID, sinceConv, until); err == nil {
+		for _, ref := range refs {
+			if len(note.Conversation) == 0 {
+				if turns, err := tools.ReadChatSessionConversation(ref.Path, 10, 300); err == nil {
+					for _, t := range turns {
+						note.Conversation = append(note.Conversation, ConvTurn{Role: t.Role, Text: t.Text})
+					}
+				}
+			}
+			if usage, err := tools.ReadChatSessionUsage(ref.Path, sinceConv, until); err == nil {
+				applyChatUsage(note, ref.Tool, usage)
+			}
+		}
+	}
+
+	body, err := json.MarshalIndent(note, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal note: %w", err)
+	}
+	if err := writeNote(repoPath, sha, body); err != nil {
+		return nil, err
+	}
+	if err := db.MarkCommitNoted(sha, repoID, commitNanos); err != nil {
+		return nil, err
+	}
+
 	return note, nil
+}
+
+// applyChatUsage folds a chat session's summed token usage into the note for
+// the owning tool. It only applies when that tool actually has attributed lines
+// in this commit (a chat session that produced no committed code shouldn't add
+// tokens). The chat JSONL exposes only prompt/completion counts, mapped to
+// input/output; there is no cache-token split. Also backfills the tool's model
+// from the session when the edit rows didn't carry one.
+func applyChatUsage(note *Note, tool store.Tool, u *tools.TranscriptUsage) {
+	if u == nil {
+		return
+	}
+	key := string(tool)
+	t, ok := note.ByTool[key]
+	if !ok {
+		return
+	}
+	if t.Tokens == nil {
+		t.Tokens = &Tokens{}
+	}
+	t.Tokens.Input += u.InputTokens
+	t.Tokens.Output += u.OutputTokens
+	if t.Model == nil && u.Model != "" {
+		m := u.Model
+		t.Model = &m
+	}
+	note.ByTool[key] = t
+
+	if note.Totals.Tokens == nil {
+		note.Totals.Tokens = &Tokens{}
+	}
+	note.Totals.Tokens.Input += u.InputTokens
+	note.Totals.Tokens.Output += u.OutputTokens
 }
 
 // perLine is the intermediate per-line attribution before collapsing into ranges.
@@ -381,7 +434,6 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			a.model = p.model
 		}
 
-		var tokensForLine *Tokens
 		if p.edit != nil {
 			editID := p.edit.ID
 			if !seenEditTokens[editID] {
@@ -393,7 +445,6 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 						CacheRead:  nullInt64(p.edit.CacheReadTokens),
 						CacheWrite: nullInt64(p.edit.CacheWriteTokens),
 					}
-					tokensForLine = &t
 					a.tokens.Input += t.Input
 					a.tokens.Output += t.Output
 					a.tokens.CacheRead += t.CacheRead
@@ -418,7 +469,6 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			AuthorType: authorTypeFor(p.tool),
 			Tool:       string(p.tool),
 			Model:      strPtr(p.model),
-			Tokens:     tokensForLine,
 		}
 		if gt := string(p.genType); gt != "" && gt != string(store.GenTypeUnknown) {
 			entry.GenType = strPtr(gt)
