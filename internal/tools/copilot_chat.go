@@ -1,34 +1,15 @@
 package tools
 
-// CopilotChatWatcher reads the VS Code / Cursor chat-session JSONL files that
-// the chat panel persists per workspace, and emits a session marker each time
-// the model produces a new response — tagged with the selected model AND the
-// owning tool. The same chatSessions/ directory holds both GitHub Copilot Chat
-// and Cursor's own chat; we classify each session by its selectedModel
-// identifier ("copilot/…" ⇒ copilot, otherwise ⇒ cursor) so the two are
-// attributed separately rather than all being credited to Copilot.
+// CopilotChatWatcher reads VS Code chat-session JSONL files and attributes them
+// to GitHub Copilot. It only watches VS Code's workspaceStorage directory.
 //
-// Why this matters
-// ----------------
-// The base CopilotWatcher only knows "the globalStorage SQLite mutated",
-// which is a fuzzy signal with no model attached. The chat-session files
-// give us:
-//
-//   - The exact selectedModel.identifier (e.g. "copilot/gpt-5-mini",
-//     "copilot/gpt-4o", "copilot/claude-3-5-sonnet").
-//   - A real "Copilot just produced response content" event (the kind=2
-//     line whose key path ends in `response`), so we mark activity at
-//     the moment text actually streams in, not when storage flushes.
-//
-// The model + gen_type flow downstream via store.LatestChatModelNear /
-// LatestChatGenTypeNear: when the chat-panel apply lands as a plugin/log edit,
-// the daemon's enrichChatEdit re-stamps the row with the chat gen_type and the
-// most-recent model from this watcher's emissions. The chat_session_path in
-// raw_meta lets the attribution step re-open the JSONL for conversation + tokens.
+// Cursor's chat sessions are handled by CursorChatWatcher (cursor_chat.go),
+// which watches Cursor's workspaceStorage directory and always emits tool=cursor.
+// The two watchers are fully independent — changing one has no effect on the other.
 //
 // File layout (per inspection — undocumented, subject to change):
 //
-//	~/Library/Application Support/{Code,Cursor}/User/workspaceStorage/
+//	~/Library/Application Support/Code/User/workspaceStorage/
 //	  <hash>/chatSessions/<sessionId>.jsonl
 //
 // Each .jsonl is append-only and uses a delta encoding:
@@ -38,8 +19,6 @@ package tools
 //	{"kind":2,"k":["requests",0,"response"],"v":"...streamed chunk..."}
 //
 // kind=0 = snapshot, kind=1 = set value at key path, kind=2 = append.
-// We only care about the model in kind=0/kind=1, and the response-arrival
-// signal in kind=2.
 
 import (
 	"bufio"
@@ -57,52 +36,93 @@ import (
 
 	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/daemon"
+	"github.com/blamely/blamely/internal/gitutil"
 	"github.com/blamely/blamely/internal/store"
 )
 
-// copilotChatPollInterval controls how often we re-scan the workspaceStorage
-// roots for chat-session activity. Chat responses don't need millisecond
-// latency to be useful downstream, and a tighter loop just burns syscalls.
 const copilotChatPollInterval = 3 * time.Second
-
-// copilotChatStaleCutoff drops in-memory state for session files that
-// haven't been touched in this long. Keeps the watcher bounded for users
-// with hundreds of historical sessions.
 const copilotChatStaleCutoff = 24 * time.Hour
 
-// CopilotChatWatcher implements daemon.Watcher.
+// ── Public watcher types ──────────────────────────────────────────────────────
+
+// CopilotChatWatcher implements daemon.Watcher for GitHub Copilot chat sessions
+// in VS Code. It watches Code/User/workspaceStorage and always emits tool=copilot.
 type CopilotChatWatcher struct {
-	// Roots overrides the workspaceStorage scan roots for tests. If empty,
-	// the platform defaults are used.
+	// Roots overrides the workspaceStorage scan roots for tests.
 	Roots []string
 }
 
 func (c *CopilotChatWatcher) Name() string { return "copilot-chat" }
-
-// sessionState is the per-file bookkeeping carried between scans.
-type sessionState struct {
-	offset    int64      // bytes read so far from this jsonl
-	model     string     // last-known display model for this session (provider prefix stripped)
-	tool      store.Tool // tool the session belongs to, classified from selectedModel
-	lastTouch time.Time  // for stale eviction
-}
 
 func (c *CopilotChatWatcher) Run(ctx context.Context, sink daemon.Sink) error {
 	roots := c.Roots
 	if len(roots) == 0 {
 		roots = defaultCopilotChatRoots()
 	}
+	return (&chatSessionWatcher{tool: store.ToolCopilot, roots: roots}).run(ctx, sink)
+}
 
+// defaultCopilotChatRoots returns the VS Code workspaceStorage paths for the
+// current OS. Only VS Code — Cursor is handled by CursorChatWatcher.
+func defaultCopilotChatRoots() []string {
+	home, err := config.Home()
+	if err != nil {
+		return nil
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		return []string{
+			filepath.Join(home, "Library", "Application Support", "Code", "User", "workspaceStorage"),
+		}
+	case "windows":
+		appData := os.Getenv("APPDATA")
+		if appData == "" {
+			return nil
+		}
+		return []string{
+			filepath.Join(appData, "Code", "User", "workspaceStorage"),
+		}
+	default:
+		return []string{
+			filepath.Join(home, ".config", "Code", "User", "workspaceStorage"),
+		}
+	}
+}
+
+// ── Shared implementation ─────────────────────────────────────────────────────
+
+// chatSessionWatcher is the shared JSONL scanner. It is not exported — callers
+// use CopilotChatWatcher or CursorChatWatcher. The tool field is fixed at
+// construction time: every event emitted by this watcher carries that tool,
+// regardless of which model the user selected inside the editor. This keeps
+// Copilot and Cursor attribution fully independent.
+type chatSessionWatcher struct {
+	tool  store.Tool
+	roots []string
+}
+
+// sessionState is the per-file bookkeeping carried between scans.
+type sessionState struct {
+	offset    int64     // bytes read so far from this jsonl
+	model     string    // last-known display model (provider prefix stripped)
+	lastTouch time.Time // for stale eviction
+
+	// textEditGroup detection uses its own full-file re-scan, deduped by edit key.
+	tegMtime  time.Time
+	seenEdits map[string]bool
+}
+
+func (w *chatSessionWatcher) run(ctx context.Context, sink daemon.Sink) error {
 	var mu sync.Mutex
 	state := map[string]*sessionState{}
 
 	tick := time.NewTicker(copilotChatPollInterval)
 	defer tick.Stop()
 	for {
-		for _, root := range roots {
-			c.scanRoot(root, state, &mu, sink)
+		for _, root := range w.roots {
+			w.scanRoot(root, state, &mu, sink)
 		}
-		c.evictStale(state, &mu)
+		w.evictStale(state, &mu)
 		select {
 		case <-ctx.Done():
 			return nil
@@ -111,9 +131,7 @@ func (c *CopilotChatWatcher) Run(ctx context.Context, sink daemon.Sink) error {
 	}
 }
 
-// scanRoot finds every chatSessions/*.jsonl under root and walks any new
-// bytes appended since the last visit.
-func (c *CopilotChatWatcher) scanRoot(root string, state map[string]*sessionState, mu *sync.Mutex, sink daemon.Sink) {
+func (w *chatSessionWatcher) scanRoot(root string, state map[string]*sessionState, mu *sync.Mutex, sink daemon.Sink) {
 	if root == "" {
 		return
 	}
@@ -127,17 +145,17 @@ func (c *CopilotChatWatcher) scanRoot(root string, state map[string]*sessionStat
 		if d.IsDir() {
 			return nil
 		}
-		// Only chatSessions/*.jsonl. The chatEditingSessions sibling has
-		// different content we don't currently parse.
+		// Only chatSessions/*.jsonl. The chatEditingSessions sibling directory
+		// has different content we don't currently parse.
 		if !strings.HasSuffix(p, ".jsonl") || !strings.Contains(p, string(filepath.Separator)+"chatSessions"+string(filepath.Separator)) {
 			return nil
 		}
-		c.handleSessionFile(p, state, mu, sink)
+		w.handleSessionFile(p, state, mu, sink)
 		return nil
 	})
 }
 
-func (c *CopilotChatWatcher) handleSessionFile(path string, state map[string]*sessionState, mu *sync.Mutex, sink daemon.Sink) {
+func (w *chatSessionWatcher) handleSessionFile(path string, state map[string]*sessionState, mu *sync.Mutex, sink daemon.Sink) {
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() {
 		return
@@ -148,15 +166,20 @@ func (c *CopilotChatWatcher) handleSessionFile(path string, state map[string]*se
 		st = &sessionState{}
 		state[path] = st
 	}
-	// First time we see this file we still want the initial snapshot's
-	// model — but we DON'T want to emit a flood of "response arrived"
-	// markers for messages that streamed before the daemon started. The
-	// solution: read the file once, capture the model from kind=0, but
-	// only emit markers for response lines whose underlying file mtime
-	// is recent (within the poll interval × a small factor).
+	// Reset the streaming offset if the file shrank — VS Code periodically
+	// rewrites a session as a fresh snapshot, which would otherwise strand the
+	// offset past EOF and silently stop processing.
+	if info.Size() < st.offset {
+		st.offset = 0
+	}
 	startOffset := st.offset
 	prime := startOffset == 0
 	mu.Unlock()
+
+	// textEditGroup detection runs on every scan via its own mtime gate —
+	// independent of the append-offset so it survives snapshot rewrites.
+	// Must run BEFORE the no-new-bytes return below.
+	w.scanTextEdits(path, st, mu, sink, info.ModTime())
 
 	if info.Size() <= startOffset {
 		return
@@ -175,37 +198,77 @@ func (c *CopilotChatWatcher) handleSessionFile(path string, state map[string]*se
 	for {
 		line, err := r.ReadString('\n')
 		if line != "" {
-			c.handleLine(path, line, st, sink, prime, now, info.ModTime())
+			w.handleLine(path, line, st, sink, prime, now, info.ModTime())
 		}
 		if err != nil {
 			break
 		}
 	}
-	newOffset, _ := f.Seek(0, 1) // current position
+	newOffset, _ := f.Seek(0, 1)
 	mu.Lock()
 	st.offset = newOffset
 	st.lastTouch = now
 	mu.Unlock()
 }
 
-// chatLine is the minimal envelope we decode. `K` and `V` are intentionally
-// json.RawMessage so we don't pay for schema we don't use.
-type chatLine struct {
-	Kind int             `json:"kind"`
-	K    json.RawMessage `json:"k"`
-	V    json.RawMessage `json:"v"`
+// scanTextEdits re-reads the session file (only when its mtime advanced) and
+// records a chat edit for every textEditGroup it hasn't emitted before.
+func (w *chatSessionWatcher) scanTextEdits(path string, st *sessionState, mu *sync.Mutex, sink daemon.Sink, mtime time.Time) {
+	mu.Lock()
+	if st.seenEdits == nil {
+		st.seenEdits = map[string]bool{}
+	}
+	firstScan := st.tegMtime.IsZero()
+	if !mtime.After(st.tegMtime) {
+		mu.Unlock()
+		return
+	}
+	st.tegMtime = mtime
+	model := st.model
+	mu.Unlock()
+
+	// Suppress emitting on the very first scan of an OLD file (historical edits);
+	// always emit once the file is actively being modified.
+	emit := !firstScan || time.Since(mtime) <= 2*copilotChatPollInterval
+
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 1<<16), 1<<24)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 || line[0] != '{' {
+			continue
+		}
+		var cl chatLine
+		if json.Unmarshal(line, &cl) != nil {
+			continue
+		}
+		// Keep the display model fresh as we scan (used when recording edits).
+		if m := findSelectedModel(cl); m != "" {
+			model = displayModel(m)
+		}
+		var groups []textEditGroupPart
+		findTextEditGroups(cl.V, &groups)
+		if cl.Kind == 0 {
+			findTextEditGroups(json.RawMessage(line), &groups)
+		}
+		for i := range groups {
+			w.recordTextEditGroup(&groups[i], model, path, st, mu, sink, emit)
+		}
+	}
 }
 
-func (c *CopilotChatWatcher) handleLine(path, line string, st *sessionState, sink daemon.Sink, prime bool, scanTime, fileMTime time.Time) {
+func (w *chatSessionWatcher) handleLine(path, line string, st *sessionState, sink daemon.Sink, prime bool, scanTime, fileMTime time.Time) {
 	var cl chatLine
 	if err := json.Unmarshal([]byte(line), &cl); err != nil {
 		return
 	}
 	switch cl.Kind {
 	case 0:
-		// Initial snapshot — the selected model lives at
-		// inputState.selectedModel (NOT the top level), so reach into it
-		// before handing the blob to extractSelectedModel.
 		var snap struct {
 			InputState struct {
 				SelectedModel json.RawMessage `json:"selectedModel"`
@@ -215,75 +278,137 @@ func (c *CopilotChatWatcher) handleLine(path, line string, st *sessionState, sin
 			st.applyModel(extractSelectedModel(snap.InputState.SelectedModel))
 		}
 	case 1:
-		// Scalar update at a key path. The selected model arrives at
-		// ["inputState","selectedModel"]. (Note: "modelState" is a per-request
-		// status enum {value,completedAt}, NOT the model — don't read it here.)
 		if keyPathHasSuffix(cl.K, "selectedModel") {
 			st.applyModel(extractSelectedModel(cl.V))
 		}
 	case 2:
-		// Append at a key path — `response` chunks are how the chat panel
-		// streams its reply. The first response chunk for a request is the
-		// signal "the model just generated code/text in the chat panel".
 		if !keyPathHasSuffix(cl.K, "response") {
 			return
 		}
-		// During the prime pass for a file we already had, skip emitting
-		// for old chunks — only emit if the underlying file is being
-		// updated right now (within ~2 poll intervals).
 		if prime && time.Since(fileMTime) > 2*copilotChatPollInterval {
 			return
 		}
-		tool := st.tool
-		if tool == "" {
-			// Model not seen yet (deltas can arrive before the snapshot's
-			// selectedModel). Default to copilot — the historical behaviour —
-			// rather than dropping the signal entirely.
-			tool = store.ToolCopilot
-		}
 		ev := daemon.Event{
 			When:       scanTime,
-			Tool:       string(tool),
+			Tool:       string(w.tool),
 			Confidence: "low",
 			GenType:    "chat",
 			Model:      st.model,
-			// chat_session_path lets the attribution step re-open this JSONL
-			// to extract the conversation + token usage for the commit's note.
 			RawMeta: fmt.Sprintf(`{"source":"copilot_chat_session","tool":%q,"chat_session_path":%q}`,
-				string(tool), path),
+				string(w.tool), path),
 		}
 		if err := sink.Record(ev); err != nil {
-			log.Printf("copilot-chat sink: %v", err)
+			log.Printf("%s-chat sink: %v", w.tool, err)
 		}
 	}
 }
 
-// applyModel records the session's display model and re-classifies the owning
-// tool from a raw selectedModel.identifier (e.g. "copilot/gpt-5-mini"). Empty
-// identifiers are ignored so a transient delta doesn't wipe a known model.
+// recordTextEditGroup records one finalized textEditGroup as a per-file chat
+// edit. The tool is always w.tool — the watcher knows which editor it belongs to.
+func (w *chatSessionWatcher) recordTextEditGroup(teg *textEditGroupPart, model, sessionPath string, st *sessionState, mu *sync.Mutex, sink daemon.Sink, emit bool) {
+	if !teg.Done {
+		return
+	}
+	abs := teg.URI.FsPath
+	if abs == "" {
+		abs = teg.URI.Path
+	}
+	if abs == "" || (teg.URI.Scheme != "" && teg.URI.Scheme != "file") {
+		return
+	}
+
+	var ranges []daemon.LineRange
+	var suggested int64
+	for _, grp := range teg.Edits {
+		for _, e := range grp {
+			if strings.TrimSpace(e.Text) == "" {
+				continue
+			}
+			start := e.Range.StartLineNumber
+			if start <= 0 {
+				start = 1
+			}
+			for i, lt := range strings.Split(strings.TrimSuffix(e.Text, "\n"), "\n") {
+				ln := start + i
+				ranges = append(ranges, daemon.LineRange{
+					Start: ln, End: ln,
+					ContentSHA: sha256Hex([]byte(strings.TrimRight(lt, "\r"))),
+				})
+				suggested++
+			}
+		}
+	}
+	if len(ranges) == 0 {
+		return
+	}
+
+	// Dedup key: file + startLineNumber of each edit group. Streaming applies
+	// write multiple done=true checkpoints for the same region with growing
+	// content — keying on start positions collapses them into one emission.
+	key := abs
+	for _, grp := range teg.Edits {
+		for _, e := range grp {
+			key += fmt.Sprintf("|%d", e.Range.StartLineNumber)
+			break
+		}
+	}
+	mu.Lock()
+	if st.seenEdits[key] {
+		mu.Unlock()
+		return
+	}
+	st.seenEdits[key] = true
+	mu.Unlock()
+	if !emit {
+		return
+	}
+
+	if r, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = r
+	}
+	repo, _ := gitutil.RepoID(abs)
+	if repo == "" {
+		return
+	}
+	wt, _ := gitutil.Toplevel(abs)
+	rel := abs
+	if wt != "" {
+		if r, err := filepath.Rel(wt, abs); err == nil && !strings.HasPrefix(r, "..") {
+			rel = r
+		}
+	}
+	ev := daemon.Event{
+		When:           time.Now(),
+		Tool:           string(w.tool),
+		Confidence:     "high",
+		GenType:        "chat",
+		Model:          model,
+		RepoPath:       repo,
+		FilePath:       rel,
+		Lines:          ranges,
+		SuggestedLines: suggested,
+		RawMeta: fmt.Sprintf(`{"source":"copilot_chat_textedit","tool":%q,"chat_session_path":%q}`,
+			string(w.tool), sessionPath),
+	}
+	if err := sink.Record(ev); err != nil {
+		log.Printf("%s-chat textedit sink: %v", w.tool, err)
+	} else {
+		log.Printf("%s-chat: apply %s lines=%d model=%s", w.tool, rel, len(ranges), model)
+	}
+}
+
+// applyModel updates the session's display model from a raw selectedModel
+// identifier (e.g. "copilot/gpt-5-mini"). The tool is NOT changed here —
+// it is fixed on the watcher, not per-session.
 func (st *sessionState) applyModel(identifier string) {
 	if identifier == "" {
 		return
 	}
-	st.tool = classifyChatTool(identifier)
 	st.model = displayModel(identifier)
 }
 
-// classifyChatTool decides which tool a chat session belongs to from its
-// selectedModel identifier. GitHub Copilot Chat prefixes every model with
-// "copilot/" (e.g. "copilot/gpt-5-mini", "copilot/claude-opus-4.6"); anything
-// else is Cursor's own chat. The same chatSessions/ directory under Cursor's
-// workspaceStorage holds both, so this prefix is how we keep them separate.
-func classifyChatTool(identifier string) store.Tool {
-	if strings.HasPrefix(strings.ToLower(identifier), "copilot/") {
-		return store.ToolCopilot
-	}
-	return store.ToolCursor
-}
-
 // displayModel strips the provider prefix from a chat model identifier so the
-// report's per-model rollup keys read "gpt-5-mini" rather than
-// "copilot/gpt-5-mini". Identifiers without a "/" are returned unchanged.
+// report's per-model rollup reads "gpt-5-mini" rather than "copilot/gpt-5-mini".
 func displayModel(identifier string) string {
 	if i := strings.IndexByte(identifier, '/'); i >= 0 {
 		return identifier[i+1:]
@@ -291,11 +416,103 @@ func displayModel(identifier string) string {
 	return identifier
 }
 
-// extractSelectedModel pulls selectedModel.identifier from the bytes of a
-// kind=0 or kind=1 value blob. Tolerant of either flat ("identifier":...)
-// or wrapped ("selectedModel":{"identifier":...}) shapes; both appear in
-// the wild depending on whether the line is the full snapshot or a
-// modelState delta.
+func (w *chatSessionWatcher) evictStale(state map[string]*sessionState, mu *sync.Mutex) {
+	mu.Lock()
+	defer mu.Unlock()
+	cutoff := time.Now().Add(-copilotChatStaleCutoff)
+	for k, st := range state {
+		if st.lastTouch.Before(cutoff) {
+			delete(state, k)
+		}
+	}
+}
+
+// ── Shared JSONL parsing helpers ──────────────────────────────────────────────
+
+// chatLine is the minimal delta-encoding envelope. K and V are RawMessage so
+// we don't pay for schema we don't use.
+type chatLine struct {
+	Kind int             `json:"kind"`
+	K    json.RawMessage `json:"k"`
+	V    json.RawMessage `json:"v"`
+}
+
+// textEditGroupPart is the response-part shape the chat panel writes when it
+// applies edits: target URI, text edits with line ranges, and a done flag.
+type textEditGroupPart struct {
+	Kind string `json:"kind"`
+	URI  struct {
+		FsPath string `json:"fsPath"`
+		Path   string `json:"path"`
+		Scheme string `json:"scheme"`
+	} `json:"uri"`
+	Edits [][]struct {
+		Text  string `json:"text"`
+		Range struct {
+			StartLineNumber int `json:"startLineNumber"`
+			EndLineNumber   int `json:"endLineNumber"`
+		} `json:"range"`
+	} `json:"edits"`
+	Done bool `json:"done"`
+}
+
+// findSelectedModel extracts a selectedModel identifier from a delta/snapshot
+// line, tolerating both the inputState.selectedModel delta and snapshot shapes.
+func findSelectedModel(cl chatLine) string {
+	if keyPathHasSuffix(cl.K, "selectedModel") {
+		return extractSelectedModel(cl.V)
+	}
+	if cl.Kind == 0 {
+		var snap struct {
+			InputState struct {
+				SelectedModel json.RawMessage `json:"selectedModel"`
+			} `json:"inputState"`
+		}
+		if json.Unmarshal(cl.V, &snap) == nil {
+			return extractSelectedModel(snap.InputState.SelectedModel)
+		}
+	}
+	return ""
+}
+
+// findTextEditGroups recursively collects every finalized textEditGroup object
+// anywhere within raw (response arrays, snapshot request trees, etc.).
+func findTextEditGroups(raw json.RawMessage, out *[]textEditGroupPart) {
+	if len(raw) == 0 {
+		return
+	}
+	switch raw[0] {
+	case '{':
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(raw, &obj) != nil {
+			return
+		}
+		if k, ok := obj["kind"]; ok {
+			var ks string
+			if json.Unmarshal(k, &ks) == nil && ks == "textEditGroup" {
+				var teg textEditGroupPart
+				if json.Unmarshal(raw, &teg) == nil {
+					*out = append(*out, teg)
+				}
+				return
+			}
+		}
+		for _, v := range obj {
+			findTextEditGroups(v, out)
+		}
+	case '[':
+		var arr []json.RawMessage
+		if json.Unmarshal(raw, &arr) != nil {
+			return
+		}
+		for _, v := range arr {
+			findTextEditGroups(v, out)
+		}
+	}
+}
+
+// extractSelectedModel pulls selectedModel.identifier from a kind=0 or kind=1
+// value blob. Tolerant of flat and wrapped shapes.
 func extractSelectedModel(v json.RawMessage) string {
 	if len(v) == 0 {
 		return ""
@@ -305,8 +522,6 @@ func extractSelectedModel(v json.RawMessage) string {
 			Identifier string `json:"identifier"`
 			Family     string `json:"family"`
 		} `json:"selectedModel"`
-		// Some payloads put the model fields at the top level (modelState
-		// deltas, occasional snapshot variants).
 		Identifier string `json:"identifier"`
 		Family     string `json:"family"`
 	}
@@ -325,10 +540,8 @@ func extractSelectedModel(v json.RawMessage) string {
 	return probe.Family
 }
 
-// keyPathHasSuffix reports whether the JSON-encoded `k` ends with the given
-// string element. The `k` field is a heterogeneous array of strings and
-// indices (["requests", 0, "response"]); we only need to match the trailing
-// string element.
+// keyPathHasSuffix reports whether the JSON-encoded k ends with the given
+// string element (e.g. ["requests", 0, "response"] ends with "response").
 func keyPathHasSuffix(k json.RawMessage, suffix string) bool {
 	if len(k) == 0 {
 		return false
@@ -343,45 +556,4 @@ func keyPathHasSuffix(k json.RawMessage, suffix string) bool {
 		return false
 	}
 	return s == suffix
-}
-
-func (c *CopilotChatWatcher) evictStale(state map[string]*sessionState, mu *sync.Mutex) {
-	mu.Lock()
-	defer mu.Unlock()
-	cutoff := time.Now().Add(-copilotChatStaleCutoff)
-	for k, st := range state {
-		if st.lastTouch.Before(cutoff) {
-			delete(state, k)
-		}
-	}
-}
-
-// defaultCopilotChatRoots returns the workspaceStorage roots blamely scans
-// for chat-session JSONL files across VS Code and Cursor on the current OS.
-func defaultCopilotChatRoots() []string {
-	home, err := config.Home()
-	if err != nil {
-		return nil
-	}
-	switch runtime.GOOS {
-	case "darwin":
-		return []string{
-			filepath.Join(home, "Library", "Application Support", "Code", "User", "workspaceStorage"),
-			filepath.Join(home, "Library", "Application Support", "Cursor", "User", "workspaceStorage"),
-		}
-	case "windows":
-		appData := os.Getenv("APPDATA")
-		if appData == "" {
-			return nil
-		}
-		return []string{
-			filepath.Join(appData, "Code", "User", "workspaceStorage"),
-			filepath.Join(appData, "Cursor", "User", "workspaceStorage"),
-		}
-	default:
-		return []string{
-			filepath.Join(home, ".config", "Code", "User", "workspaceStorage"),
-			filepath.Join(home, ".config", "Cursor", "User", "workspaceStorage"),
-		}
-	}
 }

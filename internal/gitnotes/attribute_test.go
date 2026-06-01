@@ -227,8 +227,11 @@ func TestBuildNote_PerLineShape_NoCollapse_GenType_Deletions(t *testing.T) {
 	if _, ok := note.ByTool["human"]; ok {
 		t.Errorf("by_tool must not contain 'human' — humans aren't a tool")
 	}
-	if note.ByGenType.Human != 2 {
-		t.Errorf("by_gen_type.human: want 2, got %d", note.ByGenType.Human)
+	// 2 human-typed added lines (4,5) + 2 deleted lines (10,11) = 4.
+	// Deleted lines are always attributed to the human and folded into
+	// by_gen_type.human after the per-line totals are finalised.
+	if note.ByGenType.Human != 4 {
+		t.Errorf("by_gen_type.human: want 4, got %d", note.ByGenType.Human)
 	}
 
 	// Files: one file, lines fully expanded (no Range field), deletions present.

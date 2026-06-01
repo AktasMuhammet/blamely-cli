@@ -182,19 +182,21 @@ var copilotJetBrainsLine = regexp.MustCompile(
 	`(?i)(github-copilot-jetbrains|com\.github\.copilot\.[a-z.]*(?:complet|inline|ghost|apply))`,
 )
 
-// copilotJetBrainsFetch is a HIGH-precision pattern for JetBrains Copilot:
-// the plugin logs every backend round-trip as one of:
+// copilotFetch is a HIGH-precision pattern that matches the backend round-trip
+// log lines emitted by both the VS Code and JetBrains Copilot plugins:
 //
-//	#copilot - [fetchChat]        Request <id> at <https://.../chat/completions> finished with 200 status …
-//	#copilot - [fetchChat]        Request <id> at <https://.../responses>        finished with 200 status …
-//	#copilot - [fetchCompletions] Request <id> at <https://proxy.individual.githubcopilot.com/v1/engines/<model>/completions> finished …
+//	VS Code   : [fetchCompletions] Request <id> at <https://proxy.individual.githubcopilot.com/v1/engines/<model>/completions> finished …
+//	VS Code   : [fetchChat]        Request <id> at <https://.../chat/completions> finished …
+//	JetBrains : #copilot - [fetchCompletions] Request <id> at <…> finished …
+//	JetBrains : #copilot - [fetchChat]        Request <id> at <…> finished …
 //
-// The `[fetchChat]` vs `[fetchCompletions]` prefix tells us chat-vs-Tab
-// directly, and the `/v1/engines/<model>/completions` URL embeds the
-// active model for inline completions. We pick those out explicitly so
-// the resulting event has gen_type + model populated with no guessing.
-var copilotJetBrainsFetch = regexp.MustCompile(
-	`#copilot - \[(fetchChat|fetchCompletions)\][^<]*<([^>]+)>`,
+// `[fetchChat]` vs `[fetchCompletions]` tells us chat-vs-Tab directly, and
+// `/v1/engines/<model>/completions` in the URL embeds the model for inline
+// completions. We extract both so the emitted event has gen_type + model
+// without guessing. The `(?:#copilot - )?` prefix is optional to cover both
+// VS Code (no prefix) and JetBrains (with `#copilot - ` prefix).
+var copilotFetch = regexp.MustCompile(
+	`(?:#copilot - )?\[(fetchChat|fetchCompletions)\][^<]*<([^>]+)>`,
 )
 
 // copilotJetBrainsAutoModel matches the AutoModelService line that prints
@@ -255,8 +257,8 @@ func tailCopilotLog(ctx context.Context, path string, sink daemon.Sink) error {
 			continue
 		}
 		// 2) High-precision JetBrains fetch lines → emit directly.
-		if m := copilotJetBrainsFetch.FindStringSubmatch(line); m != nil {
-			emitCopilotJetBrainsFetch(m[1], m[2], activeModel, sink)
+		if m := copilotFetch.FindStringSubmatch(line); m != nil {
+			emitCopilotFetch(m[1], m[2], activeModel, sink)
 			continue
 		}
 		// 3) Generic accept-marker lines → existing fallback path.
@@ -266,10 +268,11 @@ func tailCopilotLog(ctx context.Context, path string, sink daemon.Sink) error {
 	}
 }
 
-// emitCopilotJetBrainsFetch handles the per-request lines unique to the
-// JetBrains plugin. `fetchKind` is "fetchChat" or "fetchCompletions";
-// `url` is the request URL (the model is encoded in completion URLs).
-func emitCopilotJetBrainsFetch(fetchKind, url, activeModel string, sink daemon.Sink) {
+// emitCopilotFetch handles [fetchChat] / [fetchCompletions] log lines from
+// both VS Code and JetBrains Copilot plugins. `fetchKind` is "fetchChat" or
+// "fetchCompletions"; `url` is the request URL (the model is encoded in
+// inline-completion URLs as /v1/engines/<model>/completions).
+func emitCopilotFetch(fetchKind, url, activeModel string, sink daemon.Sink) {
 	gen := "completion"
 	if fetchKind == "fetchChat" {
 		gen = "chat"
@@ -286,7 +289,7 @@ func emitCopilotJetBrainsFetch(fetchKind, url, activeModel string, sink daemon.S
 		Confidence: "medium",
 		GenType:    gen,
 		Model:      model,
-		RawMeta: fmt.Sprintf(`{"source":"copilot_log_jetbrains","fetch":%q}`, fetchKind),
+		RawMeta: fmt.Sprintf(`{"source":"copilot_log_fetch","fetch":%q}`, fetchKind),
 	}
 	if err := sink.Record(ev); err != nil {
 		log.Printf("copilot-log sink: %v", err)

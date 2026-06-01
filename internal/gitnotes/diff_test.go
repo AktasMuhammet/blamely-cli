@@ -141,7 +141,7 @@ func TestParseDiff_InPlaceModification(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantAdded := []AddedLine{{File: "foo.go", LineNum: 4}}
+	wantAdded := []AddedLine{{File: "foo.go", LineNum: 4, Content: "new"}}
 	if !reflect.DeepEqual(c.Added, wantAdded) {
 		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)
 	}
@@ -175,9 +175,9 @@ func TestParseDiff_ModificationAfterLineShift(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantAdded := []AddedLine{
-		{File: "foo.go", LineNum: 2},
-		{File: "foo.go", LineNum: 3},
-		{File: "foo.go", LineNum: 6},
+		{File: "foo.go", LineNum: 2, Content: "new1"},
+		{File: "foo.go", LineNum: 3, Content: "new2"},
+		{File: "foo.go", LineNum: 6, Content: "newX"},
 	}
 	if !reflect.DeepEqual(c.Added, wantAdded) {
 		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)
@@ -206,7 +206,7 @@ func TestParseDiff_ReplaceMoreWithFewer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantAdded := []AddedLine{{File: "foo.go", LineNum: 10}}
+	wantAdded := []AddedLine{{File: "foo.go", LineNum: 10, Content: "new"}}
 	if !reflect.DeepEqual(c.Added, wantAdded) {
 		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)
 	}
@@ -236,9 +236,9 @@ func TestParseDiff_ReplaceFewerWithMore(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantAdded := []AddedLine{
-		{File: "foo.go", LineNum: 10},
-		{File: "foo.go", LineNum: 11},
-		{File: "foo.go", LineNum: 12},
+		{File: "foo.go", LineNum: 10, Content: "newA"},
+		{File: "foo.go", LineNum: 11, Content: "newB"},
+		{File: "foo.go", LineNum: 12, Content: "newC"},
 	}
 	if !reflect.DeepEqual(c.Added, wantAdded) {
 		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)
@@ -317,8 +317,8 @@ func TestParseDiff_PureInsertion(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantAdded := []AddedLine{
-		{File: "foo.go", LineNum: 4},
-		{File: "foo.go", LineNum: 5},
+		{File: "foo.go", LineNum: 4, Content: "inserted1"},
+		{File: "foo.go", LineNum: 5, Content: "inserted2"},
 	}
 	if !reflect.DeepEqual(c.Added, wantAdded) {
 		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)
@@ -352,8 +352,8 @@ func TestParseDiff_FileBoundaryFlushesHunk(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantAdded := []AddedLine{
-		{File: "a.go", LineNum: 1},
-		{File: "b.go", LineNum: 1},
+		{File: "a.go", LineNum: 1, Content: "newA"},
+		{File: "b.go", LineNum: 1, Content: "newB"},
 	}
 	if !reflect.DeepEqual(c.Added, wantAdded) {
 		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)
@@ -403,8 +403,8 @@ func TestParseDiff_ExcludeListSkipsFile(t *testing.T) {
 
 	// Only src/Main.java should appear.
 	wantAdded := []AddedLine{
-		{File: "src/Main.java", LineNum: 11},
-		{File: "src/Main.java", LineNum: 12},
+		{File: "src/Main.java", LineNum: 11, Content: `    System.out.println("hi");`},
+		{File: "src/Main.java", LineNum: 12, Content: `    System.out.println("bye");`},
 	}
 	if !reflect.DeepEqual(c.Added, wantAdded) {
 		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)

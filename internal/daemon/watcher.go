@@ -127,8 +127,18 @@ func (s *dbSink) Record(ev Event) error {
 		}
 		e.Lines = append(e.Lines, store.EditLine{StartLine: r.Start, EndLine: r.End, ContentSHA: r.ContentSHA})
 	}
-	_, err := s.db.InsertEdit(e)
-	return err
+	if _, err := s.db.InsertEdit(e); err != nil {
+		return err
+	}
+	// When a chat-session marker lands, retroactively re-stamp the apply edit
+	// that the editor plugin already recorded as a completion a beat earlier
+	// (the chat response streams in slightly after the apply hits the file).
+	if e.GenType == store.GenTypeChat && (e.Tool == store.ToolCopilot || e.Tool == store.ToolCursor) {
+		if err := s.db.UpgradeRecentCompletionsToChat(e.Tool, e.TimestampNanos, chatEnrichWindowNanos); err != nil {
+			log.Printf("watcher sink: upgrade completions: %v", err)
+		}
+	}
+	return nil
 }
 
 // runWatchers fans the configured watchers out as goroutines. Errors are

@@ -126,18 +126,20 @@ func isCursorTabLog(path string) bool {
 	return base == "Cursor Tab.log" || strings.Contains(dir, "cursor-always-local")
 }
 
-// tailCursorLog streams a Cursor log file looking for Composer/Agent apply
-// events and emits a cursor/chat event for each one found.
+// tailCursorLog streams a Cursor log file looking for AI-apply events.
 //
-// Cursor Tab completion logs (isCursorTabLog) are skipped entirely: Tab
-// completions fire the log entry on suggestion GENERATION, not on user
-// acceptance, so log-based detection over-counts. Accepted Tab completions
-// are attributed via the VS Code / IntelliJ editor plugin which listens to
-// editor.action.inlineSuggest.commit — the only accept-precise signal.
+// For Composer/Agent apply events: emits confidence=medium cursor/chat records
+// with the applied file path and whole-file line range.
+//
+// For Cursor Tab logs (isCursorTabLog): the log entry fires on suggestion
+// GENERATION, not user acceptance, so we cannot claim specific lines. We do
+// emit a low-confidence session marker (no file, no lines) so the daemon knows
+// Cursor Tab was recently active — this aids model backfill and debugging.
+// Precise Tab attribution (file + lines) requires the Blamely editor plugin,
+// which listens to editor.action.inlineSuggest.commit.
 func tailCursorLog(ctx context.Context, path string, sink daemon.Sink) error {
-	// Skip Cursor Tab log files — generation != acceptance.
 	if isCursorTabLog(path) {
-		return nil
+		return tailCursorTabLog(ctx, path, sink)
 	}
 
 	f, err := os.Open(path)
@@ -175,6 +177,75 @@ func tailCursorLog(ctx context.Context, path string, sink daemon.Sink) error {
 		backoff = 200 * time.Millisecond
 		if filePath, ok := extractCursorApplyPath(line); ok {
 			emitCursorLogEvent(filePath, sink)
+		}
+	}
+}
+
+// tailCursorTabLog tails a Cursor Tab completion log and emits a low-confidence
+// session marker each time Cursor Tab generates a suggestion. The marker has no
+// file or line context — the log fires on suggestion GENERATION, not on user
+// acceptance, so we cannot claim specific lines from it.
+//
+// The session marker's purpose is narrow: it lets the daemon know Cursor Tab
+// was recently active (for model backfill and debug visibility). Precise
+// Tab attribution requires the Blamely editor plugin.
+func tailCursorTabLog(ctx context.Context, path string, sink daemon.Sink) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open: %w", err)
+	}
+	defer f.Close()
+
+	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+		return fmt.Errorf("seek: %w", err)
+	}
+
+	r := bufio.NewReaderSize(f, 1<<16)
+	backoff := 200 * time.Millisecond
+	const maxBackoff = 2 * time.Second
+	modelOutputPending := false
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				return err
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(backoff):
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+			}
+			continue
+		}
+		backoff = 200 * time.Millisecond
+
+		if strings.Contains(line, "=======>Model output") {
+			modelOutputPending = true
+			continue
+		}
+		if modelOutputPending {
+			if _, ok := extractCursorTabPath(line); ok {
+				modelOutputPending = false
+				// Emit a session marker — no file/lines because this is a
+				// generation event, not an acceptance event. The marker records
+				// "Cursor Tab was active at this moment" for the daemon.
+				ev := daemon.Event{
+					When:       time.Now(),
+					Tool:       "cursor",
+					Confidence: "low",
+					GenType:    "completion",
+					RawMeta:    `{"source":"cursor_tab_log"}`,
+				}
+				if err := sink.Record(ev); err != nil {
+					log.Printf("cursor-tab sink: %v", err)
+				}
+			} else if !strings.HasPrefix(strings.TrimSpace(line), "@@") {
+				modelOutputPending = false
+			}
 		}
 	}
 }
@@ -327,7 +398,8 @@ func DebugCursorLogs(ctx context.Context, debug bool, out io.Writer) error {
 	if debug {
 		fmt.Fprintf(out, "Debug mode: all scanned lines are shown.\n")
 		fmt.Fprintf(out, "  [MATCH]            = Composer/Agent apply event (recorded by daemon)\n")
-		fmt.Fprintf(out, "  [Tab shown]        = Cursor Tab suggestion shown (tracked via editor plugin, not log)\n")
+		fmt.Fprintf(out, "  [Tab shown]        = Cursor Tab suggestion shown — session marker emitted (low confidence).\n")
+		fmt.Fprintf(out, "                       For precise line attribution install the Blamely editor plugin.\n")
 		fmt.Fprintf(out, "  [skip]             = line scanned, no apply keyword found\n")
 	} else {
 		fmt.Fprintf(out, "Showing detected AI-apply events only (use --debug to see all lines).\n")
@@ -428,7 +500,7 @@ func debugTailCursorLog(ctx context.Context, path string, debug bool, out io.Wri
 			if modelOutputPending {
 				if filePath, ok := extractCursorTabPath(line); ok {
 					modelOutputPending = false
-					fmt.Fprintf(out, "[Tab shown - not tracked] %s  →  %s\n", shortPath, filePath)
+					fmt.Fprintf(out, "[Tab shown] %s  →  %s  (session marker emitted, no lines — install plugin for line attribution)\n", shortPath, filePath)
 				} else {
 					if !strings.HasPrefix(strings.TrimSpace(line), "@@") {
 						modelOutputPending = false

@@ -4,25 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"github.com/blamely/blamely/internal/store"
 )
 
-func TestClassifyChatTool(t *testing.T) {
-	cases := map[string]store.Tool{
-		"copilot/gpt-5-mini":      store.ToolCopilot,
-		"copilot/claude-opus-4.6": store.ToolCopilot,
-		"COPILOT/gpt-4o":          store.ToolCopilot, // case-insensitive prefix
-		"claude-3.5-sonnet":       store.ToolCursor,  // Cursor's own model id
-		"gpt-4o":                  store.ToolCursor,
-		"":                        store.ToolCursor,
-	}
-	for id, want := range cases {
-		if got := classifyChatTool(id); got != want {
-			t.Errorf("classifyChatTool(%q) = %q, want %q", id, got, want)
-		}
-	}
-}
 
 func TestDisplayModel(t *testing.T) {
 	cases := map[string]string{
@@ -61,7 +44,7 @@ func writeSample(t *testing.T) string {
 
 func TestReadChatSessionConversation(t *testing.T) {
 	p := writeSample(t)
-	turns, err := ReadChatSessionConversation(p, 10, 300)
+	turns, err := ReadChatSessionConversation(p, 10, 300, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +66,7 @@ func TestReadChatSessionConversation(t *testing.T) {
 
 func TestReadChatSessionConversation_LastNTurns(t *testing.T) {
 	p := writeSample(t)
-	turns, err := ReadChatSessionConversation(p, 2, 300)
+	turns, err := ReadChatSessionConversation(p, 2, 300, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,6 +76,28 @@ func TestReadChatSessionConversation_LastNTurns(t *testing.T) {
 	// Should be the LAST two turns.
 	if turns[0].Text != "second" || turns[1].Text != "reply2" {
 		t.Errorf("want last two turns [second, reply2], got %+v", turns)
+	}
+}
+
+// TestReadChatSessionConversation_WindowFilter is the core regression test for
+// the bug where older requests in a long-running session bled into newer commits'
+// notes. The sample has two requests at timestamps 1000ms and 2000ms; a window
+// covering only 1500ms–3000ms should return only the second request.
+func TestReadChatSessionConversation_WindowFilter(t *testing.T) {
+	p := writeSample(t)
+	// sinceNanos = 1500ms in ns, untilNanos = 3000ms in ns
+	since := int64(1500 * 1e6)
+	until := int64(3000 * 1e6)
+	turns, err := ReadChatSessionConversation(p, 10, 300, since, until)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only the second request (timestamp 2000ms) should appear.
+	if len(turns) != 2 {
+		t.Fatalf("want 2 turns (second request only), got %d: %+v", len(turns), turns)
+	}
+	if turns[0].Text != "second" || turns[1].Text != "reply2" {
+		t.Errorf("want [second, reply2], got %+v", turns)
 	}
 }
 

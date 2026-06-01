@@ -1,7 +1,9 @@
 package gitnotes
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -199,7 +201,7 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	if refs, err := db.ChatSessionPathsForPeriod(repoID, sinceConv, until); err == nil {
 		for _, ref := range refs {
 			if len(note.Conversation) == 0 {
-				if turns, err := tools.ReadChatSessionConversation(ref.Path, 10, 300); err == nil {
+				if turns, err := tools.ReadChatSessionConversation(ref.Path, 10, 300, sinceConv, until); err == nil {
 					for _, t := range turns {
 						note.Conversation = append(note.Conversation, ConvTurn{Role: t.Role, Text: t.Text})
 					}
@@ -262,6 +264,7 @@ func applyChatUsage(note *Note, tool store.Tool, u *tools.TranscriptUsage) {
 type perLine struct {
 	file    string
 	line    int
+	content string // raw line text from the diff (for ContentSHA fallback)
 	tool    store.Tool
 	model   string
 	genType store.GenType
@@ -276,9 +279,16 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 	sinceNanos := db.PreviousCommitTimestampNanos(repoPath, commitNanos)
 
 	// Group changed lines by file so we hit the DB once per file.
+	// Also carry the line content for ContentSHA-based fallback attribution
+	// (so AI edits survive line-number drift from human edits made after apply).
+	type fileLineKey struct{ file string; lineNum int }
+	lineContent := map[fileLineKey]string{}
 	byFile := map[string][]int{}
 	for _, a := range added {
 		byFile[a.File] = append(byFile[a.File], a.LineNum)
+		if a.Content != "" {
+			lineContent[fileLineKey{a.File, a.LineNum}] = a.Content
+		}
 	}
 
 	resolved := make([]perLine, 0, len(added))
@@ -306,13 +316,17 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			// Default: human-typed code. tool="" + gen_type=human is the
 			// canonical representation; humans aren't a tool.
 			// Any line not explicitly claimed by an AI edit record stays human.
-			p := perLine{file: file, line: ln, tool: "", genType: store.GenTypeHuman}
+			content := lineContent[fileLineKey{file, ln}]
+			p := perLine{file: file, line: ln, content: content, tool: "", genType: store.GenTypeHuman}
 			for i := range edits {
 				e := &edits[i]
 				if e.TimestampNanos > commitNanos+sameSecondSlackNanos {
 					continue
 				}
-				if !coversLine(e.Lines, ln) {
+				// Primary match: line-number range. Falls back to ContentSHA
+				// when the line shifted after the AI applied it (e.g. human
+				// added lines earlier in the file before committing).
+				if !coversLine(e.Lines, ln) && !coversContentSHA(e.Lines, content) {
 					continue
 				}
 				// Normalise legacy rows: tool="human" pre-dates the split.
@@ -649,6 +663,26 @@ func coversLine(lines []store.EditLine, n int) bool {
 	return false
 }
 
+// coversContentSHA returns true when any edit line's stored ContentSHA matches
+// the SHA-256 of the committed line's content. This is the fallback for when
+// line numbers drifted after the AI applied the edit (e.g. the human added
+// lines earlier in the file before committing). Only called when coversLine
+// already returned false, and only when the edit has per-line hashes (chat
+// edits from the textEditGroup path always carry them; log/velocity edits don't).
+// Empty content or an edit with no ContentSHAs is never a match.
+func coversContentSHA(lines []store.EditLine, content string) bool {
+	if content == "" {
+		return false
+	}
+	want := sha256HexStr([]byte(content))
+	for _, l := range lines {
+		if l.ContentSHA != "" && l.ContentSHA == want {
+			return true
+		}
+	}
+	return false
+}
+
 func confidenceFor(tool store.Tool, e *store.Edit) store.Confidence {
 	if e != nil {
 		return e.Confidence
@@ -726,4 +760,9 @@ func equalInt64Ptr(a, b *int64) bool {
 		return a == b
 	}
 	return *a == *b
+}
+
+func sha256HexStr(b []byte) string {
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
 }

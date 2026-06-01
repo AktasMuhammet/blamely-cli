@@ -266,6 +266,24 @@ func (db *DB) LatestChatGenTypeNear(tool Tool, tsNanos, windowNanos int64) strin
 	return gt.String
 }
 
+// UpgradeRecentCompletionsToChat re-stamps recent file-bearing completion edits
+// of the given tool as gen_type=chat. It's called when a chat-session marker
+// arrives — which often happens AFTER the editor plugin already recorded the
+// apply as a completion (the chat response streams in a beat later), so the
+// insert-time enrichment can't catch it. CONFIRMED inline accepts
+// (confidence=high) are left alone: those genuinely are Tab completions.
+func (db *DB) UpgradeRecentCompletionsToChat(tool Tool, tsNanos, windowNanos int64) error {
+	_, err := db.Exec(`
+		UPDATE edits SET gen_type='chat'
+		WHERE tool=? AND gen_type='completion' AND confidence != 'high'
+		  AND file_path != '' AND ts >= ? AND ts <= ?`,
+		string(tool), tsNanos-windowNanos, tsNanos+windowNanos)
+	if err != nil {
+		return fmt.Errorf("upgrade completions to chat: %w", err)
+	}
+	return nil
+}
+
 // HasCopilotSessionNear returns true when at least one copilot session-active
 // marker exists in the DB for repoPath with a timestamp inside [ts-window, ts+window].
 // Used by the attribution step to fold in Copilot attribution for lines that
@@ -489,6 +507,76 @@ func (db *DB) MarkCommitNoted(sha, repo string, tsNanos int64) error {
 		return fmt.Errorf("mark commit: %w", err)
 	}
 	return nil
+}
+
+// PluginEditRow is a lightweight row for the live-log poller.
+type PluginEditRow struct {
+	ID         int64
+	Ts         int64 // nanoseconds
+	Tool       string
+	Confidence string
+	GenType    string
+	Model      string
+	RepoPath   string
+	FilePath   string
+	RawMeta    string
+	StartLine  int
+	EndLine    int
+}
+
+// RecentPluginEdits returns rows from the edits table whose raw_meta source
+// field matches one of the given source names and whose id > afterID.
+// Used by the live-log poller to show HTTP-endpoint events (intellij_plugin,
+// vscode_plugin) alongside watcher events in `blamely log copilot`.
+func (db *DB) RecentPluginEdits(sources []string, afterID int64) ([]PluginEditRow, error) {
+	if len(sources) == 0 {
+		return nil, nil
+	}
+	placeholders := strings.Repeat("?,", len(sources))
+	placeholders = placeholders[:len(placeholders)-1]
+	args := make([]any, 0, len(sources)+1)
+	for _, s := range sources {
+		args = append(args, "%\"source\":\""+s+"%")
+	}
+	args = append(args, afterID)
+
+	// Build a LIKE OR clause for each source pattern.
+	like := ""
+	for i := range sources {
+		if i > 0 {
+			like += " OR "
+		}
+		like += "raw_meta LIKE ?"
+	}
+	_ = placeholders
+
+	rows, err := db.Query(fmt.Sprintf(`
+		SELECT e.id, e.ts, e.tool, e.confidence, e.gen_type,
+		       COALESCE(e.model,''), e.repo_path, e.file_path, COALESCE(e.raw_meta,''),
+		       COALESCE(el.start_line,0), COALESCE(el.end_line,0)
+		FROM edits e
+		LEFT JOIN edit_lines el ON el.edit_id = e.id AND el.rowid = (
+		    SELECT MIN(rowid) FROM edit_lines WHERE edit_id = e.id
+		)
+		WHERE (%s) AND e.id > ?
+		ORDER BY e.id ASC`, like),
+		args...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PluginEditRow
+	for rows.Next() {
+		var r PluginEditRow
+		if err := rows.Scan(&r.ID, &r.Ts, &r.Tool, &r.Confidence, &r.GenType,
+			&r.Model, &r.RepoPath, &r.FilePath, &r.RawMeta,
+			&r.StartLine, &r.EndLine); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 func nullableString(s sql.NullString) any {

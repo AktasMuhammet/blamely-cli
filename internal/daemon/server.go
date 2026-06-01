@@ -26,19 +26,19 @@ type Server struct {
 
 // EditPayload is the JSON body POSTed to /edit by tool integrations.
 type EditPayload struct {
-	Tool             string  `json:"tool"`
-	Confidence       string  `json:"confidence,omitempty"`
+	Tool       string `json:"tool"`
+	Confidence string `json:"confidence,omitempty"`
 	// GenType: chat | cli | completion | unknown
-	GenType          string  `json:"gen_type,omitempty"`
-	RepoPath         string  `json:"repo_path"`
-	FilePath         string  `json:"file_path"`
-	Model            string  `json:"model,omitempty"`
-	InputTokens      *int64  `json:"input_tokens,omitempty"`
-	OutputTokens     *int64  `json:"output_tokens,omitempty"`
-	CacheReadTokens  *int64  `json:"cache_read_tokens,omitempty"`
-	CacheWriteTokens *int64  `json:"cache_write_tokens,omitempty"`
-	HashBefore       string  `json:"hash_before,omitempty"`
-	HashAfter        string  `json:"hash_after,omitempty"`
+	GenType          string `json:"gen_type,omitempty"`
+	RepoPath         string `json:"repo_path"`
+	FilePath         string `json:"file_path"`
+	Model            string `json:"model,omitempty"`
+	InputTokens      *int64 `json:"input_tokens,omitempty"`
+	OutputTokens     *int64 `json:"output_tokens,omitempty"`
+	CacheReadTokens  *int64 `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens *int64 `json:"cache_write_tokens,omitempty"`
+	HashBefore       string `json:"hash_before,omitempty"`
+	HashAfter        string `json:"hash_after,omitempty"`
 	// SuggestedLines: AI's original suggestion size before user edits.
 	SuggestedLines int64   `json:"suggested_lines,omitempty"`
 	Lines          []Range `json:"lines"`
@@ -229,7 +229,8 @@ func validateAndStore(db *store.DB, p EditPayload) error {
 
 // chatEnrichWindowNanos is the look-back/forward window for correlating a
 // committed edit with the chat-session markers emitted by the chat watcher.
-const chatEnrichWindowNanos = int64(60 * 1e9) // 60 seconds
+const chatEnrichWindowNanos = int64(60 * 1e9)     // 60 seconds — gen_type correlation
+const chatModelWindowNanos = int64(30 * 60 * 1e9) // 30 minutes — sticky model backfill
 
 // enrichChatEdit upgrades a chat-tool edit's gen_type + model from recent
 // chat-session markers. The plugin / log / velocity paths can't tell a
@@ -247,13 +248,22 @@ func enrichChatEdit(db *store.DB, e *store.Edit) {
 		return
 	}
 	now := e.TimestampNanos
-	if e.GenType != store.GenTypeChat {
+	// Never override a CONFIRMED inline-completion accept. confidence=high on a
+	// completion means the editor plugin saw the inline-suggest commit command
+	// (or IDE accept action) fire — that's a real Tab/inline accept, not a chat
+	// apply, even if the user happened to have a chat panel open nearby.
+	confirmedCompletion := e.Confidence == store.ConfidenceHigh && e.GenType == store.GenTypeCompletion
+	if e.GenType != store.GenTypeChat && !confirmedCompletion {
 		if recent := db.LatestChatGenTypeNear(e.Tool, now, chatEnrichWindowNanos); recent == string(store.GenTypeChat) {
 			e.GenType = store.GenTypeChat
 		}
 	}
 	if !e.Model.Valid || e.Model.String == "" {
-		if m := db.LatestChatModelNear(e.Tool, e.RepoPath, now, chatEnrichWindowNanos); m != "" {
+		// Best-effort model backfill for ANY copilot/cursor edit (chat AND
+		// inline completion). The selected model is sticky across a session, so
+		// use a generous window — an inline completion gets the model the user
+		// most recently had active, even if their last chat was minutes ago.
+		if m := db.LatestChatModelNear(e.Tool, e.RepoPath, now, chatModelWindowNanos); m != "" {
 			e.Model = sql.NullString{Valid: true, String: m}
 		}
 	}

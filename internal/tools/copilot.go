@@ -125,8 +125,6 @@ func defaultCopilotStorageRoots() []string {
 		roots = append(roots,
 			filepath.Join(home, "Library", "Application Support", "Code", "User", "globalStorage", "github.copilot"),
 			filepath.Join(home, "Library", "Application Support", "Code", "User", "globalStorage", "github.copilot-chat"),
-			filepath.Join(home, "Library", "Application Support", "Cursor", "User", "globalStorage", "github.copilot"),
-			filepath.Join(home, "Library", "Application Support", "Cursor", "User", "globalStorage", "github.copilot-chat"),
 		)
 	case "windows":
 		if local := os.Getenv("LOCALAPPDATA"); local != "" {

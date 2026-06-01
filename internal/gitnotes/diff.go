@@ -12,9 +12,14 @@ import (
 
 // AddedLine is one line that was added (or modified) by the commit.
 // LineNum is the 1-based line number in the POST-commit file.
+// Content is the raw text of the line (without the leading '+'), stripped of
+// trailing carriage returns. Used as a ContentSHA fallback in attribution so
+// that Copilot/chat edits survive line-number drift caused by human edits made
+// to the file after the AI applied them but before the commit.
 type AddedLine struct {
 	File    string
 	LineNum int
+	Content string
 }
 
 // FileChangeType is the file-level change kind: ADDED, DELETED, MODIFIED,
@@ -158,7 +163,7 @@ func parseDiff(r io.Reader, excl *config.ExcludeList) (*CommitChange, error) {
 		for i := 0; i < n; i++ {
 			a := hunkAdds[i]
 			if curFile != "" && strings.TrimSpace(a.content) != "" {
-				out.Added = append(out.Added, AddedLine{File: curFile, LineNum: a.line})
+				out.Added = append(out.Added, AddedLine{File: curFile, LineNum: a.line, Content: strings.TrimRight(a.content, "\r")})
 			}
 		}
 		// Excess deletes — lines removed without a same-position replacement.
@@ -171,7 +176,7 @@ func parseDiff(r io.Reader, excl *config.ExcludeList) (*CommitChange, error) {
 		for i := n; i < len(hunkAdds); i++ {
 			a := hunkAdds[i]
 			if curFile != "" && strings.TrimSpace(a.content) != "" {
-				out.Added = append(out.Added, AddedLine{File: curFile, LineNum: a.line})
+				out.Added = append(out.Added, AddedLine{File: curFile, LineNum: a.line, Content: strings.TrimRight(a.content, "\r")})
 			}
 		}
 		hunkDels = hunkDels[:0]

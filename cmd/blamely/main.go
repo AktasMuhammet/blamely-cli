@@ -65,8 +65,14 @@ func cmdDaemon() *cobra.Command {
 			// APIs respectively, both of which POST directly to /edit.
 			daemon.Watchers = []daemon.Watcher{
 				&tools.CodexWatcher{},
+				// Cursor: file-history presence signal + log events + chat panel.
+				// These three are independent of Copilot and must not share state.
 				&tools.CursorWatcher{},
 				&tools.CursorLogWatcher{},
+				&tools.CursorChatWatcher{},
+				// Copilot: storage-touch signal + chat panel (VS Code only) + logs.
+				// CopilotChatWatcher watches Code/workspaceStorage; CursorChatWatcher
+				// watches Cursor/workspaceStorage. They never overlap.
 				&tools.CopilotWatcher{},
 				&tools.CopilotChatWatcher{},
 				&tools.CopilotLogWatcher{},
@@ -211,6 +217,12 @@ func cmdAttribute() *cobra.Command {
 		Short:  "Internal: compute attribution for a commit and write the git note",
 		Args:   cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Self-heal: drop any stale per-repo Blamely hooks/runner left by
+			// older installs. Hooks live globally (core.hooksPath) now, so the
+			// per-repo copies are redundant and the legacy pre-push runner
+			// recursed. Best-effort; never blocks the commit.
+			install.RemoveLegacyRepoHooks(args[0])
+
 			note, err := gitnotes.AttributeAndWrite(args[0], args[1])
 			if err != nil {
 				return err

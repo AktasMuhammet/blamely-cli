@@ -212,9 +212,12 @@ func requestIndex(k json.RawMessage, suffix string) (int, bool) {
 }
 
 // ReadChatSessionConversation returns up to maxTurns user/assistant turns from
-// a chat-session JSONL, taking the last maxTurns. Each turn's text is capped at
-// maxChars. Empty turns (no user text and no visible assistant text) are skipped.
-func ReadChatSessionConversation(path string, maxTurns, maxChars int) ([]ConvTurn, error) {
+// a chat-session JSONL for requests whose timestamp falls within
+// [sinceNanos, untilNanos]. Pass 0,0 to include all requests (no window).
+// Filtering by the commit's time window prevents older requests in the same
+// long-running session from bleeding into a newer commit's note.
+// Each turn's text is capped at maxChars characters.
+func ReadChatSessionConversation(path string, maxTurns, maxChars int, sinceNanos, untilNanos int64) ([]ConvTurn, error) {
 	if path == "" {
 		return nil, nil
 	}
@@ -222,19 +225,30 @@ func ReadChatSessionConversation(path string, maxTurns, maxChars int) ([]ConvTur
 	if err != nil {
 		return nil, err
 	}
-	var turns []ConvTurn
-	cap := func(s string) string {
+	capText := func(s string) string {
 		s = strings.TrimSpace(s)
 		if maxChars > 0 && len(s) > maxChars {
 			return s[:maxChars] + "…"
 		}
 		return s
 	}
+	var turns []ConvTurn
 	for _, r := range cs.requests {
-		if u := cap(r.userText); u != "" {
+		// Filter by timestamp when a window is provided.
+		if sinceNanos > 0 || untilNanos > 0 {
+			if r.timestampMillis == 0 {
+				// No timestamp — skip rather than over-include.
+				continue
+			}
+			reqNanos := r.timestampMillis * int64(1e6)
+			if reqNanos < sinceNanos || (untilNanos > 0 && reqNanos > untilNanos) {
+				continue
+			}
+		}
+		if u := capText(r.userText); u != "" {
 			turns = append(turns, ConvTurn{Role: "user", Text: u})
 		}
-		if a := cap(r.assistant.String()); a != "" {
+		if a := capText(r.assistant.String()); a != "" {
 			turns = append(turns, ConvTurn{Role: "assistant", Text: a})
 		}
 	}
