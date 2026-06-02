@@ -15,14 +15,23 @@ name: Build & Publish Release
 # Optional secrets:
 #   APPLE_CERT_*  / WINDOWS_CERT_*  → code signing if/when you set it up
 #
-# Artifacts published per tag (Go produces a single static binary, no DLLs):
+# Artifacts published per semver tag (e.g. v0.2.0):
 #   blamely_<tag>_darwin_amd64.tar.gz
 #   blamely_<tag>_darwin_arm64.tar.gz
 #   blamely_<tag>_linux_amd64.tar.gz
 #   blamely_<tag>_linux_arm64.tar.gz
 #   blamely_<tag>_windows_amd64.zip
 #   blamely_<tag>_windows_arm64.zip
-#   SHA256SUMS  (over every archive)
+#   SHA256SUMS  (over every versioned archive)
+#
+# A rolling `latest` release is also updated (stable filenames for installers):
+#   blamely_darwin_amd64.tar.gz
+#   blamely_darwin_arm64.tar.gz
+#   blamely_linux_amd64.tar.gz
+#   blamely_linux_arm64.tar.gz
+#   blamely_windows_amd64.zip
+#   blamely_windows_arm64.zip
+#   → https://github.com/<RELEASE_REPO>/releases/download/latest/<asset>
 
 on:
   push:
@@ -229,6 +238,28 @@ jobs:
               --title "blamely $TAG" \
               --generate-notes \
               --verify-tag=false
-          # Upload (or replace) every archive plus SHA256SUMS.
+          # Upload (or replace) every versioned archive plus SHA256SUMS.
           gh release upload "$TAG" --repo "$RELEASE_REPO" --clobber \
             *.tar.gz *.zip SHA256SUMS
+
+          # Mark the semver release as GitHub's default "Latest" (UI + /releases/latest).
+          gh release edit "$TAG" --repo "$RELEASE_REPO" --latest
+
+          # Rolling `latest` tag release — stable asset names for curl|bash installers.
+          mkdir -p latest-assets
+          shopt -s nullglob
+          for f in blamely_"${TAG}"_*.tar.gz blamely_"${TAG}"_*.zip; do
+            [ -f "$f" ] || continue
+            stable="blamely_${f#blamely_${TAG}_}"
+            cp "$f" "latest-assets/${stable}"
+          done
+          (cd latest-assets && sha256sum *.tar.gz *.zip > SHA256SUMS 2>/dev/null || true)
+
+          gh release view latest --repo "$RELEASE_REPO" >/dev/null 2>&1 || \
+            gh release create latest \
+              --repo "$RELEASE_REPO" \
+              --title "Latest" \
+              --notes "Rolling build from the most recent release. Pin a version with a \`v*.*.*\` tag instead." \
+              --verify-tag=false
+
+          gh release upload latest --repo "$RELEASE_REPO" --clobber latest-assets/*
