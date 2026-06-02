@@ -64,6 +64,46 @@ func (c *CopilotChatWatcher) Run(ctx context.Context, sink daemon.Sink) error {
 
 // defaultCopilotChatRoots returns the VS Code workspaceStorage paths for the
 // current OS. Only VS Code — Cursor is handled by CursorChatWatcher.
+// findChatSessionPath locates a VS Code / Cursor chatSessions JSONL file by
+// session UUID (filename is <sessionID>.jsonl under workspaceStorage).
+func findChatSessionPath(sessionID string, roots []string) string {
+	if sessionID == "" {
+		return ""
+	}
+	name := sessionID + ".jsonl"
+	for _, root := range roots {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			p := filepath.Join(root, e.Name(), "chatSessions", name)
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
+// copilotChatSearchRoots returns workspaceStorage roots where Copilot chat
+// sessions may live (VS Code and Copilot-in-Cursor).
+func copilotChatSearchRoots() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, r := range append(defaultCopilotChatRoots(), defaultCursorChatRoots()...) {
+		if r == "" || seen[r] {
+			continue
+		}
+		seen[r] = true
+		out = append(out, r)
+	}
+	return out
+}
+
 func defaultCopilotChatRoots() []string {
 	home, err := config.Home()
 	if err != nil {

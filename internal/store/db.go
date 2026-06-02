@@ -92,6 +92,39 @@ var migrations = []string{
 	// partial acceptance. Compare to SUM(end_line - start_line + 1) across
 	// edit_lines for that edit to compute the acceptance ratio.
 	/* 7 */ `ALTER TABLE edits ADD COLUMN suggested_lines INTEGER NOT NULL DEFAULT 0`,
+	// Migration 8: prompts — the user's chat prompts, keyed by session_id, so the
+	// conversation survives transcript-file rotation/deletion and can be shown by
+	// reports and editor gutters without re-reading the transcript on disk.
+	// Populated at commit/attribute time from each session's transcript. `seq` is
+	// the user-turn order within the session; (session_id, seq) is unique so a
+	// re-run upserts rather than duplicates.
+	/* 8 */ `CREATE TABLE IF NOT EXISTS prompts (
+		id          INTEGER PRIMARY KEY AUTOINCREMENT,
+		session_id  TEXT    NOT NULL,
+		repo_path   TEXT,
+		tool        TEXT,
+		seq         INTEGER NOT NULL,
+		text        TEXT    NOT NULL,
+		ts          INTEGER NOT NULL
+	)`,
+	/* 9 */ `CREATE UNIQUE INDEX IF NOT EXISTS prompts_session_seq ON prompts(session_id, seq)`,
+	// Migration 10-14: branch-based work sessions. A session is (repo_path, branch,
+	// base_sha) where base_sha is the HEAD commit while uncommitted work accrues.
+	// One open session per branch at a time; each commit advances HEAD and closes
+	// that session (the next edit opens a new row). edits.session_id links an edit
+	// edits.branch is denormalized so the live gutter is a single indexed lookup.
+	/* 10 */ `CREATE TABLE IF NOT EXISTS sessions (
+		id          INTEGER PRIMARY KEY AUTOINCREMENT,
+		repo_path   TEXT NOT NULL,
+		branch      TEXT NOT NULL,
+		base_sha    TEXT
+	)`,
+	/* 11 */ `CREATE UNIQUE INDEX IF NOT EXISTS sessions_repo_branch_base ON sessions(repo_path, branch, base_sha)`,
+	/* 12 */ `ALTER TABLE edits ADD COLUMN session_id INTEGER`,
+	/* 13 */ `ALTER TABLE edits ADD COLUMN branch TEXT`,
+	/* 14 */ `CREATE INDEX IF NOT EXISTS edits_repo_branch ON edits(repo_path, branch)`,
+	// Migration 15: work-session ids INTEGER → TEXT UUID (see migrateWorkSessionsUUID).
+	/* 15 */ `SELECT 1`,
 }
 
 func (db *DB) migrate() error {
@@ -108,6 +141,12 @@ func (db *DB) migrate() error {
 	for i, stmt := range migrations {
 		if i <= applied-1 {
 			continue // already applied in a previous run
+		}
+		if i == 15 {
+			if err := db.migrateWorkSessionsUUID(); err != nil {
+				return fmt.Errorf("migration %d: %w", i, err)
+			}
+			continue
 		}
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("migration %d: %w", i, err)

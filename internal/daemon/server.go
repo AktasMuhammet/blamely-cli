@@ -43,6 +43,9 @@ type EditPayload struct {
 	SuggestedLines int64   `json:"suggested_lines,omitempty"`
 	Lines          []Range `json:"lines"`
 	RawMeta        string  `json:"raw_meta,omitempty"`
+	// Branch is the editor's checked-out branch when the edit was made. Optional:
+	// the daemon resolves it from repo_path if empty (e.g. watcher-sourced edits).
+	Branch string `json:"branch,omitempty"`
 }
 
 type Range struct {
@@ -223,6 +226,7 @@ func validateAndStore(db *store.DB, p EditPayload) error {
 			StartLine: r.Start, EndLine: r.End, ContentSHA: r.ContentSHA,
 		})
 	}
+	sessions.resolve(db, &e, p.Branch)
 	_, err := db.InsertEdit(e)
 	return err
 }

@@ -2,6 +2,8 @@ package tools
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -129,6 +131,34 @@ func TestLooksLikePatch(t *testing.T) {
 }
 
 // ---- processCodexLine / buffer-flush tests ----
+
+func TestReadCodexSessionUsage_LatestBlock(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "sess.jsonl")
+	content := `{"type":"response.start","model":"gpt-5-codex"}
+{"type":"response.complete","usage":{"input_tokens":100,"output_tokens":20}}
+{"type":"response.complete","usage":{"input_tokens":500,"output_tokens":80,"cache_read_input_tokens":10,"cache_creation_input_tokens":5}}
+`
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	u, err := ReadCodexSessionUsage(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u == nil {
+		t.Fatal("expected usage")
+	}
+	if u.Model != "gpt-5-codex" {
+		t.Errorf("model: want gpt-5-codex, got %q", u.Model)
+	}
+	if u.InputTokens != 500 || u.OutputTokens != 80 {
+		t.Errorf("tokens: want 500/80, got %d/%d", u.InputTokens, u.OutputTokens)
+	}
+	if u.CacheReadTokens != 10 || u.CacheWriteTokens != 5 {
+		t.Errorf("cache: want 10/5, got %d/%d", u.CacheReadTokens, u.CacheWriteTokens)
+	}
+}
 
 func TestProcessCodexLine_BufferAndFlushOnUsage(t *testing.T) {
 	sink := &mockSink{}

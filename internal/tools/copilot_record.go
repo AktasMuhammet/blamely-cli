@@ -83,9 +83,14 @@ func RecordCopilotFromStdin(r io.Reader) error {
 		Model:          p.Model,
 		SuggestedLines: suggested,
 		Lines:          toDaemonRanges(ranges),
-		RawMeta: fmt.Sprintf(`{"session_id":%q,"tool":%q,"source":"copilot_hook"}`,
-			p.SessionID, p.ToolName),
+		RawMeta: fmt.Sprintf(`{"session_id":%q,"tool":%q,"transcript_path":%q,"source":"copilot_hook"}`,
+			p.SessionID, p.ToolName, p.TranscriptPath),
 	}
+	applyHookUsage(&payload, hookUsageOptions{
+		transcriptPath: p.TranscriptPath,
+		sessionID:      p.SessionID,
+		tool:           "copilot",
+	})
 	return postToDaemon(payload)
 }
 

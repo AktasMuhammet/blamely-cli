@@ -160,23 +160,14 @@ func RecordClaudeFromStdin(r io.Reader) error {
 			p.SessionID, p.ToolName, p.CursorVersion, p.TranscriptPath),
 	}
 
-	if isCursor {
-		// Cursor puts the model name directly in the hook payload.
-		// Token usage is not exposed by Cursor's hook payload.
-		if p.Model != "" {
-			payload.Model = p.Model
-		}
-	} else {
-		// Claude Code: read model + tokens from the transcript JSONL.
-		usage, _ := ReadTranscriptUsage(p.TranscriptPath)
-		if usage != nil {
-			payload.Model = usage.Model
-			payload.InputTokens = int64Ptr(usage.InputTokens)
-			payload.OutputTokens = int64Ptr(usage.OutputTokens)
-			payload.CacheReadTokens = int64Ptr(usage.CacheReadTokens)
-			payload.CacheWriteTokens = int64Ptr(usage.CacheWriteTokens)
-		}
+	if isCursor && p.Model != "" {
+		payload.Model = p.Model
 	}
+	applyHookUsage(&payload, hookUsageOptions{
+		transcriptPath: p.TranscriptPath,
+		sessionID:      p.SessionID,
+		tool:           tool,
+	})
 
 	return postToDaemon(payload)
 }

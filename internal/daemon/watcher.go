@@ -52,6 +52,9 @@ type Event struct {
 	// watcher observed the event, before any partial-acceptance/user-editing.
 	SuggestedLines int64
 	Lines          []LineRange
+	// Branch is the checked-out branch for this edit. Watchers usually leave it
+	// empty; the sink resolves it from RepoPath. Editor-pushed events may set it.
+	Branch string
 }
 
 type LineRange struct {
@@ -127,6 +130,7 @@ func (s *dbSink) Record(ev Event) error {
 		}
 		e.Lines = append(e.Lines, store.EditLine{StartLine: r.Start, EndLine: r.End, ContentSHA: r.ContentSHA})
 	}
+	sessions.resolve(s.db, &e, ev.Branch)
 	if _, err := s.db.InsertEdit(e); err != nil {
 		return err
 	}

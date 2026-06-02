@@ -293,3 +293,29 @@ func ReadChatSessionUsage(path string, sinceNanos, untilNanos int64) (*Transcrip
 	}
 	return &u, nil
 }
+
+// ReadChatSessionLatestUsage returns token usage from the most recent chat
+// request in the session that recorded prompt/completion counts. Used by
+// `blamely record` hooks to attach per-tool-call usage without summing the
+// whole session (ReadChatSessionUsage is for commit-level rollups).
+func ReadChatSessionLatestUsage(path string) (*TranscriptUsage, error) {
+	if path == "" {
+		return nil, nil
+	}
+	cs, err := parseChatSession(path)
+	if err != nil {
+		return nil, err
+	}
+	for i := len(cs.requests) - 1; i >= 0; i-- {
+		r := cs.requests[i]
+		if r.promptTokens == 0 && r.completionTokens == 0 {
+			continue
+		}
+		return &TranscriptUsage{
+			Model:        cs.model,
+			InputTokens:  r.promptTokens,
+			OutputTokens: r.completionTokens,
+		}, nil
+	}
+	return nil, nil
+}

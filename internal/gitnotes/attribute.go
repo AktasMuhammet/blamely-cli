@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/blamely/blamely/internal/daemon"
 	"github.com/blamely/blamely/internal/gitutil"
 	"github.com/blamely/blamely/internal/store"
 	"github.com/blamely/blamely/internal/tools"
@@ -32,6 +33,10 @@ type Note struct {
 	// or "" if HEAD was detached. Useful when the same commit lands on
 	// multiple branches (the note is attached to the commit, not the branch).
 	Branch string `json:"branch,omitempty"`
+	// BaseSHA is the work session's divergence point from the default branch
+	// (merge-base), or "" on the trunk. Together with Branch it identifies the
+	// session whose edits were scoped into this note.
+	BaseSHA string `json:"base_sha,omitempty"`
 	// Message is the full commit message (subject + body) as recorded by git.
 	Message string `json:"message,omitempty"`
 	// CodingTimeNanos is the wall-clock time from the earliest edit observed
@@ -193,6 +198,28 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 		}
 	}
 
+	// Persist the user prompts of each session in this commit window into the
+	// prompts table (keyed by session_id), so the conversation survives transcript
+	// rotation/deletion and can be shown without re-reading the transcript. Best
+	// effort: failures here never block note writing.
+	if sessions, err := db.SessionTranscriptsForPeriod(repoID, sinceConv, commitNanos+slackNanos); err == nil {
+		for _, s := range sessions {
+			turns, err := tools.ReadTranscriptConversation(s.TranscriptPath, 200, 4000)
+			if err != nil || len(turns) == 0 {
+				continue
+			}
+			userPrompts := make([]string, 0, len(turns))
+			for _, t := range turns {
+				if t.Role == "user" && t.Text != "" {
+					userPrompts = append(userPrompts, t.Text)
+				}
+			}
+			if len(userPrompts) > 0 {
+				_ = db.UpsertUserPrompts(s.SessionID, repoID, s.Tool, userPrompts, commitNanos)
+			}
+		}
+	}
+
 	// Copilot / Cursor chat panels persist a delta-encoded chat JSONL rather
 	// than a Claude-style transcript. Pull its conversation (if no Claude
 	// transcript already supplied one) and its per-session token usage, which
@@ -223,6 +250,11 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	if err := db.MarkCommitNoted(sha, repoID, commitNanos); err != nil {
 		return nil, err
 	}
+
+	// HEAD advanced — invalidate cached session identity so post-commit edits
+	// resolve to a new work session on this branch.
+	daemon.InvalidateSessionCache(repoID)
+	daemon.InvalidateSessionCache(repoPath)
 
 	return note, nil
 }
@@ -272,10 +304,25 @@ type perLine struct {
 }
 
 func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []AddedLine, deleted map[string][]int, renames map[string]string, fileChanges map[string]FileChangeType) (*Note, error) {
-	// Lower bound: only consider AI edits recorded since the previous commit.
-	// This prevents stale records from an earlier session from claiming lines
-	// the human typed after that commit. Returns 0 for the very first commit
-	// (no prior commit), which correctly includes all AI records ever.
+	// Scope AI edits by WORK SESSION (branch + HEAD-at-edit-time), not by a
+	// timestamp window. At commit time the session is the one keyed by this
+	// commit's parent — the HEAD tip while those edits were being made.
+	branch := gitutil.BranchName(repoPath)
+	baseSHA := gitutil.ParentCommitSHA(repoPath, sha)
+	// sessionID is "" when the branch is unresolvable (detached HEAD / not a
+	// repo). EditsForFileInSession still pulls session_id IS NULL rows, which is
+	// where detached/legacy edits live, so they attribute by line as before.
+	var sessionID string
+	if branch != "" {
+		if id, err := db.ResolveSession(repoPath, branch, baseSHA); err == nil {
+			sessionID = id
+		}
+	}
+
+	// Intra-session lower bound: an edit already consumed by an earlier commit on
+	// this branch must not re-claim a line in a later commit (sessions can span
+	// many commits). Returns 0 for the first commit → includes all prior edits.
+	// This bounds only the PRIMARY match; the content_sha fallback is unbounded.
 	sinceNanos := db.PreviousCommitTimestampNanos(repoPath, commitNanos)
 
 	// Group changed lines by file so we hit the DB once per file.
@@ -291,22 +338,37 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		}
 	}
 
+	// editsForFile pulls the session-scoped edits for a file (primary), plus the
+	// repo-wide edits for the same file (content_sha fallback). The fallback is
+	// what re-attributes cherry-picked/squashed AI code: the new commit has a
+	// fresh SHA/timestamp and a different session, but the line content — and
+	// thus its content_sha — is unchanged.
+	editsForFile := func(file string) (sessionEdits, anyEdits []store.Edit, err error) {
+		if sessionEdits, err = db.EditsForFileInSession(repoPath, file, sessionID); err != nil {
+			return nil, nil, err
+		}
+		if anyEdits, err = db.EditsForFileAny(repoPath, file); err != nil {
+			return nil, nil, err
+		}
+		// Destination of a rename: also pull edits recorded under the old name
+		// so `git mv` doesn't lose history.
+		if from, ok := renames[file]; ok && from != "" {
+			if old, err := db.EditsForFileInSession(repoPath, from, sessionID); err == nil {
+				sessionEdits = mergeEditsByTimeDesc(sessionEdits, old)
+			}
+			if old, err := db.EditsForFileAny(repoPath, from); err == nil {
+				anyEdits = mergeEditsByTimeDesc(anyEdits, old)
+			}
+		}
+		return sessionEdits, anyEdits, nil
+	}
+
 	resolved := make([]perLine, 0, len(added))
 	for file, lineNos := range byFile {
-		edits, err := db.EditsForFileSince(repoPath, file, sinceNanos)
+		sessionEdits, anyEdits, err := editsForFile(file)
 		if err != nil {
 			return nil, err
 		}
-		// If this file is the destination of a rename, also pull edits that
-		// were recorded under the old name so `git mv` doesn't lose history.
-		if from, ok := renames[file]; ok && from != "" {
-			oldEdits, err := db.EditsForFileSince(repoPath, from, sinceNanos)
-			if err != nil {
-				return nil, err
-			}
-			edits = mergeEditsByTimeDesc(edits, oldEdits)
-		}
-		// edits are newest-first. For each line, pick the latest edit covering it.
 		// git commit timestamps are second-precision; edit timestamps are
 		// nanosecond-precision. Allow up to 5s of post-commit slack so an
 		// edit recorded in the same wall-clock second as the commit still
@@ -315,35 +377,28 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		for _, ln := range lineNos {
 			// Default: human-typed code. tool="" + gen_type=human is the
 			// canonical representation; humans aren't a tool.
-			// Any line not explicitly claimed by an AI edit record stays human.
 			content := lineContent[fileLineKey{file, ln}]
 			p := perLine{file: file, line: ln, content: content, tool: "", genType: store.GenTypeHuman}
-			for i := range edits {
-				e := &edits[i]
-				if e.TimestampNanos > commitNanos+sameSecondSlackNanos {
-					continue
-				}
-				// Primary match: line-number range. Falls back to ContentSHA
-				// when the line shifted after the AI applied it (e.g. human
-				// added lines earlier in the file before committing).
-				if !coversLine(e.Lines, ln) && !coversContentSHA(e.Lines, content) {
-					continue
-				}
+			// Primary: a session edit covering this line by range OR content_sha,
+			// bounded below by the previous commit (intra-session separator).
+			e := pickEdit(sessionEdits, ln, content, sinceNanos, commitNanos+sameSecondSlackNanos, true)
+			if e == nil {
+				// Fallback: any edit for this file whose content_sha matches this
+				// line's content (line numbers ignored, time-unbounded below —
+				// survives cherry-pick/squash).
+				e = pickEdit(anyEdits, ln, content, 0, commitNanos+sameSecondSlackNanos, false)
+			}
+			if e != nil {
 				// Normalise legacy rows: tool="human" pre-dates the split.
-				// Translate to the new shape so downstream code only needs
-				// to know about tool="" + gen_type=human.
 				if e.Tool == store.ToolHuman {
-					p.tool = ""
-					p.genType = store.GenTypeHuman
+					p.tool, p.genType = "", store.GenTypeHuman
 				} else {
-					p.tool = e.Tool
-					p.genType = e.GenType
+					p.tool, p.genType = e.Tool, e.GenType
 				}
 				if e.Model.Valid {
 					p.model = e.Model.String
 				}
 				p.edit = e
-				break
 			}
 			resolved = append(resolved, p)
 		}
@@ -359,6 +414,7 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 	note := &Note{
 		Schema:      1,
 		Commit:      sha,
+		BaseSHA:     baseSHA,
 		ByTool:      map[string]Tool{},
 		GeneratedBy: "blamely 0.1.0",
 	}
@@ -652,6 +708,30 @@ func mergeEditsByTimeDesc(a, b []store.Edit) []store.Edit {
 	out = append(out, a[i:]...)
 	out = append(out, b[j:]...)
 	return out
+}
+
+// pickEdit returns the first edit (the slice is confidence-then-recency ordered)
+// recorded within (minNanos, maxNanos] that claims the given line. A content_sha
+// match always counts; a line-number range match counts only when allowLineMatch
+// is true.
+//
+// The primary (session-scoped) call passes minNanos = previous-commit timestamp
+// so an edit already consumed by an earlier commit on this branch can't re-claim
+// a line in a later commit. The cross-session fallback passes minNanos = 0 and
+// allowLineMatch = false: it relies on content alone (line numbers are unreliable
+// across cherry-pick/squash) and must NOT be time-bounded, because the original
+// AI edit predates the rewritten commit's timestamp.
+func pickEdit(edits []store.Edit, ln int, content string, minNanos, maxNanos int64, allowLineMatch bool) *store.Edit {
+	for i := range edits {
+		e := &edits[i]
+		if e.TimestampNanos <= minNanos || e.TimestampNanos > maxNanos {
+			continue
+		}
+		if coversContentSHA(e.Lines, content) || (allowLineMatch && coversLine(e.Lines, ln)) {
+			return e
+		}
+	}
+	return nil
 }
 
 func coversLine(lines []store.EditLine, n int) bool {

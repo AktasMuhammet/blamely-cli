@@ -133,6 +133,21 @@ func TestReadChatSessionUsage_WindowFilter(t *testing.T) {
 	}
 }
 
+func TestReadChatSessionLatestUsage_LastRequest(t *testing.T) {
+	p := writeSample(t)
+	u, err := ReadChatSessionLatestUsage(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u == nil {
+		t.Fatal("expected usage")
+	}
+	// Last request in sample is 50+10
+	if u.InputTokens != 50 || u.OutputTokens != 10 {
+		t.Errorf("latest tokens: want input=50 output=10, got input=%d output=%d", u.InputTokens, u.OutputTokens)
+	}
+}
+
 func TestReadChatSessionUsage_NoTokens(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "empty.jsonl")

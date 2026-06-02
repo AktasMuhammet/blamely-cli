@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 type Tool string
@@ -70,6 +72,12 @@ type Edit struct {
 	// i.e. what actually stuck after any partial-acceptance/user-editing.
 	SuggestedLines int64
 	Lines          []EditLine
+	// Branch is the checked-out branch when the edit was recorded ("" = detached
+	// or unknown). Denormalized onto the row so the live gutter can scope by
+	// branch with a single indexed lookup. SessionID is a UUID string for the
+	// work session row in sessions (distinct from AI-tool session_id in raw_meta).
+	Branch    string
+	SessionID sql.NullString
 }
 
 // AcceptedLines returns the total number of lines covered by this edit's
@@ -105,13 +113,13 @@ func (db *DB) InsertEdit(e Edit) (int64, error) {
 	res, err := tx.Exec(`
 		INSERT INTO edits(ts, repo_path, file_path, tool, confidence, gen_type,
 			model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			hash_before, hash_after, raw_meta, suggested_lines)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			hash_before, hash_after, raw_meta, suggested_lines, branch, session_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		e.TimestampNanos, e.RepoPath, e.FilePath, string(e.Tool), string(e.Confidence), gt,
 		nullableString(e.Model), nullableInt(e.InputTokens), nullableInt(e.OutputTokens),
 		nullableInt(e.CacheReadTokens), nullableInt(e.CacheWriteTokens),
 		nullableString(e.HashBefore), nullableString(e.HashAfter), nullableString(e.RawMeta),
-		e.SuggestedLines,
+		e.SuggestedLines, nullableNonEmpty(e.Branch), nullableNullString(e.SessionID),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("insert edit: %w", err)
@@ -141,16 +149,27 @@ func (db *DB) InsertEdit(e Edit) (int64, error) {
 // (log watchers, VelocityWatcher) for the same line, regardless of which
 // fired last. Within the same confidence level, newest wins.
 func (db *DB) EditsForFileSince(repo, file string, sinceNanos int64) ([]Edit, error) {
+	return db.editsForFileWhere(
+		`repo_path = ? AND file_path = ? AND ts >= ?`,
+		repo, file, sinceNanos,
+	)
+}
+
+// editsForFileWhere runs the standard edit SELECT with a caller-supplied WHERE
+// clause (and its bind args), applies the confidence-then-recency ordering, and
+// hydrates each edit's line ranges. Shared by EditsForFileSince and
+// EditsForFileInSession so the column list and ordering stay in one place.
+func (db *DB) editsForFileWhere(where string, args ...any) ([]Edit, error) {
 	rows, err := db.Query(`
 		SELECT id, ts, repo_path, file_path, tool, confidence, gen_type,
 			model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			hash_before, hash_after, raw_meta, suggested_lines
+			hash_before, hash_after, raw_meta, suggested_lines, branch, session_id
 		FROM edits
-		WHERE repo_path = ? AND file_path = ? AND ts >= ?
+		WHERE `+where+`
 		ORDER BY
 			CASE confidence WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
 			ts DESC`,
-		repo, file, sinceNanos,
+		args...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query edits: %w", err)
@@ -161,15 +180,17 @@ func (db *DB) EditsForFileSince(repo, file string, sinceNanos int64) ([]Edit, er
 	for rows.Next() {
 		var e Edit
 		var tool, conf, genType string
+		var branch sql.NullString
 		if err := rows.Scan(&e.ID, &e.TimestampNanos, &e.RepoPath, &e.FilePath, &tool, &conf, &genType,
 			&e.Model, &e.InputTokens, &e.OutputTokens, &e.CacheReadTokens, &e.CacheWriteTokens,
-			&e.HashBefore, &e.HashAfter, &e.RawMeta, &e.SuggestedLines,
+			&e.HashBefore, &e.HashAfter, &e.RawMeta, &e.SuggestedLines, &branch, &e.SessionID,
 		); err != nil {
 			return nil, fmt.Errorf("scan edit: %w", err)
 		}
 		e.Tool = Tool(tool)
 		e.Confidence = Confidence(conf)
 		e.GenType = GenType(genType)
+		e.Branch = branch.String
 		out = append(out, e)
 	}
 	if err := rows.Err(); err != nil {
@@ -432,6 +453,103 @@ func (db *DB) TranscriptPathsForPeriod(repoPath string, sinceNanos, untilNanos i
 	return out, rows.Err()
 }
 
+// SessionTranscript pairs a session_id with its transcript file and owning tool,
+// parsed from edit raw_meta. Used to persist user prompts keyed by session.
+type SessionTranscript struct {
+	SessionID      string
+	TranscriptPath string
+	Tool           string
+}
+
+// SessionTranscriptsForPeriod returns the distinct (session_id, transcript_path,
+// tool) triples from edit raw_meta in the given repo and time window. Only rows
+// that carry BOTH a session_id and a transcript_path are returned (the CLI /
+// hook tools: Claude, Cursor, Codex). Deduped by session_id.
+func (db *DB) SessionTranscriptsForPeriod(repoPath string, sinceNanos, untilNanos int64) ([]SessionTranscript, error) {
+	rows, err := db.Query(`
+		SELECT DISTINCT raw_meta FROM edits
+		WHERE repo_path = ? AND ts >= ? AND ts <= ?
+		  AND raw_meta LIKE '%session_id%' AND raw_meta LIKE '%transcript_path%'`,
+		repoPath, sinceNanos, untilNanos)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	seen := map[string]bool{}
+	var out []SessionTranscript
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			continue
+		}
+		var m struct {
+			SessionID      string `json:"session_id"`
+			TranscriptPath string `json:"transcript_path"`
+			Tool           string `json:"tool"`
+		}
+		if err := json.Unmarshal([]byte(raw), &m); err != nil {
+			continue
+		}
+		if m.SessionID == "" || m.TranscriptPath == "" || seen[m.SessionID] {
+			continue
+		}
+		seen[m.SessionID] = true
+		out = append(out, SessionTranscript{SessionID: m.SessionID, TranscriptPath: m.TranscriptPath, Tool: m.Tool})
+	}
+	return out, rows.Err()
+}
+
+// UpsertUserPrompts stores the user prompts for a session, idempotently keyed by
+// (session_id, seq). Re-running with the same session overwrites existing turns
+// (and appends any new ones) rather than duplicating.
+func (db *DB) UpsertUserPrompts(sessionID, repoPath, tool string, prompts []string, tsNanos int64) error {
+	if sessionID == "" || len(prompts) == 0 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.Prepare(`
+		INSERT INTO prompts(session_id, repo_path, tool, seq, text, ts)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(session_id, seq) DO UPDATE SET
+			text = excluded.text,
+			repo_path = excluded.repo_path,
+			tool = excluded.tool,
+			ts = excluded.ts`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for seq, text := range prompts {
+		if _, err := stmt.Exec(sessionID, repoPath, tool, seq, text, tsNanos); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// UserPromptsForSession returns the stored user prompts for a session in turn order.
+func (db *DB) UserPromptsForSession(sessionID string) ([]string, error) {
+	rows, err := db.Query(
+		`SELECT text FROM prompts WHERE session_id = ? ORDER BY seq ASC`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // ChatSessionRef pairs a chat-session JSONL path with the tool that owns it,
 // as recorded in the raw_meta of a chat-session marker.
 type ChatSessionRef struct {
@@ -591,4 +709,75 @@ func nullableInt(i sql.NullInt64) any {
 		return i.Int64
 	}
 	return nil
+}
+
+func nullableNullString(s sql.NullString) any {
+	if s.Valid && s.String != "" {
+		return s.String
+	}
+	return nil
+}
+
+// nullableNonEmpty stores "" as SQL NULL so legacy/unknown branches read back as
+// NULL (the live gutter's `branch IS NULL` transition clause depends on this).
+func nullableNonEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// ResolveSession returns the UUID of the work session identified by
+// (repoPath, branch, baseSha), creating it if absent. base_sha is the HEAD
+// commit while uncommitted work accrues ("" when the repo has no commits).
+func (db *DB) ResolveSession(repoPath, branch, baseSha string) (string, error) {
+	var id string
+	err := db.QueryRow(
+		`SELECT id FROM sessions WHERE repo_path = ? AND branch = ? AND base_sha = ?`,
+		repoPath, branch, baseSha,
+	).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if err != sql.ErrNoRows {
+		return "", fmt.Errorf("select session: %w", err)
+	}
+	id = uuid.New().String()
+	if _, err := db.Exec(
+		`INSERT OR IGNORE INTO sessions(id, repo_path, branch, base_sha) VALUES (?, ?, ?, ?)`,
+		id, repoPath, branch, baseSha,
+	); err != nil {
+		return "", fmt.Errorf("insert session: %w", err)
+	}
+	if err := db.QueryRow(
+		`SELECT id FROM sessions WHERE repo_path = ? AND branch = ? AND base_sha = ?`,
+		repoPath, branch, baseSha,
+	).Scan(&id); err != nil {
+		return "", fmt.Errorf("select session after insert: %w", err)
+	}
+	return id, nil
+}
+
+// EditsForFileInSession returns edits touching repo/file that belong to the
+// given session, newest-and-highest-confidence first (same ordering as
+// EditsForFileSince). Used by commit-time attribution to scope by work session
+// rather than a timestamp window.
+func (db *DB) EditsForFileInSession(repo, file string, sessionID string) ([]Edit, error) {
+	// Include session_id IS NULL so legacy rows (recorded before sessions
+	// existed) and edits made while detached/unresolvable still attribute by
+	// line within the current commit — preserving pre-sessions behavior during
+	// the transition. New edits always carry a session_id and are scoped to it.
+	return db.editsForFileWhere(
+		`repo_path = ? AND file_path = ? AND (session_id = ? OR session_id IS NULL)`,
+		repo, file, sessionID,
+	)
+}
+
+// EditsForFileAny returns every recorded edit for repo/file regardless of
+// session or timestamp. Used as the commit-time content_sha fallback: a
+// cherry-picked or squashed commit gets a new SHA and committer timestamp, but
+// the line content is unchanged, so matching by content_sha across all edits
+// preserves AI authorship that a session/time-scoped query would miss.
+func (db *DB) EditsForFileAny(repo, file string) ([]Edit, error) {
+	return db.editsForFileWhere(`repo_path = ? AND file_path = ?`, repo, file)
 }

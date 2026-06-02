@@ -396,6 +396,67 @@ func sha256Of(s string) string {
 	return hex.EncodeToString(h[:])
 }
 
+// ReadCodexSessionUsage scans a Codex session JSONL and returns the latest
+// non-empty usage block (response.complete / message.usage). Used by the
+// `blamely record codex` hook so tokens land in SQLite at detection time.
+func ReadCodexSessionUsage(path string) (*TranscriptUsage, error) {
+	if path == "" {
+		return nil, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open codex session: %w", err)
+	}
+	defer f.Close()
+
+	var model string
+	var last *TranscriptUsage
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 || line[0] != '{' {
+			continue
+		}
+		var ln codexLine
+		if json.Unmarshal(line, &ln) != nil {
+			continue
+		}
+		if ln.Model != "" {
+			model = ln.Model
+		}
+		if ln.Message != nil && ln.Message.Model != "" {
+			model = ln.Message.Model
+		}
+		var in, out, cr, cw int64
+		var ok bool
+		if ln.Usage != nil {
+			in, out = ln.Usage.InputTokens, ln.Usage.OutputTokens
+			cr, cw = ln.Usage.CacheReadInputTokens, ln.Usage.CacheCreationInputTokens
+			ok = in > 0 || out > 0
+		} else if ln.Message != nil && ln.Message.Usage != nil {
+			u := ln.Message.Usage
+			in, out = u.InputTokens, u.OutputTokens
+			cr, cw = u.CacheReadInputTokens, u.CacheCreationInputTokens
+			ok = in > 0 || out > 0
+		}
+		if !ok {
+			continue
+		}
+		last = &TranscriptUsage{
+			Model:            model,
+			InputTokens:      in,
+			OutputTokens:     out,
+			CacheReadTokens:  cr,
+			CacheWriteTokens: cw,
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("scan codex session: %w", err)
+	}
+	return last, nil
+}
+
 func parseCodexTimestamp(s string) time.Time {
 	if s == "" {
 		return time.Time{}
