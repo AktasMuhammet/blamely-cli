@@ -2,6 +2,7 @@ package tools
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +13,16 @@ import (
 	"github.com/blamely/blamely/internal/daemon"
 	"github.com/blamely/blamely/internal/store"
 )
+
+// jsonQuotedFilePath returns a JSON string literal for a file URI (VS Code uses
+// forward slashes). Raw Windows paths like C:\foo break JSON (\U… escapes).
+func jsonQuotedFilePath(path string) string {
+	b, err := json.Marshal(filepath.ToSlash(path))
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
 
 // captureSink records events emitted by a watcher for assertions.
 type captureSink struct{ events []daemon.Event }
@@ -90,7 +101,8 @@ func TestChatWatcher_TextEditGroupEmitsChatEdit(t *testing.T) {
 
 	// A finalized textEditGroup inserting 3 lines starting at line 2.
 	var teg textEditGroupPart
-	raw := `{"kind":"textEditGroup","uri":{"path":"` + file + `","scheme":"file"},"edits":[[{"text":"a\nb\nc","range":{"startLineNumber":2,"startColumn":1,"endLineNumber":2,"endColumn":1}}],[]],"done":true}`
+	raw := fmt.Sprintf(`{"kind":"textEditGroup","uri":{"path":%s,"scheme":"file"},"edits":[[{"text":"a\nb\nc","range":{"startLineNumber":2,"startColumn":1,"endLineNumber":2,"endColumn":1}}],[]],"done":true}`,
+		jsonQuotedFilePath(file))
 	if err := json.Unmarshal([]byte(raw), &teg); err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +139,8 @@ func TestChatWatcher_TextEditGroupEmitsChatEdit(t *testing.T) {
 	// A non-done group must not emit.
 	sink2 := &captureSink{}
 	var partial textEditGroupPart
-	_ = json.Unmarshal([]byte(`{"kind":"textEditGroup","uri":{"path":"`+file+`","scheme":"file"},"edits":[[{"text":"x","range":{"startLineNumber":1}}]],"done":false}`), &partial)
+	_ = json.Unmarshal([]byte(fmt.Sprintf(`{"kind":"textEditGroup","uri":{"path":%s,"scheme":"file"},"edits":[[{"text":"x","range":{"startLineNumber":1}}]],"done":false}`,
+		jsonQuotedFilePath(file))), &partial)
 	w.recordTextEditGroup(&partial, st.model, "/sessions/s.jsonl", st, &mu, sink2, true)
 	if len(sink2.events) != 0 {
 		t.Errorf("partial (done=false) should not emit, got %d", len(sink2.events))
@@ -154,7 +167,8 @@ func TestScanTextEdits_FullFile(t *testing.T) {
 	sessDir := t.TempDir()
 	sess := filepath.Join(sessDir, "s.jsonl")
 	line1 := `{"kind":0,"v":{"requests":[],"inputState":{"selectedModel":{"identifier":"copilot/gpt-4o"}}}}` + "\n"
-	teg := `{"kind":2,"k":["requests",0,"response"],"v":[{"kind":"textEditGroup","uri":{"path":"` + target + `","scheme":"file"},"edits":[[{"text":"x\ny","range":{"startLineNumber":2}}]],"done":true}]}` + "\n"
+	teg := fmt.Sprintf(`{"kind":2,"k":["requests",0,"response"],"v":[{"kind":"textEditGroup","uri":{"path":%s,"scheme":"file"},"edits":[[{"text":"x\ny","range":{"startLineNumber":2}}]],"done":true}]}`,
+		jsonQuotedFilePath(target)) + "\n"
 	if err := os.WriteFile(sess, []byte(line1+teg), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +194,8 @@ func TestScanTextEdits_FullFile(t *testing.T) {
 	}
 
 	// Append a NEW edit and advance mtime → only the new one emits.
-	teg2 := `{"kind":2,"k":["requests",1,"response"],"v":[{"kind":"textEditGroup","uri":{"path":"` + target + `","scheme":"file"},"edits":[[{"text":"z","range":{"startLineNumber":9}}]],"done":true}]}` + "\n"
+	teg2 := fmt.Sprintf(`{"kind":2,"k":["requests",1,"response"],"v":[{"kind":"textEditGroup","uri":{"path":%s,"scheme":"file"},"edits":[[{"text":"z","range":{"startLineNumber":9}}]],"done":true}]}`,
+		jsonQuotedFilePath(target)) + "\n"
 	fh, _ := os.OpenFile(sess, os.O_APPEND|os.O_WRONLY, 0o644)
 	fh.WriteString(teg2)
 	fh.Close()
