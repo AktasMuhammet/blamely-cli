@@ -14,10 +14,10 @@ All data stays on your machine. No cloud, no telemetry.
 
 | Tool | Detection | Attribution |
 |------|-----------|-------------|
-| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | ✓ | chat |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | ✓ | cli, chat |
 | [Cursor](https://cursor.com) | ✓ | chat, agent |
 | [Codex CLI](https://github.com/openai/codex) | ✓ | cli |
-| [GitHub Copilot](https://github.com/features/copilot) | ✓ | completion |
+| [GitHub Copilot](https://github.com/features/copilot) | ✓ | chat, completion |
 | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | ✓ | cli |
 
 Blamely auto-detects which tools are installed and wires up hooks only for those. If you install a new tool later, run `blamely install` again — it's idempotent.
