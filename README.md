@@ -26,35 +26,8 @@ Blamely auto-detects which tools are installed and wires up hooks only for those
 
 ### Install from a release
 
-Download the archive for your platform from [GitHub Releases](https://github.com/blamely/blamely/releases), extract it, and put `blamely` on your `PATH`.
+Download the archive for your platform from https://blamely.ai/.
 
-```bash
-# macOS / Linux example (adjust arch and version as needed)
-curl -LO https://github.com/blamely/blamely/releases/download/v0.1.0/blamely_v0.1.0_darwin_arm64.tar.gz
-tar xzf blamely_v0.1.0_darwin_arm64.tar.gz
-sudo mv blamely_v0.1.0_darwin_arm64/blamely /usr/local/bin/
-```
-
-Then run:
-
-```bash
-blamely install
-```
-
-Reload your shell (or `source ~/.zshrc` / `~/.bashrc`) so the PATH entry takes effect.
-
-### Install from source
-
-Requires [Go 1.26+](https://go.dev/dl/) and Git.
-
-```bash
-git clone https://github.com/blamely/blamely.git
-cd blamely
-./scripts/install.sh          # macOS / Linux
-# pwsh -File scripts\install.ps1   # Windows
-```
-
-The install script builds the binary, runs `blamely install`, and cleans up any stale legacy hooks.
 
 ### Verify
 
@@ -119,25 +92,6 @@ Attribution data lives in two places, both local:
 | `blamely history --all` | Include all tracked repos, not just the current one |
 | `blamely config` | View or change what each commit note stores |
 | `blamely --version` | Print version |
-
-## What gets installed
-
-`blamely install` makes these changes (all reversible with `blamely uninstall`):
-
-| Change | Location |
-|--------|----------|
-| Stable binary copy | `~/.blamely/bin/blamely` |
-| Daemon agent | launchd (macOS) / systemd user unit (Linux) / Scheduled Task (Windows) |
-| Global git hook | `git config --global core.hooksPath` → `~/.blamely/git-hooks/` |
-| Claude Code hook | `~/.claude/settings.json` |
-| Cursor hook | `~/.cursor/hooks.json` |
-| Codex hook | `~/.codex/config.toml` |
-| Copilot hook | `~/.copilot/hooks/blamely.json` |
-| Gemini hook | `~/.gemini/settings.json` |
-| PATH entry | Appended to `~/.zshrc`, `~/.bashrc`, or equivalent |
-
-Existing hooks from other tools are preserved — Blamely merges into your settings rather than replacing them.
-
 ## Configuration
 
 Everything Blamely writes lives under `~/.blamely/` (on Windows: `%USERPROFILE%\.blamely\`).
