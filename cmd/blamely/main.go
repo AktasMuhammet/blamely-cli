@@ -3,11 +3,13 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
 	"time"
 
+	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/daemon"
 	"github.com/blamely/blamely/internal/gitnotes"
 	"github.com/blamely/blamely/internal/install"
@@ -45,6 +47,7 @@ func main() {
 	root.AddCommand(cmdStatus())
 	root.AddCommand(cmdDoctor())
 	root.AddCommand(cmdLog())
+	root.AddCommand(cmdConfig())
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -393,6 +396,125 @@ func cmdDoctor() *cobra.Command {
 			"Does NOT modify anything — fix recommendations are printed at the end.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return install.Doctor(os.Stdout)
+		},
+	}
+}
+
+// cmdConfig manages ~/.blamely/config.json — the toggles that decide what each
+// commit's git note includes (file detail, conversation, message, tokens, …).
+// With no subcommand it prints the current settings.
+func cmdConfig() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "config",
+		Short: "View or change what blamely writes into commit notes",
+		Long: "Manage ~/.blamely/config.json. Every toggle defaults to on; turning one\n" +
+			"off keeps it out of future commit notes (existing notes are untouched).\n\n" +
+			"Keys: " + strings.Join(config.NoteKeys(), ", ") + "\n\n" +
+			"Examples:\n" +
+			"  blamely config                       # show current settings\n" +
+			"  blamely config get note.conversation\n" +
+			"  blamely config set note.file_lines off\n" +
+			"  blamely config set tokens true       # 'note.' prefix optional\n" +
+			"  blamely config path",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runConfigShow(cmd)
+		},
+	}
+	c.AddCommand(cmdConfigShow(), cmdConfigGet(), cmdConfigSet(), cmdConfigPath())
+	return c
+}
+
+func cmdConfigShow() *cobra.Command {
+	return &cobra.Command{
+		Use:     "show",
+		Aliases: []string{"list", "ls"},
+		Short:   "Print the current settings",
+		Args:    cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runConfigShow(cmd)
+		},
+	}
+}
+
+func runConfigShow(cmd *cobra.Command) error {
+	cfg := config.LoadConfig()
+	if path, err := config.ConfigFile(); err == nil {
+		fmt.Fprintf(cmd.OutOrStdout(), "%s\n\n", path)
+	}
+	for _, key := range config.NoteKeys() {
+		v, _ := cfg.GetBool(key)
+		fmt.Fprintf(cmd.OutOrStdout(), "  %-30s %v\n", key, v)
+	}
+	return nil
+}
+
+func cmdConfigGet() *cobra.Command {
+	return &cobra.Command{
+		Use:   "get <key>",
+		Short: "Print one setting's value",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg := config.LoadConfig()
+			v, ok := cfg.GetBool(args[0])
+			if !ok {
+				return fmt.Errorf("unknown key %q (valid: %s)", args[0], strings.Join(config.NoteKeys(), ", "))
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), v)
+			return nil
+		},
+	}
+}
+
+func cmdConfigSet() *cobra.Command {
+	return &cobra.Command{
+		Use:   "set <key> <true|false>",
+		Short: "Change a setting and save it to ~/.blamely/config.json",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			val, err := config.ParseBoolValue(args[1])
+			if err != nil {
+				return fmt.Errorf("invalid value %q: want true/false (also on/off, yes/no)", args[1])
+			}
+			cfg := config.LoadConfig()
+			if !cfg.SetBool(args[0], val) {
+				return fmt.Errorf("unknown key %q (valid: %s)", args[0], strings.Join(config.NoteKeys(), ", "))
+			}
+			path, err := config.SaveConfig(cfg)
+			if err != nil {
+				return fmt.Errorf("save config: %w", err)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "set %s = %v  (%s)\n", canonicalKey(args[0]), val, path)
+			return nil
+		},
+	}
+}
+
+// canonicalKey maps a user-supplied key (bare or dotted, any case) to its
+// canonical dotted form so `set` echoes a consistent name. Falls back to the
+// input if it's not a known key (Set already rejected it by then).
+func canonicalKey(userKey string) string {
+	norm := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(userKey)), "note.")
+	for _, k := range config.NoteKeys() {
+		if strings.TrimPrefix(k, "note.") == norm {
+			return k
+		}
+	}
+	return userKey
+}
+
+func cmdConfigPath() *cobra.Command {
+	return &cobra.Command{
+		Use:   "path",
+		Short: "Print the path to the config file",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			path, err := config.ConfigFile()
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), path)
+			return nil
 		},
 	}
 }

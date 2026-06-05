@@ -191,6 +191,17 @@ func Run() error {
 		fmt.Printf("  • Exclude list already present at %s\n", excludePath)
 	}
 
+	// 5b. Default config file. Like the exclude list, we never overwrite an
+	// existing one — users edit ~/.blamely/config.json to choose what each
+	// commit's git note includes (file detail, conversation, tokens, …).
+	if configPath, created, cerr := config.EnsureDefaultConfigFile(); cerr != nil {
+		fmt.Printf("  • Could not write default config file: %v\n", cerr)
+	} else if created {
+		fmt.Printf("  ✓ Default config written to %s\n", configPath)
+	} else {
+		fmt.Printf("  • Config already present at %s\n", configPath)
+	}
+
 	if err := SaveState(s); err != nil {
 		return fmt.Errorf("save state: %w", err)
 	}

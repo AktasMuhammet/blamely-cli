@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/daemon"
 	"github.com/blamely/blamely/internal/gitutil"
 	"github.com/blamely/blamely/internal/store"
@@ -23,6 +24,38 @@ const NotesRef = "refs/notes/blamely"
 type ConvTurn struct {
 	Role string `json:"role"` // "user" or "assistant"
 	Text string `json:"text"`
+}
+
+// filterConversation applies the user's conversation config to the built turns.
+// The master `Conversation` toggle gates everything; within it, user and
+// assistant turns are kept independently so a team can, e.g., store the model's
+// replies but omit the developer's prompts (or vice versa). Returns nil when
+// nothing survives so the `conversation` field is omitted from the note.
+func filterConversation(turns []ConvTurn, nc config.NoteConfig) []ConvTurn {
+	if !nc.Conversation {
+		return nil
+	}
+	if nc.ConversationUser && nc.ConversationAssistant {
+		return turns
+	}
+	out := make([]ConvTurn, 0, len(turns))
+	for _, t := range turns {
+		switch strings.ToLower(t.Role) {
+		case "user":
+			if !nc.ConversationUser {
+				continue
+			}
+		case "assistant":
+			if !nc.ConversationAssistant {
+				continue
+			}
+		}
+		out = append(out, t)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // Note is the JSON payload written to refs/notes/blamely for each commit.
@@ -113,7 +146,7 @@ type FileEntry struct {
 	// Lines holds the attribution as collapsed ranges (schema 2): consecutive
 	// lines sharing the same (type, author_type, tool, model, gen_type) are
 	// merged into one RangeEntry. Added/Deleted above stay line-accurate.
-	Lines []RangeEntry `json:"lines"`
+	Lines []RangeEntry `json:"lines,omitempty"`
 	// acc is the per-line accumulation buffer used while building the note; it
 	// is collapsed into Lines at flush time and never serialized.
 	acc []LineEntry
@@ -319,6 +352,32 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 			if usage, err := tools.ReadChatSessionUsage(ref.Path, sinceConv, until); err == nil {
 				applyChatUsage(note, ref.Tool, usage)
 			}
+		}
+	}
+
+	// Apply the user's note-content config (~/.blamely/config.json). The note is
+	// built in full above; here we strip whatever the user disabled, in one
+	// auditable place, just before it is persisted. Defaults are all-on, so a
+	// missing/partial config leaves the note unchanged. Attribution itself is
+	// never affected — only what gets written into the note.
+	cfg := config.LoadConfig()
+	if !cfg.Note.Message {
+		note.Message = ""
+	}
+	if !cfg.Note.CodingTime {
+		note.CodingTimeNanos = 0
+	}
+	note.Conversation = filterConversation(note.Conversation, cfg.Note)
+	if !cfg.Note.FileLines {
+		for i := range note.Files {
+			note.Files[i].Lines = nil
+		}
+	}
+	if !cfg.Note.Tokens {
+		note.Totals.Tokens = nil
+		for k, t := range note.ByTool {
+			t.Tokens = nil
+			note.ByTool[k] = t
 		}
 	}
 
