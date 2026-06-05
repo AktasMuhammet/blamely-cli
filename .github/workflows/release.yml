@@ -254,6 +254,32 @@ jobs:
           sha256sum *.tar.gz *.zip > SHA256SUMS
           cat SHA256SUMS
 
+      - name: GPG-sign checksums
+        # Linux binaries have no OS-level code signature; instead we detach-sign
+        # the SHA256SUMS manifest so users can verify both integrity (sha) AND
+        # authenticity (our GPG key). The same .asc covers every platform's
+        # archive, since SHA256SUMS lists them all.
+        #   Verify:  gpg --verify SHA256SUMS.asc SHA256SUMS
+        #            sha256sum -c SHA256SUMS
+        # Secrets (in this private source repo):
+        #   GPG_PRIVATE_KEY  ASCII-armored private key (gpg --armor --export-secret-keys KEYID)
+        #   GPG_PASSPHRASE   passphrase for that key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        shell: bash
+        working-directory: dist
+        run: |
+          set -e
+          if [ -z "$GPG_PRIVATE_KEY" ] || [ -z "$GPG_PASSPHRASE" ]; then
+            echo "Missing GPG_PRIVATE_KEY and/or GPG_PASSPHRASE secrets."
+            exit 1
+          fi
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+            --detach-sign --armor -o SHA256SUMS.asc SHA256SUMS
+          gpg --verify SHA256SUMS.asc SHA256SUMS
+
       - name: Publish to public release repo
         # gh CLI is preinstalled on ubuntu-latest. We use the PAT so the
         # release lands in a DIFFERENT repo than the one running this workflow.
@@ -261,6 +287,7 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASE_REPO_TOKEN }}
           RELEASE_REPO: ${{ secrets.RELEASE_REPO }}
           TAG: ${{ steps.tag.outputs.tag }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         shell: bash
         working-directory: dist
         run: |
@@ -278,9 +305,9 @@ jobs:
               --title "blamely $TAG" \
               --generate-notes \
               --verify-tag=false
-          # Upload (or replace) every versioned archive plus SHA256SUMS.
+          # Upload (or replace) every versioned archive plus SHA256SUMS and its signature.
           gh release upload "$TAG" --repo "$RELEASE_REPO" --clobber \
-            *.tar.gz *.zip SHA256SUMS
+            *.tar.gz *.zip SHA256SUMS SHA256SUMS.asc
 
           # Mark the semver release as GitHub's default "Latest" (UI + /releases/latest).
           gh release edit "$TAG" --repo "$RELEASE_REPO" --latest
@@ -294,6 +321,11 @@ jobs:
             cp "$f" "latest-assets/${stable}"
           done
           (cd latest-assets && sha256sum *.tar.gz *.zip > SHA256SUMS 2>/dev/null || true)
+          # Sign the rolling manifest too (GPG key already imported above).
+          if [ -f latest-assets/SHA256SUMS ]; then
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+              --detach-sign --armor -o latest-assets/SHA256SUMS.asc latest-assets/SHA256SUMS
+          fi
 
           gh release view latest --repo "$RELEASE_REPO" >/dev/null 2>&1 || \
             gh release create latest \

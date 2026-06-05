@@ -13,11 +13,11 @@ STABLE_DIR="${HOME}/.blamely/bin"
 STABLE_BIN="${STABLE_DIR}/blamely"
 AUTO_YES="${BLAMELY_INSTALL_YES:-}"
 
-RED='\033[31m'
-GREEN='\033[32m'
-YELLOW='\033[33m'
-BOLD='\033[1m'
-RESET='\033[0m'
+RED=$'\033[31m'
+GREEN=$'\033[32m'
+YELLOW=$'\033[33m'
+BOLD=$'\033[1m'
+RESET=$'\033[0m'
 
 info()  { printf '  → %s\n' "$*"; }
 ok()    { printf "${GREEN}  ✓${RESET} %s\n" "$*"; }
@@ -154,36 +154,48 @@ detect_arch() {
 }
 
 download_and_install() {
-  local arch asset url tmpdir extracted bin
+  local arch asset url bin
   arch="$(detect_arch)"
   asset="blamely_linux_${arch}.tar.gz"
   url="${RELEASE_BASE}/${asset}"
 
   info "Downloading ${url} ..."
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
+  if ! (
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+    trap 'rm -rf "$tmpdir"' EXIT
 
-  if have curl; then
-    curl -fsSL "$url" -o "${tmpdir}/${asset}"
-  else
-    wget -qO "${tmpdir}/${asset}" "$url"
+    if have curl; then
+      curl -fsSL "$url" -o "${tmpdir}/${asset}"
+    else
+      wget -qO "${tmpdir}/${asset}" "$url"
+    fi
+    tar -xzf "${tmpdir}/${asset}" -C "$tmpdir"
+
+    bin="$(find "$tmpdir" -type f -name blamely 2>/dev/null | head -1)"
+    if [ -z "$bin" ]; then
+      exit 1
+    fi
+
+    mkdir -p "$STABLE_DIR"
+    cp -f "$bin" "$STABLE_BIN"
+    chmod +x "$STABLE_BIN"
+  ); then
+    die "could not download or extract blamely from ${asset}"
   fi
-  tar -xzf "${tmpdir}/${asset}" -C "$tmpdir"
 
-  bin="$(find "$tmpdir" -type f -name blamely 2>/dev/null | head -1)"
-  if [ -z "$bin" ]; then
-    die "could not find blamely binary inside ${asset}"
-  fi
-
-  mkdir -p "$STABLE_DIR"
-  cp -f "$bin" "$STABLE_BIN"
-  chmod +x "$STABLE_BIN"
   ok "Binary installed: ${STABLE_BIN}"
 }
 
 run_blamely_install() {
   info "Running blamely install (hooks, daemon, PATH)..."
+  set +e
   "$STABLE_BIN" install
+  local rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    die "blamely install failed (exit ${rc}). Run: ${STABLE_BIN} doctor"
+  fi
   "$STABLE_BIN" repair >/dev/null 2>&1 || true
   ok "Blamely configured."
 }

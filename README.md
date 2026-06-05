@@ -117,9 +117,8 @@ Attribution data lives in two places, both local:
 | `blamely history` | Aggregate report across noted commits |
 | `blamely history --since 7d` | Limit to a time window (`7d`, `30d`, `90d`, `1y`) |
 | `blamely history --all` | Include all tracked repos, not just the current one |
+| `blamely config` | View or change what each commit note stores |
 | `blamely --version` | Print version |
-
-Set `NO_COLOR=1` to disable ANSI colors in terminal output.
 
 ## What gets installed
 
@@ -138,6 +137,68 @@ Set `NO_COLOR=1` to disable ANSI colors in terminal output.
 | PATH entry | Appended to `~/.zshrc`, `~/.bashrc`, or equivalent |
 
 Existing hooks from other tools are preserved — Blamely merges into your settings rather than replacing them.
+
+## Configuration
+
+Everything Blamely writes lives under `~/.blamely/` (on Windows: `%USERPROFILE%\.blamely\`).
+
+| Path | Purpose |
+|------|---------|
+| `~/.blamely/bin/blamely` | Stable CLI binary (used by hooks and the daemon) |
+| `~/.blamely/db.sqlite` | Raw edit events from hooks and watchers |
+| `~/.blamely/daemon.port` | Localhost port the daemon listens on |
+| `~/.blamely/daemon.log` | Daemon logs |
+| `~/.blamely/git-hooks/` | Global git hooks (`post-commit` → `blamely attribute`) |
+| `~/.blamely/state.json` | Install state (used by `blamely uninstall`) |
+| `~/.blamely/config.json` | What each commit git note includes (see below) |
+| `~/.blamely/exclude` | Paths skipped from attribution (gitignore-style) |
+
+`blamely install` seeds `config.json` and `exclude` with defaults. Re-running install is idempotent and does **not** overwrite files you have edited.
+
+### Note settings (`config.json`)
+
+Controls **what is stored in each commit note** — not how attribution is computed. Every option defaults to **on**; list only the toggles you want off:
+
+```json
+{
+  "note": {
+    "file_lines": true,
+    "conversation": true,
+    "conversation_user": true,
+    "conversation_assistant": true,
+    "message": true,
+    "coding_time": true,
+    "tokens": true
+  }
+}
+```
+
+| Key | When `false` |
+|-----|--------------|
+| `file_lines` | Drops per-line detail (largest note size reduction) |
+| `conversation` | Stores no transcript turns |
+| `conversation_user` | Omits your prompts |
+| `conversation_assistant` | Omits model replies |
+| `message` | Omits commit message |
+| `coding_time` | Omits coding-time field |
+| `tokens` | Omits token usage |
+
+Manage from the CLI (changes apply to **future** commits only):
+
+```bash
+blamely config                              # show settings + file path
+blamely config get note.conversation
+blamely config set note.file_lines off      # accepts on/off, yes/no, true/false
+blamely config path
+```
+
+### Exclude list (`~/.blamely/exclude`)
+
+Gitignore-style patterns for files that should never appear in attribution (build outputs, `node_modules/`, etc.). Blamely also merges patterns from the repo's `.gitignore` and `.git/info/exclude`. Edits take effect on the next commit.
+
+### Environment
+
+Set `NO_COLOR=1` to disable ANSI colors in terminal output.
 
 ## Example output
 

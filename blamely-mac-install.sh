@@ -13,11 +13,11 @@ STABLE_DIR="${HOME}/.blamely/bin"
 STABLE_BIN="${STABLE_DIR}/blamely"
 AUTO_YES="${BLAMELY_INSTALL_YES:-}"
 
-RED='\033[31m'
-GREEN='\033[32m'
-YELLOW='\033[33m'
-BOLD='\033[1m'
-RESET='\033[0m'
+RED=$'\033[31m'
+GREEN=$'\033[32m'
+YELLOW=$'\033[33m'
+BOLD=$'\033[1m'
+RESET=$'\033[0m'
 
 info()  { printf '  → %s\n' "$*"; }
 ok()    { printf "${GREEN}  ✓${RESET} %s\n" "$*"; }
@@ -117,33 +117,92 @@ detect_arch() {
   esac
 }
 
+prepare_macos_binary() {
+  # curl downloads get quarantine/provenance xattrs; the release binary is
+  # linker-signed, which can stall dyld on first launch. Strip xattrs and
+  # re-sign locally so `blamely install` starts immediately.
+  local target="$1"
+  if [ ! -f "$target" ]; then
+    return 0
+  fi
+  xattr -cr "$target" 2>/dev/null || true
+  if have codesign; then
+    codesign -s - -f "$target" >/dev/null 2>&1 || \
+      warn "could not re-sign binary; first launch may hang while macOS verifies it"
+  else
+    warn "codesign not found; first launch may hang while macOS verifies the download"
+  fi
+}
+
+run_with_timeout() {
+  local secs="$1"
+  shift
+  "$@" &
+  local pid=$!
+  local waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$secs" ]; then
+      kill -9 "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$pid"
+}
+
 download_and_install() {
-  local arch asset url tmpdir extracted bin
+  local arch asset url bin
   arch="$(detect_arch)"
   asset="blamely_darwin_${arch}.tar.gz"
   url="${RELEASE_BASE}/${asset}"
 
   info "Downloading ${url} ..."
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
+  if ! (
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+    trap 'rm -rf "$tmpdir"' EXIT
 
-  curl -fsSL "$url" -o "${tmpdir}/${asset}"
-  tar -xzf "${tmpdir}/${asset}" -C "$tmpdir"
+    curl -fsSL "$url" -o "${tmpdir}/${asset}"
+    tar -xzf "${tmpdir}/${asset}" -C "$tmpdir"
 
-  bin="$(find "$tmpdir" -type f -name blamely 2>/dev/null | head -1)"
-  if [ -z "$bin" ]; then
-    die "could not find blamely binary inside ${asset}"
+    bin="$(find "$tmpdir" -type f -name blamely 2>/dev/null | head -1)"
+    if [ -z "$bin" ]; then
+      exit 1
+    fi
+
+    prepare_macos_binary "$bin"
+    mkdir -p "$STABLE_DIR"
+    cp -f "$bin" "$STABLE_BIN"
+    chmod +x "$STABLE_BIN"
+  ); then
+    die "could not download or extract blamely from ${asset}"
   fi
 
-  mkdir -p "$STABLE_DIR"
-  cp -f "$bin" "$STABLE_BIN"
-  chmod +x "$STABLE_BIN"
+  prepare_macos_binary "$STABLE_BIN"
   ok "Binary installed: ${STABLE_BIN}"
 }
 
 run_blamely_install() {
+  if [ ! -x "$STABLE_BIN" ]; then
+    die "blamely binary is missing or not executable: ${STABLE_BIN}"
+  fi
+
   info "Running blamely install (hooks, daemon, PATH)..."
-  "$STABLE_BIN" install
+  set +e
+  run_with_timeout 180 "$STABLE_BIN" install
+  local rc=$?
+  set -e
+  if [ "$rc" -eq 124 ]; then
+    die "blamely install timed out. Try:\n  xattr -cr ${STABLE_BIN}\n  codesign -s - -f ${STABLE_BIN}\n  ${STABLE_BIN} install"
+  fi
+  if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -eq 137 ]; then
+      die "blamely install was killed (signal 9). Try: xattr -cr ${STABLE_BIN} && codesign -s - -f ${STABLE_BIN} && ${STABLE_BIN} install"
+    fi
+    die "blamely install failed (exit ${rc}). Run: ${STABLE_BIN} doctor"
+  fi
   "$STABLE_BIN" repair >/dev/null 2>&1 || true
   ok "Blamely configured."
 }
