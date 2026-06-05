@@ -47,7 +47,7 @@ permissions:
   contents: read     # only need to read this source repo; release writes go via PAT
 
 env:
-  GO_VERSION: '1.26.3'
+  GO_VERSION: '1.26.4'
   # Pinned for reproducible obfuscation. garble is coupled to the Go toolchain
   # and refuses to run against an unsupported Go release — bump this in lockstep
   # with GO_VERSION. Releases: https://github.com/burrowers/garble/releases
