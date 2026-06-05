@@ -8,10 +8,11 @@ import (
 
 func writeConfig(t *testing.T, body string) {
 	t.Helper()
-	dir := filepath.Join(t.TempDir(), ".blamely")
-	// t.TempDir() returns a fresh dir each call, so derive HOME from its parent.
-	home := filepath.Dir(dir)
-	t.Setenv("HOME", home)
+	// fakeHome (paths_test.go) sandboxes the home dir cross-platform — it sets
+	// HOME *and* USERPROFILE, so os.UserHomeDir() resolves to our temp dir on
+	// Windows too (where HOME alone is ignored).
+	home := fakeHome(t)
+	dir := filepath.Join(home, ".blamely")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -21,7 +22,7 @@ func writeConfig(t *testing.T, body string) {
 }
 
 func TestLoadConfig_DefaultsWhenMissing(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	fakeHome(t)
 	cfg := LoadConfig()
 	if cfg != DefaultConfig() {
 		t.Fatalf("missing config should yield defaults; got %+v", cfg)
