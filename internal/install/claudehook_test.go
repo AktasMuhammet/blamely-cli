@@ -127,7 +127,7 @@ func TestInstallClaudeHook_MergesIntoExistingMatcher(t *testing.T) {
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
         "hooks": [{"type":"command","command":"echo other"}]
       }
     ]
@@ -147,6 +147,42 @@ func TestInstallClaudeHook_MergesIntoExistingMatcher(t *testing.T) {
 	inner := getSlice(grp, "hooks")
 	if len(inner) != 2 {
 		t.Errorf("expected 2 hooks in merged group (other + blamely), got %d", len(inner))
+	}
+}
+
+func TestInstallClaudeHook_MigratesLegacyMatcher(t *testing.T) {
+	// A blamely hook installed by an older version used a matcher without Bash.
+	// Re-running install must upgrade that group's matcher in place (not add a
+	// duplicate hook).
+	existing := `{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [{"type":"command","command":"/bin/blamely record claude"}]
+      }
+    ]
+  }
+}`
+	setupFakeHome(t, existing)
+	added, settingsPath, err := InstallClaudeHook("/bin/blamely")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !added {
+		t.Error("expected added=true (matcher migrated)")
+	}
+	m := claudeSettingsAt(t, settingsPath)
+	groups := getSlice(getMap(m, "hooks", false), "PostToolUse")
+	if len(groups) != 1 {
+		t.Fatalf("expected 1 group (migrated in place), got %d", len(groups))
+	}
+	grp, _ := groups[0].(map[string]any)
+	if grp["matcher"] != claudeHookMatcher {
+		t.Errorf("matcher not migrated: got %v want %v", grp["matcher"], claudeHookMatcher)
+	}
+	if inner := getSlice(grp, "hooks"); len(inner) != 1 {
+		t.Errorf("expected hook not duplicated, got %d", len(inner))
 	}
 }
 

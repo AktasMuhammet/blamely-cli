@@ -11,7 +11,11 @@ import (
 )
 
 const (
-	claudeHookMatcher = "Write|Edit|MultiEdit|NotebookEdit"
+	// Bash is included so file writes Claude performs via shell (e.g.
+	// `printf > f`, `cat > f`, heredocs, scripts) — which bypass the
+	// Write/Edit tools — still fire our PostToolUse hook. The recorder
+	// attributes the source files that changed during the command.
+	claudeHookMatcher = "Write|Edit|MultiEdit|NotebookEdit|Bash"
 	blamelyHookMarker = "blamely record claude"
 )
 
@@ -48,6 +52,12 @@ func InstallClaudeHook(binaryPath string) (added bool, settingsPath string, err 
 
 	for _, event := range claudeHookEvents {
 		entries := getSlice(hooks, event)
+		// Migrate older installs whose blamely group used a narrower matcher
+		// (e.g. one without Bash) up to the current matcher.
+		if migrateClaudeMatcher(entries, claudeHookMatcher) {
+			hooks[event] = entries
+			added = true
+		}
 		if alreadyPresent(entries) {
 			continue
 		}
@@ -69,6 +79,33 @@ func InstallClaudeHook(binaryPath string) (added bool, settingsPath string, err 
 		return false, settingsPath, err
 	}
 	return true, settingsPath, nil
+}
+
+// migrateClaudeMatcher updates the `matcher` of any existing group that contains
+// a blamely hook but whose matcher differs from the current one (e.g. an older
+// install that didn't watch Bash). Returns true if it changed anything. This
+// keeps `blamely install` idempotent while still upgrading legacy hook entries.
+func migrateClaudeMatcher(groups []any, matcher string) bool {
+	changed := false
+	for _, g := range groups {
+		grp, ok := g.(map[string]any)
+		if !ok {
+			continue
+		}
+		if m, _ := grp["matcher"].(string); m == matcher {
+			continue
+		}
+		inner := getSlice(grp, "hooks")
+		for _, h := range inner {
+			hm, _ := h.(map[string]any)
+			if cmd, _ := hm["command"].(string); containsBlamelyHook(cmd) {
+				grp["matcher"] = matcher
+				changed = true
+				break
+			}
+		}
+	}
+	return changed
 }
 
 // appendIntoMatcherGroup adds {type:command, command} to the matcher group

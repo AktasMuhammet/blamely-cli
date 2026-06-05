@@ -103,22 +103,30 @@ type FileEntry struct {
 	// Type is the file-level change kind: ADDED, DELETED, MODIFIED, RENAMED,
 	// or COPIED. Surfaced so consumers can render per-file status (e.g. a
 	// "+ added" / "- deleted" tag) without re-parsing the diff.
-	Type    string      `json:"type,omitempty"`
+	Type    string       `json:"type,omitempty"`
 	// RenamedFrom (resp. CopiedFrom) is set for RENAMED / COPIED files and
 	// names the source pre-commit path.
-	RenamedFrom string      `json:"renamed_from,omitempty"`
-	CopiedFrom  string      `json:"copied_from,omitempty"`
-	Added       int         `json:"added"`
-	Deleted     int         `json:"deleted"`
-	Lines       []LineEntry `json:"lines"`
+	RenamedFrom string       `json:"renamed_from,omitempty"`
+	CopiedFrom  string       `json:"copied_from,omitempty"`
+	Added       int          `json:"added"`
+	Deleted     int          `json:"deleted"`
+	// Lines holds the attribution as collapsed ranges (schema 2): consecutive
+	// lines sharing the same (type, author_type, tool, model, gen_type) are
+	// merged into one RangeEntry. Added/Deleted above stay line-accurate.
+	Lines []RangeEntry `json:"lines"`
+	// acc is the per-line accumulation buffer used while building the note; it
+	// is collapsed into Lines at flush time and never serialized.
+	acc []LineEntry
 }
 
-// LineEntry is one line of the commit's attribution. There is exactly one
-// LineEntry per added or deleted line (no range collapsing) so downstream
-// tools can render or filter at line granularity.
-type LineEntry struct {
-	Line int    `json:"line"` // post-image for adds, pre-image for deletes
-	Type string `json:"type"` // "add" | "delete"
+// RangeEntry is a contiguous run of added or deleted lines that share the same
+// attribution. For a single line Start == End. Replaces the schema-1 per-line
+// LineEntry to keep notes small on large commits (one object per range, not
+// per line). Readers of older notes should treat a bare `line` as start==end.
+type RangeEntry struct {
+	Start int    `json:"start"` // post-image for adds, pre-image for deletes
+	End   int    `json:"end"`   // inclusive; == Start for a single line
+	Type  string `json:"type"`  // "add" | "delete"
 	// AuthorType is the binary AI-or-human classification. "AI" for any AI
 	// tool (claude/cursor/codex/copilot/gemini), "Human" for typed-by-user
 	// or pasted lines, "" for deletions (we don't attribute who deleted what).
@@ -128,6 +136,65 @@ type LineEntry struct {
 	Tool    string  `json:"tool,omitempty"`
 	Model   *string `json:"model,omitempty"`
 	GenType *string `json:"gen_type,omitempty"`
+}
+
+// NumLines returns the number of lines covered by the range (inclusive).
+func (r RangeEntry) NumLines() int {
+	if r.End < r.Start {
+		return 0
+	}
+	return r.End - r.Start + 1
+}
+
+// LineEntry is the intermediate per-line attribution accumulated while building
+// a file's entry, before collapsing into RangeEntry ranges. Internal only.
+type LineEntry struct {
+	Line       int
+	Type       string
+	AuthorType string
+	Tool       string
+	Model      *string
+	GenType    *string
+}
+
+// collapseToRanges sorts per-line entries and merges consecutive lines that
+// share the same attribution into ranges. Adds and deletes never merge (Type
+// differs); a gap in line numbers always starts a new range.
+func collapseToRanges(lines []LineEntry) []RangeEntry {
+	if len(lines) == 0 {
+		return nil
+	}
+	sort.SliceStable(lines, func(i, j int) bool {
+		if lines[i].Line != lines[j].Line {
+			return lines[i].Line < lines[j].Line
+		}
+		return lines[i].Type < lines[j].Type
+	})
+	var out []RangeEntry
+	for _, le := range lines {
+		if n := len(out); n > 0 {
+			last := &out[n-1]
+			if last.Type == le.Type &&
+				last.AuthorType == le.AuthorType &&
+				last.Tool == le.Tool &&
+				equalStrPtr(last.Model, le.Model) &&
+				equalStrPtr(last.GenType, le.GenType) &&
+				le.Line == last.End+1 {
+				last.End = le.Line
+				continue
+			}
+		}
+		out = append(out, RangeEntry{
+			Start:      le.Line,
+			End:        le.Line,
+			Type:       le.Type,
+			AuthorType: le.AuthorType,
+			Tool:       le.Tool,
+			Model:      le.Model,
+			GenType:    le.GenType,
+		})
+	}
+	return out
 }
 
 // AttributeAndWrite is the main entry point invoked by the post-commit hook.
@@ -179,22 +246,37 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 			note.Files[i].CopiedFrom = from
 		}
 	}
-	// Attach conversation from any AI transcript files linked to edits in this
-	// commit's session. transcript_path is written into raw_meta by the Claude
-	// hook as of blamely 0.2; older edits silently produce no conversation.
-	// Must run BEFORE MarshalIndent/writeNote so it ends up in the persisted note.
+	// Attach conversation from the AI SESSIONS that produced this repo's edits in
+	// this commit's window. Three scopes combine so a commit's note shows exactly
+	// its own conversation and nothing else:
+	//   1. repo_path — SessionTranscriptsForPeriod only returns sessions whose
+	//      edits are in THIS repo, so working in many repos never cross-bleeds.
+	//   2. session_id — sessions are keyed/deduped by AI session_id, so each
+	//      distinct conversation that contributed code is included exactly once.
+	//   3. time window (prevCommit, commit] — within each session, only the turns
+	//      made after the previous commit, so a long session spanning several
+	//      commits doesn't repeat its whole history on every commit.
+	// transcript_path is written into raw_meta by the Claude hook as of blamely
+	// 0.2; older edits silently produce no conversation. Must run BEFORE
+	// MarshalIndent/writeNote so it ends up in the persisted note.
 	sinceConv := db.PreviousCommitTimestampNanos(repoID, commitNanos)
 	const slackNanos = int64(5 * 1e9)
-	if paths, err := db.TranscriptPathsForPeriod(repoID, sinceConv, commitNanos+slackNanos); err == nil {
-		for _, tp := range paths {
-			turns, err := tools.ReadTranscriptConversation(tp, 10, 300)
-			if err != nil || len(turns) == 0 {
+	const maxConvTurns = 12
+	if sessions, err := db.SessionTranscriptsForPeriod(repoID, sinceConv, commitNanos+slackNanos); err == nil {
+		for _, s := range sessions {
+			if len(note.Conversation) >= maxConvTurns {
+				break
+			}
+			turns, err := tools.ReadTranscriptConversationWindow(s.TranscriptPath, maxConvTurns, 300, sinceConv, commitNanos+slackNanos)
+			if err != nil {
 				continue
 			}
 			for _, t := range turns {
+				if len(note.Conversation) >= maxConvTurns {
+					break
+				}
 				note.Conversation = append(note.Conversation, ConvTurn{Role: t.Role, Text: t.Text})
 			}
-			break // one transcript per commit is enough
 		}
 	}
 
@@ -290,6 +372,48 @@ func applyChatUsage(note *Note, tool store.Tool, u *tools.TranscriptUsage) {
 	}
 	note.Totals.Tokens.Input += u.InputTokens
 	note.Totals.Tokens.Output += u.OutputTokens
+}
+
+// inheritBlankLineAttribution reassigns blank (empty/whitespace-only) lines to
+// the author of the nearest non-blank line in the SAME file, preferring the
+// line above. A blank line has no stable identity — its content_sha isn't
+// unique, so once the file drifts it can't be re-located by content and falls
+// through to Human even when the AI generated it as part of a block. Inheriting
+// from the surrounding block keeps AI-generated blank lines AI, while blank
+// lines the user added between human lines stay Human. Only blanks that
+// defaulted to Human are touched, and only an AI neighbour promotes them — a
+// human neighbour leaves the blank human. `resolved` must already be sorted by
+// (file, line).
+func inheritBlankLineAttribution(resolved []perLine) {
+	for i := range resolved {
+		if strings.TrimSpace(resolved[i].content) != "" {
+			continue // non-blank lines keep their own (content-matched) attribution
+		}
+		if resolved[i].tool != "" || resolved[i].genType != store.GenTypeHuman {
+			continue // a blank that already matched an AI edit — leave it
+		}
+		src := -1
+		for j := i - 1; j >= 0 && resolved[j].file == resolved[i].file; j-- {
+			if strings.TrimSpace(resolved[j].content) != "" {
+				src = j
+				break
+			}
+		}
+		if src == -1 {
+			for j := i + 1; j < len(resolved) && resolved[j].file == resolved[i].file; j++ {
+				if strings.TrimSpace(resolved[j].content) != "" {
+					src = j
+					break
+				}
+			}
+		}
+		if src == -1 || resolved[src].tool == "" {
+			continue // no neighbour, or the neighbour is human — keep blank human
+		}
+		resolved[i].tool = resolved[src].tool
+		resolved[i].genType = resolved[src].genType
+		resolved[i].model = resolved[src].model
+	}
 }
 
 // perLine is the intermediate per-line attribution before collapsing into ranges.
@@ -411,8 +535,10 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		return resolved[i].line < resolved[j].line
 	})
 
+	inheritBlankLineAttribution(resolved)
+
 	note := &Note{
-		Schema:      1,
+		Schema:      2,
 		Commit:      sha,
 		BaseSHA:     baseSHA,
 		ByTool:      map[string]Tool{},
@@ -464,7 +590,7 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			delLines = deleted[old]
 		}
 		for _, n := range delLines {
-			curFileEntry.Lines = append(curFileEntry.Lines, LineEntry{
+			curFileEntry.acc = append(curFileEntry.acc, LineEntry{
 				Line:       n,
 				Type:       "delete",
 				AuthorType: "Human",
@@ -479,10 +605,8 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		if from, ok := renames[curFileEntry.Path]; ok {
 			curFileEntry.RenamedFrom = from
 		}
-		// Sort all lines (adds + deletes) by line number for stable rendering.
-		sort.SliceStable(curFileEntry.Lines, func(i, j int) bool {
-			return curFileEntry.Lines[i].Line < curFileEntry.Lines[j].Line
-		})
+		// Collapse per-line accumulation (adds + deletes) into ranges.
+		curFileEntry.Lines = collapseToRanges(curFileEntry.acc)
 		note.Files = append(note.Files, *curFileEntry)
 		fileCount++
 	}
@@ -543,7 +667,7 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		if gt := string(p.genType); gt != "" && gt != string(store.GenTypeUnknown) {
 			entry.GenType = strPtr(gt)
 		}
-		curFileEntry.Lines = append(curFileEntry.Lines, entry)
+		curFileEntry.acc = append(curFileEntry.acc, entry)
 	}
 	flushFile()
 
@@ -574,12 +698,11 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			kind = FileDeleted
 		}
 		fe := FileEntry{Path: path, Type: string(kind), Deleted: len(delLines)}
+		acc := make([]LineEntry, 0, len(delLines))
 		for _, n := range delLines {
-			fe.Lines = append(fe.Lines, LineEntry{Line: n, Type: "delete", AuthorType: "Human"})
+			acc = append(acc, LineEntry{Line: n, Type: "delete", AuthorType: "Human"})
 		}
-		sort.SliceStable(fe.Lines, func(i, j int) bool {
-			return fe.Lines[i].Line < fe.Lines[j].Line
-		})
+		fe.Lines = collapseToRanges(acc)
 		note.Files = append(note.Files, fe)
 		note.Totals.DeletedLines += fe.Deleted
 		fileCount++
@@ -734,8 +857,19 @@ func pickEdit(edits []store.Edit, ln int, content string, minNanos, maxNanos int
 	return nil
 }
 
+// coversLine reports whether any edit line covers post-image line n BY POSITION.
+// Lines that carry a ContentSHA are skipped here on purpose: their content is
+// the authoritative signal, so they must match via coversContentSHA, not by
+// line number. Matching a content_sha line by position would re-introduce the
+// drift bug — an inserted line landing inside the AI's original range would be
+// mislabelled AI, and the AI line pushed out of the range mislabelled human.
+// Only ranges WITHOUT a content_sha (inline completions, log/velocity edits)
+// are matched positionally. Mirrors the editor gutter's resolve logic.
 func coversLine(lines []store.EditLine, n int) bool {
 	for _, l := range lines {
+		if l.ContentSHA != "" {
+			continue
+		}
 		if n >= l.StartLine && n <= l.EndLine {
 			return true
 		}

@@ -237,7 +237,7 @@ func toolGenType(note *gitnotes.Note, tool string) string {
 			if l.Tool != tool || l.GenType == nil {
 				continue
 			}
-			counts[*l.GenType]++
+			counts[*l.GenType] += l.NumLines()
 		}
 	}
 	var best string
@@ -274,7 +274,7 @@ func fileToolBreakdown(f gitnotes.FileEntry) string {
 		if l.Type != "add" || l.Tool == "" {
 			continue
 		}
-		counts[l.Tool]++
+		counts[l.Tool] += l.NumLines()
 	}
 	var parts []string
 	for _, name := range []string{"claude", "cursor", "codex", "copilot", "gemini", "human"} {

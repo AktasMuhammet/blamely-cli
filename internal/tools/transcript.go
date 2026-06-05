@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 )
 
 // TranscriptUsage extracts model + token usage from the last assistant turn
@@ -42,6 +43,11 @@ type transcriptEntry struct {
 	//   "claude-vscode" – Claude Code in VSCode (interactive)
 	// Absent on assistant turns and on Cursor transcripts.
 	Entrypoint string `json:"entrypoint"`
+
+	// Timestamp is the RFC3339 wall-clock time of the turn (Claude Code writes
+	// e.g. "2026-05-14T11:26:43.313Z"). Used to scope a commit's conversation to
+	// the turns made since the previous commit. Absent on some entry kinds.
+	Timestamp string `json:"timestamp"`
 
 	Message struct {
 		Model string `json:"model"`
@@ -138,7 +144,18 @@ func (e *transcriptEntry) role() string {
 // ReadTranscriptConversation returns up to maxTurns user/assistant turns from
 // the transcript JSONL, taking the last maxTurns turns. Each turn's text is
 // capped at maxChars characters. Tool-use and system entries are skipped.
+// Reads the whole transcript (no time window) — use
+// ReadTranscriptConversationWindow to scope to a commit's work cycle.
 func ReadTranscriptConversation(path string, maxTurns, maxChars int) ([]ConvTurn, error) {
+	return ReadTranscriptConversationWindow(path, maxTurns, maxChars, 0, 0)
+}
+
+// ReadTranscriptConversationWindow is ReadTranscriptConversation scoped to a
+// time window: only turns whose timestamp falls in (sinceNanos, untilNanos] are
+// returned. Pass 0 for either bound to leave that side open. This is what keeps
+// a commit's note conversation to the turns made SINCE the previous commit, so
+// each commit shows only its own prompts rather than the whole session history.
+func ReadTranscriptConversationWindow(path string, maxTurns, maxChars int, sinceNanos, untilNanos int64) ([]ConvTurn, error) {
 	if path == "" {
 		return nil, nil
 	}
@@ -147,10 +164,10 @@ func ReadTranscriptConversation(path string, maxTurns, maxChars int) ([]ConvTurn
 		return nil, fmt.Errorf("open transcript: %w", err)
 	}
 	defer f.Close()
-	return scanConversation(f, maxTurns, maxChars)
+	return scanConversation(f, maxTurns, maxChars, sinceNanos, untilNanos)
 }
 
-func scanConversation(r io.Reader, maxTurns, maxChars int) ([]ConvTurn, error) {
+func scanConversation(r io.Reader, maxTurns, maxChars int, sinceNanos, untilNanos int64) ([]ConvTurn, error) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 1<<16), 1<<22)
 	var turns []ConvTurn
@@ -166,6 +183,16 @@ func scanConversation(r io.Reader, maxTurns, maxChars int) ([]ConvTurn, error) {
 		role := e.role()
 		if role != "user" && role != "assistant" {
 			continue
+		}
+		// Time-window scope: when a bound is set, drop turns outside it. A turn
+		// whose timestamp can't be parsed (ts==0) is KEPT (fail open) so formats
+		// without a timestamp aren't silently lost — Claude turns always carry one.
+		if sinceNanos > 0 || untilNanos > 0 {
+			if ts := e.timestampNanos(); ts > 0 {
+				if ts <= sinceNanos || (untilNanos > 0 && ts > untilNanos) {
+					continue
+				}
+			}
 		}
 		text := extractText(e.Message.Content)
 		if text == "" {
@@ -184,6 +211,19 @@ func scanConversation(r io.Reader, maxTurns, maxChars int) ([]ConvTurn, error) {
 		turns = turns[len(turns)-maxTurns:]
 	}
 	return turns, nil
+}
+
+// timestampNanos parses the entry's RFC3339 timestamp to Unix nanoseconds.
+// Returns 0 when absent or unparseable.
+func (e *transcriptEntry) timestampNanos() int64 {
+	if e.Timestamp == "" {
+		return 0
+	}
+	t, err := time.Parse(time.RFC3339, e.Timestamp)
+	if err != nil {
+		return 0
+	}
+	return t.UnixNano()
 }
 
 func ReadTranscriptUsage(path string) (*TranscriptUsage, error) {

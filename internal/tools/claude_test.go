@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // buildPayload creates a temp git repo, writes a file into it, and returns
@@ -104,6 +105,55 @@ func TestRecordClaudeFromStdin_BashTool_NoOp(t *testing.T) {
 	b, _ := json.Marshal(m)
 	if err := RecordClaudeFromStdin(bytes.NewReader(b)); err != nil {
 		t.Errorf("Bash tool should be no-op, got: %v", err)
+	}
+}
+
+// TestRecentlyChangedFiles verifies the git-status-based detection that backs
+// Bash file-write attribution: an untracked source file just written shows up,
+// while ignored paths and unchanged files do not.
+func TestRecentlyChangedFiles(t *testing.T) {
+	dir := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "-q"},
+		{"config", "user.email", "t@l"},
+		{"config", "user.name", "T"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if err := cmd.Run(); err != nil {
+			t.Skipf("git not available: %v", err)
+		}
+	}
+	// gitignored file must be excluded.
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("ignored.txt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A freshly written, untracked source file — the Bash-create case.
+	if err := os.WriteFile(filepath.Join(dir, "new.txt"), []byte("hello\nworld\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ignored.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := recentlyChangedFiles(dir, bashWriteWindow)
+	if len(got) != 1 || got[0] != "new.txt" {
+		t.Fatalf("expected [new.txt], got %v", got)
+	}
+
+	// A file last modified outside the window must not be reported.
+	old := filepath.Join(dir, "old.txt")
+	if err := os.WriteFile(old, []byte("stale\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().Add(-bashWriteWindow - time.Minute)
+	if err := os.Chtimes(old, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range recentlyChangedFiles(dir, bashWriteWindow) {
+		if f == "old.txt" {
+			t.Error("stale file should be excluded by the mtime window")
+		}
 	}
 }
 

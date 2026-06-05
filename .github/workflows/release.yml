@@ -48,6 +48,10 @@ permissions:
 
 env:
   GO_VERSION: '1.26.3'
+  # Pinned for reproducible obfuscation. garble is coupled to the Go toolchain
+  # and refuses to run against an unsupported Go release — bump this in lockstep
+  # with GO_VERSION. Releases: https://github.com/burrowers/garble/releases
+  GARBLE_VERSION: 'v0.16.0'
 
 jobs:
   # ── 1. Build per OS/arch in parallel ───────────────────────────────────────
@@ -82,10 +86,12 @@ jobs:
         #   - strip extra runtime metadata
         # Source in this private repo stays unchanged; only the published
         # binary going to the public release repo is obfuscated.
+        # Pinned via GARBLE_VERSION (see env) for reproducible builds.
         shell: bash
         run: |
-          go install mvdan.cc/garble@latest
+          go install mvdan.cc/garble@${GARBLE_VERSION}
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          "$(go env GOPATH)/bin/garble" version
 
       - name: Resolve tag
         id: tag
@@ -136,21 +142,55 @@ jobs:
             -o "$out_dir/$bin_name" \
             ./cmd/blamely
 
-      - name: Verify obfuscation
-        # Smoke check: a binary built with `garble -literals` should NOT
-        # contain readable internal Go symbols like our package paths.
-        # We grep for our import path and fail the job if it shows up — that
-        # would mean the obfuscation regressed.
+      - name: Verify obfuscation (static)
+        # A non-garbled build embeds our import paths in the runtime symbol
+        # tables (gopclntab) even with `-s -w`; garble hashes them away. Grep
+        # the WHOLE module path — covering both internal/ and cmd/, not just
+        # internal/ as before — and fail if any of it survives. On failure we
+        # print the leaking paths to make a regression easy to diagnose.
         # `grep -a` treats the binary as text; portable across all runners.
         shell: bash
         run: |
           set -e
           bin="dist/blamely_${{ steps.tag.outputs.tag }}_${{ matrix.goos }}_${{ matrix.goarch }}/blamely${{ matrix.ext }}"
-          if grep -a -q "github.com/blamely/blamely/internal" "$bin"; then
-            echo "ERROR: internal import paths still visible in $bin"
+          if grep -a -q "github.com/blamely/blamely" "$bin"; then
+            echo "ERROR: readable blamely import paths still present in $bin — obfuscation regressed:"
+            grep -a -o "github.com/blamely/blamely[A-Za-z0-9/_.-]*" "$bin" | sort -u | head
             exit 1
           fi
-          echo "OK: $bin is obfuscated"
+          echo "OK: $bin shows no readable blamely import paths"
+
+      - name: Smoke-test obfuscated binary (native arch only)
+        # The static grep can't catch an obfuscated-but-BROKEN binary. With
+        # GOGARBLE='*', garble rewrites modernc.org/sqlite (heavy unsafe +
+        # //go:linkname) — the most likely thing to break under obfuscation,
+        # and it only fails at RUNTIME when the DB is opened. So actually run
+        # the just-built binary on the matching-arch runner:
+        #   - `--version` proves it executes AND the `-X main.version` ldflag
+        #     survived garble's name mangling (else it prints the dev default).
+        #   - `history --all` opens, migrates, and queries ~/.blamely/db.sqlite,
+        #     exercising the obfuscated SQLite stack; it needs no git repo /
+        #     daemon / network and exits 0 on an empty DB.
+        # Cross-arch builds (e.g. linux/arm64 on an amd64 runner) can't run
+        # here, so this is gated to the native OS/arch of each runner.
+        if: >-
+          (matrix.goos == 'darwin' && matrix.goarch == 'arm64') ||
+          (matrix.goos == 'linux' && matrix.goarch == 'amd64') ||
+          (matrix.goos == 'windows' && matrix.goarch == 'amd64')
+        shell: bash
+        run: |
+          set -e
+          tag="${{ steps.tag.outputs.tag }}"
+          bin="dist/blamely_${tag}_${{ matrix.goos }}_${{ matrix.goarch }}/blamely${{ matrix.ext }}"
+          ver="$("$bin" --version)"
+          echo "version output: $ver"
+          case "$ver" in
+            *"$tag"*) echo "OK: binary runs and the version ldflag survived obfuscation" ;;
+            *) echo "ERROR: version output '$ver' does not contain tag '$tag' — garble -X mapping broke"; exit 1 ;;
+          esac
+          # Open + migrate + query the SQLite store (the obfuscated modernc stack).
+          "$bin" history --all
+          echo "OK: obfuscated binary runs and SQLite works"
 
       - name: Package archive
         id: pkg

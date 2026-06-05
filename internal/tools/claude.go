@@ -105,6 +105,19 @@ func RecordClaudeFromStdin(r io.Reader) error {
 		return err
 	}
 	if filePath == "" {
+		// No file-edit tool produced a path. A Bash command, however, may have
+		// created or modified files directly (e.g. `printf > f`, `cat > f`,
+		// heredocs, a script) — bypassing Write/Edit entirely. We can't parse
+		// arbitrary shell (paths are often dynamic, e.g. `> "$fname"`), so we
+		// ask git which source files in the repo just changed and attribute
+		// those. Claude only (Cursor Tab has no Bash tool).
+		if !isCursor && p.ToolName == "Bash" {
+			gt := ReadTranscriptGenType(p.TranscriptPath)
+			if gt == "" {
+				gt = "chat"
+			}
+			return recordClaudeBashWrites(p.Cwd, p.SessionID, p.TranscriptPath, gt)
+		}
 		return nil
 	}
 
@@ -172,6 +185,174 @@ func RecordClaudeFromStdin(r io.Reader) error {
 	return postToDaemon(payload)
 }
 
+const (
+	// bashWriteWindow bounds how recently a file must have been modified to be
+	// credited to the Bash command that just ran. The PostToolUse hook fires
+	// immediately after the command, so a generous window absorbs hook latency
+	// while still excluding files the user edited minutes earlier.
+	bashWriteWindow = 15 * time.Second
+	// maxBashWriteFiles caps how many changed files we attribute to one command.
+	// A larger change set is almost certainly a bulk operation (build, codegen,
+	// `git checkout`, `npm install`) rather than authored content — we skip
+	// rather than guess, to avoid stealing credit for non-authored files.
+	maxBashWriteFiles = 30
+)
+
+// recordClaudeBashWrites attributes source files that changed while a Claude
+// Bash command ran. It uses `git status` (not a filesystem walk) so the scan is
+// bounded and automatically respects .gitignore — build output and node_modules
+// never appear. Each changed source file is recorded as a medium-confidence
+// claude edit covering the whole file, matching how a Write is stored, so the
+// existing commit-time attribution credits it without any further changes.
+func recordClaudeBashWrites(cwd, sessionID, transcriptPath, genType string) error {
+	if cwd == "" {
+		return nil
+	}
+	root, ok := gitToplevel(cwd)
+	if !ok {
+		return nil
+	}
+	files := recentlyChangedFiles(root, bashWriteWindow)
+	// none → read-only command (ls/grep/test); too many → bulk op we won't guess.
+	if len(files) == 0 || len(files) > maxBashWriteFiles {
+		return nil
+	}
+	repoID, _ := gitutil.RepoID(resolveSymlinks(root))
+	if repoID == "" {
+		repoID = root
+	}
+	for _, rel := range files {
+		abs := filepath.Join(root, rel)
+		ranges := perLineShaRanges(abs)
+		if len(ranges) == 0 {
+			continue
+		}
+		payload := daemon.EditPayload{
+			Tool:           "claude",
+			Confidence:     "medium",
+			GenType:        genType,
+			RepoPath:       repoID,
+			FilePath:       rel,
+			SuggestedLines: int64(len(ranges)),
+			Lines:          toDaemonRanges(ranges),
+			RawMeta: fmt.Sprintf(`{"session_id":%q,"tool":"claude","source":"claude_bash_fswrite","transcript_path":%q}`,
+				sessionID, transcriptPath),
+		}
+		// Backfill model + token usage from the session transcript, exactly like
+		// the Write/Edit hook path — otherwise the row has an empty model.
+		applyHookUsage(&payload, hookUsageOptions{
+			transcriptPath: transcriptPath,
+			sessionID:      sessionID,
+			tool:           "claude",
+		})
+		if err := postToDaemon(payload); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// perLineShaRanges returns one range per non-blank line of the file, each
+// carrying that line's content_sha (sha256 of the line text, sans trailing \r).
+// The editor gutter attributes chat/cli rows by hashing the CURRENT line text
+// and matching it against these shas, so a single whole-file hash would never
+// paint a line — per-line shas are what the live gutter needs, and they also let
+// commit-time attribution survive line-number drift. Capped so a huge generated
+// file can't blow past the daemon's request size limit.
+func perLineShaRanges(absPath string) []LineRange {
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return nil
+	}
+	const maxLines = 4000
+	var out []LineRange
+	for i, ln := range strings.Split(string(data), "\n") {
+		text := strings.TrimRight(ln, "\r")
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		n := i + 1
+		out = append(out, LineRange{Start: n, End: n, ContentSHA: sha256Hex([]byte(text))})
+		if len(out) >= maxLines {
+			break
+		}
+	}
+	return out
+}
+
+// perLineShaRangesFromContent is perLineShaRanges for an in-memory string (the
+// content an AI Write just produced) rather than a file on disk. It returns one
+// {n,n} range per line. Non-blank lines carry a content_sha so attribution
+// follows the line text across later insertions; blank lines carry no sha (a
+// blank line's hash isn't unique) but still get a range so they're counted as
+// authored. The trailing empty element from a final newline is dropped. Capped
+// for request size, matching perLineShaRanges.
+func perLineShaRangesFromContent(content string) []LineRange {
+	if content == "" {
+		return nil
+	}
+	lines := strings.Split(content, "\n")
+	if n := len(lines); n > 0 && lines[n-1] == "" {
+		lines = lines[:n-1] // drop trailing empty from a final newline
+	}
+	const maxLines = 4000
+	out := make([]LineRange, 0, len(lines))
+	for i, ln := range lines {
+		text := strings.TrimRight(ln, "\r")
+		sha := ""
+		if strings.TrimSpace(text) != "" {
+			sha = sha256Hex([]byte(text))
+		}
+		n := i + 1
+		out = append(out, LineRange{Start: n, End: n, ContentSHA: sha})
+		if len(out) >= maxLines {
+			break
+		}
+	}
+	return out
+}
+
+// recentlyChangedFiles returns repo-relative paths that git reports as
+// changed/untracked and whose on-disk mtime is within `window` of now. Using
+// git keeps the result bounded (usually a handful of paths) and gitignore-aware.
+func recentlyChangedFiles(root string, window time.Duration) []string {
+	cmd := exec.Command("git", "-C", root, "status", "--porcelain", "--untracked-files=all")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	cutoff := time.Now().Add(-window)
+	var files []string
+	for _, line := range strings.Split(string(out), "\n") {
+		// Porcelain v1 lines are "XY <path>" (3-char status prefix). Renames
+		// and copies use "XY <old> -> <new>"; we want the new path.
+		if len(line) < 4 {
+			continue
+		}
+		path := strings.TrimSpace(line[3:])
+		if i := strings.Index(path, " -> "); i >= 0 {
+			path = path[i+len(" -> "):]
+		}
+		path = strings.Trim(path, `"`)
+		if path == "" {
+			continue
+		}
+		abs := filepath.Join(root, path)
+		info, err := os.Stat(abs)
+		if err != nil || info.IsDir() || info.Size() == 0 {
+			continue
+		}
+		if info.ModTime().Before(cutoff) {
+			continue
+		}
+		if !looksLikeSourceFile(abs) {
+			continue
+		}
+		files = append(files, path)
+	}
+	return files
+}
+
 // extractClaudeRanges returns the file path, the located line ranges after
 // the edit landed, and `suggested`: the number of lines the model proposed
 // before any user editing. For Edit/MultiEdit `suggested` is the new_string
@@ -223,22 +404,22 @@ func extractClaudeRanges(p claudeHookPayload) (string, []LineRange, int64, error
 			return "", nil, 0, nil
 		}
 		suggested := int64(countLines(in.Content))
-		lr, err := LineRangeForWholeFile(in.FilePath)
-		if err != nil {
-			return in.FilePath, nil, suggested, err
-		}
-		if lr == nil {
+		// Emit ONE range per line, each non-blank line carrying its own
+		// content_sha. This is what makes attribution survive line drift: when
+		// the user later inserts a line into the AI-written file, each AI line is
+		// re-located by hashing the CURRENT text and matching the stored sha at
+		// its new position — so the AI lines stay AI even after they shift, and
+		// the user's freshly-typed line (no matching sha) is correctly human.
+		//
+		// A single whole-file range [1, N] (or the old 1<<30 sentinel) can't do
+		// this: it matches purely by line number, so an inserted line lands
+		// inside the range and is mislabelled AI, while the AI line pushed past N
+		// falls outside and is mislabelled human. Per-line shas fix both.
+		ranges := perLineShaRangesFromContent(in.Content)
+		if len(ranges) == 0 {
 			return in.FilePath, nil, suggested, nil
 		}
-		// Use a large sentinel for EndLine: if a subsequent Edit in the same
-		// session inserts lines before the end of this file, the stored range
-		// would become stale (shifted lines would be outside [1, N] and fall
-		// through to "human"). Setting EndLine to a large value ensures the
-		// Write covers all lines regardless of later insertions.
-		// AcceptedLines in the note uses the actual matched commit-line count,
-		// not this stored range, so stats are unaffected.
-		lr.End = 1 << 30
-		return in.FilePath, []LineRange{*lr}, suggested, nil
+		return in.FilePath, ranges, suggested, nil
 
 	case "MultiEdit":
 		var in multiEditInput

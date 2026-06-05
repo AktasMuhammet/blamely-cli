@@ -129,8 +129,12 @@ func printNote(n *gitnotes.Note) {
 			if author == "" {
 				author = "-"
 			}
-			fmt.Printf("  L%-6d %-7s %-6s %-8s%s%s\n",
-				l.Line, l.Type, author, toolStr, modelStr, genTypeStr)
+			loc := fmt.Sprintf("L%d", l.Start)
+			if l.End > l.Start {
+				loc = fmt.Sprintf("L%d-%d", l.Start, l.End)
+			}
+			fmt.Printf("  %-8s %-7s %-6s %-8s%s%s\n",
+				loc, l.Type, author, toolStr, modelStr, genTypeStr)
 		}
 		fmt.Println()
 	}

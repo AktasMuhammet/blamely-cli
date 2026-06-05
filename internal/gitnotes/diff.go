@@ -78,16 +78,24 @@ func DiffCommit(repoPath, sha string) (*CommitChange, error) {
 	if err != nil {
 		return nil, err
 	}
-	// -M  rename detection, -C  copy detection (so we can tag COPIED files).
+	// -M rename detection only. We deliberately do NOT pass -C (copy detection):
+	// when an AI Writes a brand-new file that happens to resemble an existing one
+	// (e.g. contact.html created from register.html), -C makes git report it as a
+	// COPY and emit only the handful of differing lines as "added" — so a 146-line
+	// AI-authored file shows added=43 and the rest of the AI's work vanishes from
+	// the note. Without -C the file is a normal new file with all 146 lines added,
+	// matching `git show --stat` and attributing every line the AI wrote.
+	// The first argument "-C repoPath" is git's own -C (change-directory) flag and
+	// is unrelated to copy detection.
 	var args []string
 	if hasParent {
-		args = []string{"-C", repoPath, "diff", "--unified=0", "--no-color", "-M", "-C", parent + ".." + sha}
+		args = []string{"-C", repoPath, "diff", "--unified=0", "--no-color", "-M", parent + ".." + sha}
 	} else {
 		emptyTree, err := emptyTreeSHA(repoPath)
 		if err != nil {
 			return nil, err
 		}
-		args = []string{"-C", repoPath, "diff", "--unified=0", "--no-color", "-M", "-C", emptyTree, sha}
+		args = []string{"-C", repoPath, "diff", "--unified=0", "--no-color", "-M", emptyTree, sha}
 	}
 	cmd := exec.Command("git", args...)
 	stdout, err := cmd.StdoutPipe()
@@ -160,9 +168,12 @@ func parseDiff(r io.Reader, excl *config.ExcludeList) (*CommitChange, error) {
 			n = len(hunkAdds)
 		}
 		// Paired adds (modifications) — emit add side, drop delete side.
+		// All added lines are counted, including blank/whitespace-only ones:
+		// a blank line the author wrote is still a line they authored, and
+		// counting it keeps the note's totals consistent with `git show --stat`.
 		for i := 0; i < n; i++ {
 			a := hunkAdds[i]
-			if curFile != "" && strings.TrimSpace(a.content) != "" {
+			if curFile != "" {
 				out.Added = append(out.Added, AddedLine{File: curFile, LineNum: a.line, Content: strings.TrimRight(a.content, "\r")})
 			}
 		}
@@ -175,7 +186,7 @@ func parseDiff(r io.Reader, excl *config.ExcludeList) (*CommitChange, error) {
 		// Excess adds — lines added without a same-position predecessor.
 		for i := n; i < len(hunkAdds); i++ {
 			a := hunkAdds[i]
-			if curFile != "" && strings.TrimSpace(a.content) != "" {
+			if curFile != "" {
 				out.Added = append(out.Added, AddedLine{File: curFile, LineNum: a.line, Content: strings.TrimRight(a.content, "\r")})
 			}
 		}

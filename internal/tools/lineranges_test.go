@@ -272,34 +272,53 @@ func TestAddedOrChangedRanges_InsertedDuplicateLine(t *testing.T) {
 func TestNarrowToChangedLines_OnlyTruncatesContextLines(t *testing.T) {
 	// new_string spans absolute file lines 10..14 (5 lines). The first and
 	// last lines are unchanged context (also in old_string). Only the
-	// middle three lines should remain after narrowing, mapped to file
-	// line numbers 11..13.
+	// middle three lines should remain after narrowing — emitted ONE range
+	// per line (11, 12, 13), each carrying its content_sha.
 	old := "header\nfooter"
 	newStr := "header\nNEW1\nNEW2\nNEW3\nfooter"
 	full := LineRange{Start: 10, End: 14}
 	ranges, suggested := narrowToChangedLines(old, newStr, full)
-	if len(ranges) != 1 {
-		t.Fatalf("expected 1 narrowed range, got %d: %+v", len(ranges), ranges)
+	if len(ranges) != 3 {
+		t.Fatalf("expected 3 per-line ranges, got %d: %+v", len(ranges), ranges)
 	}
-	if ranges[0].Start != 11 || ranges[0].End != 13 {
-		t.Errorf("expected absolute range [11,13], got %+v", ranges[0])
+	for i, w := range []struct {
+		ln   int
+		text string
+	}{{11, "NEW1"}, {12, "NEW2"}, {13, "NEW3"}} {
+		r := ranges[i]
+		if r.Start != w.ln || r.End != w.ln {
+			t.Errorf("range %d: want single line %d, got [%d,%d]", i, w.ln, r.Start, r.End)
+		}
+		if want := sha256Hex([]byte(w.text)); r.ContentSHA != want {
+			t.Errorf("range %d (L%d): content_sha mismatch", i, w.ln)
+		}
 	}
 	if suggested != 3 {
 		t.Errorf("expected suggested=3, got %d", suggested)
 	}
 }
 
-func TestNarrowToChangedLines_IdenticalReturnsFull(t *testing.T) {
-	// When old == new (no real change), there are no new lines; we fall
-	// back to recording the full range so the AI still appears in the
-	// edit log (useful for "AI touched this file" signals).
+func TestNarrowToChangedLines_IdenticalCreditsFullPerLine(t *testing.T) {
+	// When old == new (no real change), there are no new lines; we fall back
+	// to crediting the located span so the AI still appears in the edit log —
+	// but still LINE BY LINE (each line with its sha), never a coarse range
+	// that could be matched positionally.
 	full := LineRange{Start: 5, End: 7}
 	ranges, suggested := narrowToChangedLines("a\nb\nc", "a\nb\nc", full)
-	if len(ranges) != 1 || ranges[0] != full {
-		t.Errorf("expected fallback to full range, got %+v", ranges)
+	if len(ranges) != 3 {
+		t.Fatalf("expected 3 per-line ranges, got %d: %+v", len(ranges), ranges)
+	}
+	for i, w := range []struct {
+		ln   int
+		text string
+	}{{5, "a"}, {6, "b"}, {7, "c"}} {
+		r := ranges[i]
+		if r.Start != w.ln || r.End != w.ln || r.ContentSHA != sha256Hex([]byte(w.text)) {
+			t.Errorf("range %d: want L%d sha(%q), got %+v", i, w.ln, w.text, r)
+		}
 	}
 	if suggested != 3 {
-		t.Errorf("expected suggested=3 (full range size), got %d", suggested)
+		t.Errorf("expected suggested=3 (full span size), got %d", suggested)
 	}
 }
 
@@ -312,5 +331,64 @@ func TestCountAddedLines(t *testing.T) {
 	}
 	if got := CountAddedLines("a\nb", "a\nb"); got != 0 {
 		t.Errorf("CountAddedLines (no change): want 0, got %d", got)
+	}
+}
+
+// TestNarrowToChangedLines_PerLineSha asserts the Edit/MultiEdit recording path
+// emits ONE range per changed line, each non-blank line carrying its content_sha
+// (sans trailing \r). A coarse multi-line range with no sha would be matched
+// positionally at commit time and would mislabel a human line inserted inside
+// the AI block as AI — the bug this guards against.
+func TestNarrowToChangedLines_PerLineSha(t *testing.T) {
+	// new_string = two context lines (shared with old) + 3 genuinely-new lines.
+	oldStr := "ctxA\nctxB"
+	newStr := "ctxA\nctxB\nNEW1\nNEW2\nNEW3"
+	// Pretend LocateNewString placed new_string at file lines 224..228.
+	full := LineRange{Start: 224, End: 228}
+
+	ranges, suggested := narrowToChangedLines(oldStr, newStr, full)
+
+	if suggested != 3 {
+		t.Fatalf("suggested: want 3 new lines, got %d", suggested)
+	}
+	// Expect exactly the 3 new lines, each a single-line range with a sha.
+	if len(ranges) != 3 {
+		t.Fatalf("want 3 per-line ranges, got %d: %+v", len(ranges), ranges)
+	}
+	wantLines := []struct {
+		ln   int
+		text string
+	}{{226, "NEW1"}, {227, "NEW2"}, {228, "NEW3"}}
+	for i, w := range wantLines {
+		r := ranges[i]
+		if r.Start != w.ln || r.End != w.ln {
+			t.Errorf("range %d: want single line %d, got [%d,%d]", i, w.ln, r.Start, r.End)
+		}
+		if want := sha256Hex([]byte(w.text)); r.ContentSHA != want {
+			t.Errorf("range %d (L%d): content_sha mismatch\n want %s\n  got %s", i, w.ln, want, r.ContentSHA)
+		}
+	}
+}
+
+// TestNarrowToChangedLines_BlankLineNoSha: blank lines inside the changed block
+// still get a per-line range (so they're counted) but carry no content_sha,
+// matching perLineShaRangesFromContent's convention.
+func TestNarrowToChangedLines_BlankLineNoSha(t *testing.T) {
+	oldStr := "keep"
+	newStr := "keep\nA\n\nB"
+	full := LineRange{Start: 10, End: 13}
+	ranges, suggested := narrowToChangedLines(oldStr, newStr, full)
+	if suggested != 3 {
+		t.Fatalf("suggested: want 3, got %d", suggested)
+	}
+	if len(ranges) != 3 {
+		t.Fatalf("want 3 ranges, got %d: %+v", len(ranges), ranges)
+	}
+	// Lines 11 (A), 12 (blank), 13 (B).
+	if ranges[1].Start != 12 || ranges[1].ContentSHA != "" {
+		t.Errorf("blank line should be L12 with empty sha, got %+v", ranges[1])
+	}
+	if ranges[0].ContentSHA == "" || ranges[2].ContentSHA == "" {
+		t.Errorf("non-blank lines must carry a sha: %+v", ranges)
 	}
 }

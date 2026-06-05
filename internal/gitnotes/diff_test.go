@@ -248,11 +248,10 @@ func TestParseDiff_ReplaceFewerWithMore(t *testing.T) {
 	}
 }
 
-// TestParseDiff_WhitespaceOnlyModificationSymmetric covers the second bug:
-// the - side previously survived when its paired + was whitespace-only and
-// got filtered, producing a phantom "deletion treated as human". With
-// positional pairing, a whitespace-only + still consumes its matching - so
-// neither side is counted.
+// TestParseDiff_WhitespaceOnlyModificationSymmetric: a whitespace-only `+`
+// paired with a `-` is a modification. The `+` side is now counted (we count
+// all added lines, blank ones included), and the `-` side is still consumed by
+// the positional pairing so it does NOT produce a phantom deletion.
 func TestParseDiff_WhitespaceOnlyModificationSymmetric(t *testing.T) {
 	diff := strings.Join([]string{
 		"diff --git a/foo.go b/foo.go",
@@ -260,15 +259,16 @@ func TestParseDiff_WhitespaceOnlyModificationSymmetric(t *testing.T) {
 		"+++ b/foo.go",
 		"@@ -7,1 +7,1 @@",
 		"-old",
-		"+   ", // whitespace-only — filtered out as an add, but still pairs.
+		"+   ", // whitespace-only — counted as an add, and still pairs.
 		"",
 	}, "\n")
 	c, err := parseDiff(strings.NewReader(diff), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(c.Added) != 0 {
-		t.Errorf("Added: want empty (whitespace-only), got %v", c.Added)
+	wantAdded := []AddedLine{{File: "foo.go", LineNum: 7, Content: "   "}}
+	if !reflect.DeepEqual(c.Added, wantAdded) {
+		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)
 	}
 	if got := c.Deleted["foo.go"]; len(got) != 0 {
 		t.Errorf("Deleted: want empty (paired with whitespace add), got %v", got)

@@ -4,7 +4,19 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
+
+// mustNanos parses an RFC3339 timestamp to Unix nanoseconds, failing the test
+// on a bad input.
+func mustNanos(t *testing.T, rfc3339 string) int64 {
+	t.Helper()
+	tm, err := time.Parse(time.RFC3339, rfc3339)
+	if err != nil {
+		t.Fatalf("parse %q: %v", rfc3339, err)
+	}
+	return tm.UnixNano()
+}
 
 func TestScanTranscriptUsage_Empty(t *testing.T) {
 	u, err := scanTranscriptUsage(strings.NewReader(""))
@@ -102,7 +114,7 @@ func TestScanConversation_PlainStringUserTurn(t *testing.T) {
 	// User turns where content is a plain JSON string (not an array).
 	input := `{"type":"user","message":{"role":"user","content":"Fix the auth bug"}}` + "\n" +
 		`{"type":"assistant","message":{"model":"claude-opus-4-7","content":[{"type":"text","text":"I'll fix that now."}],"usage":{"input_tokens":10,"output_tokens":5}}}` + "\n"
-	turns, err := scanConversation(strings.NewReader(input), 10, 0)
+	turns, err := scanConversation(strings.NewReader(input), 10, 0, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,11 +129,46 @@ func TestScanConversation_PlainStringUserTurn(t *testing.T) {
 	}
 }
 
+func TestScanConversation_TimeWindowScopesToCommitCycle(t *testing.T) {
+	// Three user turns across two commits. The window (since, until] should keep
+	// only the turn made between the previous commit and this one.
+	input := `{"type":"user","timestamp":"2026-01-01T10:00:00Z","message":{"content":"create a simple html page"}}` + "\n" +
+		`{"type":"user","timestamp":"2026-01-01T11:00:00Z","message":{"content":"add a simple button"}}` + "\n" +
+		`{"type":"user","timestamp":"2026-01-01T12:00:00Z","message":{"content":"change the color"}}` + "\n"
+
+	prevCommit := mustNanos(t, "2026-01-01T10:30:00Z") // first commit was at 10:30
+	thisCommit := mustNanos(t, "2026-01-01T11:30:00Z") // second commit at 11:30
+
+	turns, err := scanConversation(strings.NewReader(input), 10, 0, prevCommit, thisCommit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(turns) != 1 {
+		t.Fatalf("want 1 turn in window, got %d: %+v", len(turns), turns)
+	}
+	if turns[0].Text != "add a simple button" {
+		t.Errorf("want only 'add a simple button', got %q", turns[0].Text)
+	}
+}
+
+func TestScanConversation_NoTimestampFailsOpen(t *testing.T) {
+	// A turn without a timestamp is kept even when a window is set, so formats
+	// lacking timestamps aren't silently dropped.
+	input := `{"type":"user","message":{"content":"no timestamp here"}}` + "\n"
+	turns, err := scanConversation(strings.NewReader(input), 10, 0, mustNanos(t, "2026-01-01T10:00:00Z"), mustNanos(t, "2026-01-01T12:00:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(turns) != 1 || turns[0].Text != "no timestamp here" {
+		t.Fatalf("want the un-timestamped turn kept, got %+v", turns)
+	}
+}
+
 func TestScanConversation_HumanTurnContentType(t *testing.T) {
 	// User turns where content is an array with type "human_turn".
 	input := `{"type":"user","message":{"content":[{"type":"human_turn","text":"Refactor this function"}]}}` + "\n" +
 		`{"type":"assistant","message":{"model":"claude-opus-4-7","content":[{"type":"text","text":"Sure, here is the refactor."}],"usage":{"input_tokens":10,"output_tokens":5}}}` + "\n"
-	turns, err := scanConversation(strings.NewReader(input), 10, 0)
+	turns, err := scanConversation(strings.NewReader(input), 10, 0, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +184,7 @@ func TestScanConversation_TextArrayContentType(t *testing.T) {
 	// Both turns using standard array with type "text".
 	input := `{"type":"user","message":{"content":[{"type":"text","text":"Add unit tests"}]}}` + "\n" +
 		`{"type":"assistant","message":{"model":"claude-opus-4-7","content":[{"type":"text","text":"I'll add tests for each case."},{"type":"tool_use","id":"t1","name":"Edit","input":{}}],"usage":{"input_tokens":10,"output_tokens":5}}}` + "\n"
-	turns, err := scanConversation(strings.NewReader(input), 10, 0)
+	turns, err := scanConversation(strings.NewReader(input), 10, 0, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +201,7 @@ func TestScanConversation_SkipsToolUseOnlyTurns(t *testing.T) {
 	// An assistant turn with only a tool_use block (no text) should be skipped.
 	input := `{"type":"assistant","message":{"model":"claude-opus-4-7","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{}}],"usage":{"input_tokens":5,"output_tokens":2}}}` + "\n" +
 		`{"type":"assistant","message":{"model":"claude-opus-4-7","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":5,"output_tokens":2}}}` + "\n"
-	turns, err := scanConversation(strings.NewReader(input), 10, 0)
+	turns, err := scanConversation(strings.NewReader(input), 10, 0, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +272,7 @@ func TestScanConversation_MaxTurnsAndTruncation(t *testing.T) {
 	input := `{"type":"user","message":{"content":[{"type":"text","text":"first"}]}}` + "\n" +
 		`{"type":"user","message":{"content":[{"type":"text","text":"second"}]}}` + "\n" +
 		`{"type":"user","message":{"content":[{"type":"text","text":"third"}]}}` + "\n"
-	turns, err := scanConversation(strings.NewReader(input), 2, 0)
+	turns, err := scanConversation(strings.NewReader(input), 2, 0, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

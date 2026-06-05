@@ -85,23 +85,62 @@ func sha256Hex(b []byte) string {
 // lines around the actual change so the patch matches uniquely. We don't
 // want those context lines credited to the AI — only the genuinely new
 // lines. The returned `suggested` count is the total number of lines marked
-// new (sum of the returned ranges' sizes). Falls back to `full` when the
-// strings are identical (no-op edit) or the diff yields no changes.
+// new (sum of the returned ranges' sizes). Falls back to crediting the whole
+// located span when the strings share no new lines (no-op / reorder).
+//
+// Crucially the output is emitted ONE RANGE PER LINE, each non-blank line
+// carrying its own content_sha (sha256 of the line text, sans trailing \r) —
+// exactly like the Write path's perLineShaRangesFromContent. This is what makes
+// attribution survive line drift: when the user later inserts a line inside the
+// AI-edited block, every AI line is re-located by hashing the CURRENT text and
+// matching the stored sha at its new position, while the user's freshly-typed
+// line (no matching sha) is correctly human. A coarse multi-line range with no
+// sha matches purely by position, so an inserted line lands inside the range and
+// is mislabelled AI. The note still stores collapsed ranges (collapseToRanges),
+// but the recorded edit — and thus attribution — is line-by-line.
 func narrowToChangedLines(oldStr, newStr string, full LineRange) ([]LineRange, int64) {
-	changed := AddedOrChangedRanges([]byte(oldStr), []byte(newStr))
-	if len(changed) == 0 {
-		return []LineRange{full}, int64(full.End - full.Start + 1)
+	newLines := strings.Split(newStr, "\n")
+	if n := len(newLines); n > 0 && newLines[n-1] == "" {
+		newLines = newLines[:n-1] // drop trailing empty from a final newline
 	}
 	offset := full.Start - 1
+
+	// emit expands a 1-based [relStart, relEnd] span (relative to newStr) into
+	// per-line absolute ranges, each carrying the line's content_sha.
+	emit := func(relStart, relEnd int) []LineRange {
+		var rs []LineRange
+		for rel := relStart; rel <= relEnd; rel++ {
+			abs := offset + rel
+			if abs > full.End {
+				break
+			}
+			text := ""
+			if rel-1 >= 0 && rel-1 < len(newLines) {
+				text = strings.TrimRight(newLines[rel-1], "\r")
+			}
+			sha := ""
+			if strings.TrimSpace(text) != "" {
+				sha = sha256Hex([]byte(text))
+			}
+			rs = append(rs, LineRange{Start: abs, End: abs, ContentSHA: sha})
+		}
+		return rs
+	}
+
+	changed := AddedOrChangedRanges([]byte(oldStr), []byte(newStr))
+	if len(changed) == 0 {
+		// No genuinely-new lines vs old_string. Credit the whole located span,
+		// still line-by-line so it can't be matched positionally.
+		out := emit(1, full.End-offset)
+		return out, int64(len(out))
+	}
+
 	var out []LineRange
 	var suggested int64
 	for _, r := range changed {
-		abs := LineRange{Start: offset + r.Start, End: offset + r.End}
-		if abs.End > full.End {
-			abs.End = full.End
-		}
-		out = append(out, abs)
-		suggested += int64(abs.End - abs.Start + 1)
+		rs := emit(r.Start, r.End)
+		out = append(out, rs...)
+		suggested += int64(len(rs))
 	}
 	return out, suggested
 }
