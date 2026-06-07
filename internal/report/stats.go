@@ -54,9 +54,8 @@ func RenderStats(sha string) error {
 	}
 	sessionNanos := db.SessionDurationNanos(repoID, commitNanos)
 
-	color := colorEnabled()
 	w := os.Stdout
-	renderStats(w, &note, meta, sessionNanos, color)
+	renderStats(w, &note, meta, sessionNanos)
 	return nil
 }
 
@@ -83,32 +82,7 @@ func readNote(repoPath, sha string) ([]byte, error) {
 	return exec.Command("git", "-C", repoPath, "notes", "--ref="+gitnotes.NotesRef, "show", sha).Output()
 }
 
-func renderStats(w io.Writer, note *gitnotes.Note, meta commitMeta_, sessionNanos int64, color bool) {
-	bold := func(s string) string {
-		if color {
-			return ansiBold + s + ansiReset
-		}
-		return s
-	}
-	dim := func(s string) string {
-		if color {
-			return ansiDim + s + ansiReset
-		}
-		return s
-	}
-	green := func(s string) string {
-		if color {
-			return ansiGreen + s + ansiReset
-		}
-		return s
-	}
-	red := func(s string) string {
-		if color {
-			return "\x1b[31m" + s + ansiReset
-		}
-		return s
-	}
-
+func renderStats(w io.Writer, note *gitnotes.Note, meta commitMeta_, sessionNanos int64) {
 	sha := meta["sha"]
 	if len(sha) > 12 {
 		sha = sha[:12]

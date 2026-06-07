@@ -20,9 +20,13 @@ import (
 	"github.com/blamely/blamely/internal/gitutil"
 )
 
-// CodexWatcher tails ~/.codex/sessions/*.jsonl and emits attribution events
+// CodexWatcher tails ~/.codex/sessions/**/*.jsonl and emits attribution events
 // for every `apply_patch`-style file mutation. It also captures `model` and
 // token usage from the surrounding response events.
+//
+// Codex CLI partitions session rollouts by date —
+// ~/.codex/sessions/<year>/<month>/<day>/rollout-*.jsonl — rather than writing
+// them flat into sessions/, so the scan below must recurse.
 //
 // The session log format is tolerant — Codex CLI versions vary the exact
 // event shape. We extract from any JSON line that:
@@ -61,13 +65,8 @@ func (c *CodexWatcher) Run(ctx context.Context, sink daemon.Sink) error {
 	defer tick.Stop()
 
 	for {
-		entries, _ := os.ReadDir(dir)
 		seen := map[string]bool{}
-		for _, e := range entries {
-			if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
-				continue
-			}
-			path := filepath.Join(dir, e.Name())
+		for _, path := range findCodexSessionFiles(dir) {
 			seen[path] = true
 			if _, running := tailers[path]; running {
 				continue
@@ -93,6 +92,27 @@ func (c *CodexWatcher) Run(ctx context.Context, sink daemon.Sink) error {
 		case <-tick.C:
 		}
 	}
+}
+
+// findCodexSessionFiles recursively collects every rollout-*.jsonl under dir,
+// since Codex CLI nests them under <year>/<month>/<day>/ rather than writing
+// them flat into the sessions root.
+func findCodexSessionFiles(dir string) []string {
+	var paths []string
+	_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() || !strings.HasSuffix(d.Name(), ".jsonl") {
+			return nil
+		}
+		paths = append(paths, p)
+		return nil
+	})
+	return paths
 }
 
 // tailCodexSession streams new JSONL events from `path` and emits an Event
@@ -196,10 +216,36 @@ type codexLine struct {
 	} `json:"tool_call"`
 }
 
+// codexWrappedLine is the envelope used by current Codex CLI session logs
+// (observed with cli_version 0.137.x): every line is wrapped as
+// {"timestamp", "type": "response_item"|"event_msg"|"turn_context"|"session_meta",
+// "payload": {...}} — a completely different shape from the flat `codexLine`
+// form older versions (and ReadCodexSessionUsage) expect.
+type codexWrappedLine struct {
+	Timestamp string          `json:"timestamp"`
+	Type      string          `json:"type"`
+	Payload   json.RawMessage `json:"payload"`
+}
+
 // processCodexLine handles one JSONL event from a Codex session. It carries
 // the latest seen model on the state, buffers patch-derived events, and
 // drains the buffer when a usage block arrives.
+//
+// Codex CLI's session-line shape has changed across versions: newer releases
+// wrap every line in {"type", "payload"} (handled by processCodexWrappedLine);
+// older ones emit flat {"type", "model"/"name"/"usage", ...} lines (handled
+// below). We try the wrapped shape first since that's what current installs
+// produce, and fall back to the flat parser otherwise.
 func processCodexLine(raw []byte, st *codexState) {
+	var env codexWrappedLine
+	if err := json.Unmarshal(raw, &env); err == nil && len(env.Payload) > 0 {
+		switch env.Type {
+		case "turn_context", "event_msg", "session_meta", "response_item":
+			processCodexWrappedLine(&env, st)
+			return
+		}
+	}
+
 	var ln codexLine
 	if err := json.Unmarshal(raw, &ln); err != nil {
 		return
@@ -254,6 +300,146 @@ func processCodexLine(raw []byte, st *codexState) {
 		u := ln.Message.Usage
 		st.flush(u.InputTokens, u.OutputTokens, u.CacheReadInputTokens, u.CacheCreationInputTokens, true)
 	}
+}
+
+// processCodexWrappedLine handles one line of the wrapped session-log
+// envelope. Of the wrapper types, only three payload shapes carry signal we
+// need:
+//   - turn_context.payload.model        — tracks the active model for this turn
+//   - event_msg/patch_apply_end payload — the actual file mutations (richer
+//     than the legacy apply_patch function-call: absolute paths, full content
+//     for adds, real unified diffs for updates — no content-sha guessing)
+//   - event_msg/token_count payload     — usage to attach to buffered events
+func processCodexWrappedLine(env *codexWrappedLine, st *codexState) {
+	when := parseCodexTimestamp(env.Timestamp)
+	if when.IsZero() {
+		when = time.Now()
+	}
+	switch env.Type {
+	case "turn_context":
+		var p struct {
+			Model string `json:"model"`
+		}
+		if json.Unmarshal(env.Payload, &p) == nil && p.Model != "" {
+			st.model = p.Model
+		}
+	case "event_msg":
+		var head struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(env.Payload, &head) != nil {
+			return
+		}
+		switch head.Type {
+		case "patch_apply_end":
+			emitCodexPatchApplyEvents(env.Payload, when, st)
+		case "token_count":
+			flushCodexTokenCount(env.Payload, st)
+		}
+	}
+}
+
+// emitCodexPatchApplyEvents reads a patch_apply_end payload — one entry per
+// changed file, each either `{"type":"add","content":...}` (full new file
+// content) or `{"type":"update","unified_diff":...}` (a real unified diff) —
+// and buffers one Event per file. Buffered rather than recorded immediately
+// so the trailing token_count line can attach accurate usage, mirroring the
+// legacy apply_patch buffering above.
+func emitCodexPatchApplyEvents(payload json.RawMessage, when time.Time, st *codexState) {
+	var p struct {
+		Success bool `json:"success"`
+		Changes map[string]struct {
+			Type        string `json:"type"`
+			Content     string `json:"content"`
+			UnifiedDiff string `json:"unified_diff"`
+		} `json:"changes"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil || !p.Success {
+		return
+	}
+	for absPath, change := range p.Changes {
+		abs := absPath
+		if r, err := filepath.EvalSymlinks(absPath); err == nil {
+			abs = r
+		}
+		repo, _ := gitutil.RepoID(abs)
+		wt, _ := gitutil.Toplevel(abs)
+		rel := abs
+		if wt != "" {
+			if r, err := filepath.Rel(wt, abs); err == nil && !strings.HasPrefix(r, "..") {
+				rel = r
+			}
+		}
+
+		var lines []daemon.LineRange
+		var suggested int64
+		switch change.Type {
+		case "add":
+			full, err := LineRangeForWholeFile(abs)
+			if err != nil || full == nil {
+				continue
+			}
+			lines = []daemon.LineRange{{Start: full.Start, End: full.End, ContentSHA: full.ContentSHA}}
+			suggested = int64(full.End - full.Start + 1)
+		case "update":
+			ranges, n := UnifiedDiffAddedRanges(change.UnifiedDiff)
+			if len(ranges) == 0 {
+				continue
+			}
+			lines = toDaemonLineRanges(ranges)
+			suggested = n
+		default:
+			continue
+		}
+
+		st.pending = append(st.pending, daemon.Event{
+			When:           when,
+			Tool:           "codex",
+			Confidence:     "high",
+			GenType:        "cli",
+			RepoPath:       repo,
+			FilePath:       rel,
+			Model:          st.model,
+			Lines:          lines,
+			SuggestedLines: suggested,
+			RawMeta:        fmt.Sprintf(`{"source":"codex_session","patch_apply":%q}`, change.Type),
+		})
+	}
+}
+
+// flushCodexTokenCount reads an event_msg/token_count payload's
+// `info.last_token_usage` (the per-turn delta, not the running total) and
+// flushes any buffered patch events with it. The wrapped format has no
+// separate cache-write counter — only `cached_input_tokens`, which we map to
+// cache-read.
+func flushCodexTokenCount(payload json.RawMessage, st *codexState) {
+	var p struct {
+		Info struct {
+			LastTokenUsage struct {
+				InputTokens       int64 `json:"input_tokens"`
+				CachedInputTokens int64 `json:"cached_input_tokens"`
+				OutputTokens      int64 `json:"output_tokens"`
+			} `json:"last_token_usage"`
+		} `json:"info"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return
+	}
+	u := p.Info.LastTokenUsage
+	if u.InputTokens == 0 && u.OutputTokens == 0 {
+		return
+	}
+	st.flush(u.InputTokens, u.OutputTokens, u.CachedInputTokens, 0, true)
+}
+
+// toDaemonLineRanges converts the local LineRange (shared with antigravity_chat.go's
+// diff-walking helpers) to daemon.LineRange — identical fields, different package.
+func toDaemonLineRanges(rs []LineRange) []daemon.LineRange {
+	out := make([]daemon.LineRange, len(rs))
+	for i, r := range rs {
+		out[i] = daemon.LineRange{Start: r.Start, End: r.End, ContentSHA: r.ContentSHA}
+	}
+	return out
 }
 
 func pickFunctionCall(ln *codexLine) (string, json.RawMessage) {

@@ -3,7 +3,9 @@ package report
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -38,61 +40,21 @@ func RenderSince(since string) error {
 	return fmt.Errorf("report --since=%s: aggregated rollup not yet implemented", since)
 }
 
+// printNote renders the full per-commit attribution view: the same premium
+// header + AI/Human bar + per-tool/generation breakdown that `blamely
+// attribute` prints (via RenderBar, so the visual language stays consistent
+// across commands), followed by report's distinguishing detail — coding time,
+// the model rollup, the conversation, and a clean per-file, per-range
+// line-level attribution listing.
 func printNote(n *gitnotes.Note) {
-	fmt.Printf("commit %s\n", n.Commit)
-	if n.Branch != "" {
-		fmt.Printf("  branch:        %s\n", n.Branch)
-	}
-	if n.Message != "" {
-		// Show the subject line only (first line) plus a hint that the body
-		// is in the note. Avoids printing multi-line messages in the header
-		// summary.
-		subject := strings.SplitN(n.Message, "\n", 2)[0]
-		fmt.Printf("  message:       %s\n", subject)
-	}
-	if n.CodingTimeNanos > 0 {
-		fmt.Printf("  coding time:   %s\n", formatDuration(time.Duration(n.CodingTimeNanos)))
-	}
-	fmt.Printf("  AI lines:      %d\n", n.Totals.AILines)
-	fmt.Printf("  human lines:   %d\n", n.Totals.HumanLines)
-	if n.Totals.DeletedLines > 0 {
-		// Deletions are line-level but not tool-attributed today; they count
-		// as human actions in the bar/totals.
-		fmt.Printf("  deleted lines: %d  (treated as human)\n", n.Totals.DeletedLines)
-	}
-	fmt.Printf("  files:         %d\n", n.Totals.Files)
-	if n.Totals.Tokens != nil {
-		t := n.Totals.Tokens
-		fmt.Printf("  tokens:        in=%d out=%d cache_read=%d cache_write=%d\n",
-			t.Input, t.Output, t.CacheRead, t.CacheWrite)
-	}
-	fmt.Println()
-	if len(n.Totals.Models) > 0 {
-		fmt.Println("  models:")
-		for model, count := range n.Totals.Models {
-			fmt.Printf("    %-24s %4d lines\n", model, count)
-		}
-	}
+	RenderBar(os.Stdout, n, 40)
 	fmt.Println()
 
-	fmt.Println("by tool:")
-	for _, name := range []string{"claude", "cursor", "codex", "copilot", "gemini", "human", "copypaste"} {
-		t, ok := n.ByTool[name]
-		if !ok {
-			continue
-		}
-		modelStr := "-"
-		if t.Model != nil {
-			modelStr = *t.Model
-		}
-		fmt.Printf("  %-8s %4d lines  model=%s", name, t.Lines, modelStr)
-		if t.SuggestedLines > 0 {
-			fmt.Printf("  suggested=%d accepted=%d", t.SuggestedLines, t.AcceptedLines)
-		}
-		if t.Tokens != nil {
-			fmt.Printf("  tokens(in=%d out=%d)", t.Tokens.Input, t.Tokens.Output)
-		}
-		fmt.Println()
+	if n.CodingTimeNanos > 0 {
+		fmt.Printf("  %s  %s\n", bold("Coding time:"), formatDuration(time.Duration(n.CodingTimeNanos)))
+	}
+	if len(n.Totals.Models) > 0 {
+		fmt.Printf("  %s  %s\n", bold("Models:"), formatModels(n.Totals.Models))
 	}
 	fmt.Println()
 
@@ -100,44 +62,90 @@ func printNote(n *gitnotes.Note) {
 		printConversation(n.Conversation)
 	}
 
+	if len(n.Files) == 0 {
+		return
+	}
+	fmt.Println(bold("Files:"))
 	for _, f := range n.Files {
-		header := f.Path
-		if f.Type != "" {
-			header = fmt.Sprintf("%s  [%s]", f.Path, f.Type)
-		}
-		if f.RenamedFrom != "" {
-			header += fmt.Sprintf("  (from %s)", f.RenamedFrom)
-		}
-		if f.CopiedFrom != "" {
-			header += fmt.Sprintf("  (copied from %s)", f.CopiedFrom)
-		}
-		fmt.Printf("%s  +%d -%d\n", header, f.Added, f.Deleted)
+		fmt.Println()
+		printFileHeader(f)
 		for _, l := range f.Lines {
-			modelStr := ""
-			if l.Model != nil {
-				modelStr = "  " + *l.Model
-			}
-			genTypeStr := ""
-			if l.GenType != nil {
-				genTypeStr = "  " + *l.GenType
-			}
-			toolStr := l.Tool
-			if toolStr == "" {
-				toolStr = "-"
-			}
-			author := l.AuthorType
-			if author == "" {
-				author = "-"
-			}
 			loc := fmt.Sprintf("L%d", l.Start)
 			if l.End > l.Start {
 				loc = fmt.Sprintf("L%d-%d", l.Start, l.End)
 			}
-			fmt.Printf("  %-8s %-7s %-6s %-8s%s%s\n",
-				loc, l.Type, author, toolStr, modelStr, genTypeStr)
+			fmt.Printf("    %s  %s  %s\n", dim(fmt.Sprintf("%-9s", loc)), dim(fmt.Sprintf("%-6s", l.Type)), formatAttribution(l))
 		}
-		fmt.Println()
 	}
+	fmt.Println()
+}
+
+// printFileHeader renders one file's status line:
+//
+//	app.js  [ADDED]                              +122  -0
+//	server.go  [RENAMED] (from old_server.go)     +18  -4
+func printFileHeader(f gitnotes.FileEntry) {
+	name := bold(f.Path)
+	if f.Type != "" {
+		name += "  " + dim("["+f.Type+"]")
+	}
+	if f.RenamedFrom != "" {
+		name += "  " + dim("(from "+f.RenamedFrom+")")
+	}
+	if f.CopiedFrom != "" {
+		name += "  " + dim("(copied from "+f.CopiedFrom+")")
+	}
+	fmt.Printf("%s  %s %s\n", name, green(fmt.Sprintf("+%-4d", f.Added)), red(fmt.Sprintf("-%-4d", f.Deleted)))
+}
+
+// formatAttribution renders one range's authorship as a single colored token:
+// "human" in blue for human-typed/pasted lines, or "<tool> · <model> ·
+// <gen_type>" in green for AI-attributed lines (model/gen_type dimmed, omitted
+// when unknown). Deletions (no AuthorType) render as a dim "—".
+func formatAttribution(l gitnotes.RangeEntry) string {
+	switch {
+	case l.Tool != "":
+		s := green(l.Tool)
+		var extra []string
+		if l.Model != nil && *l.Model != "" {
+			extra = append(extra, *l.Model)
+		}
+		if l.GenType != nil && *l.GenType != "" {
+			extra = append(extra, *l.GenType)
+		}
+		if len(extra) > 0 {
+			s += dim(" · " + strings.Join(extra, " · "))
+		}
+		return s
+	case l.AuthorType != "":
+		return blue("human")
+	default:
+		return dim("—")
+	}
+}
+
+// formatModels renders the commit's per-model line-count rollup, busiest
+// model first: "claude-opus-4-7 (320 lines)  ·  gpt-5.5 (48 lines)".
+func formatModels(models map[string]int) string {
+	type entry struct {
+		name  string
+		count int
+	}
+	entries := make([]entry, 0, len(models))
+	for name, count := range models {
+		entries = append(entries, entry{name, count})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].count != entries[j].count {
+			return entries[i].count > entries[j].count
+		}
+		return entries[i].name < entries[j].name
+	})
+	parts := make([]string, len(entries))
+	for i, e := range entries {
+		parts[i] = e.name + "  " + dim(fmt.Sprintf("(%d lines)", e.count))
+	}
+	return strings.Join(parts, "  ·  ")
 }
 
 // printConversation renders the user/assistant conversation in a clean,

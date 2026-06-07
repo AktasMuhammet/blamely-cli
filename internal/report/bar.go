@@ -10,12 +10,34 @@ import (
 )
 
 const (
-	ansiReset = "\x1b[0m"
-	ansiGreen = "\x1b[32m"
-	ansiBlue  = "\x1b[34m"
-	ansiDim   = "\x1b[2m"
-	ansiBold  = "\x1b[1m"
+	ansiReset   = "\x1b[0m"
+	ansiGreen   = "\x1b[32m"
+	ansiBlue    = "\x1b[34m"
+	ansiRed     = "\x1b[31m"
+	ansiCyan    = "\x1b[36m"
+	ansiMagenta = "\x1b[35m"
+	ansiDim     = "\x1b[2m"
+	ansiBold    = "\x1b[1m"
 )
+
+// style wraps s in the given ANSI code (and a reset) when color is enabled,
+// or returns it unchanged otherwise. The shared formatting primitive behind
+// bold/dim/green/etc — every report view (bar, stats, commit detail) renders
+// through these so the "modern, clean, premium" look stays consistent.
+func style(code, s string) string {
+	if !colorEnabled() {
+		return s
+	}
+	return code + s + ansiReset
+}
+
+func bold(s string) string    { return style(ansiBold, s) }
+func dim(s string) string     { return style(ansiDim, s) }
+func green(s string) string   { return style(ansiGreen, s) }
+func blue(s string) string    { return style(ansiBlue, s) }
+func red(s string) string     { return style(ansiRed, s) }
+func cyan(s string) string    { return style(ansiCyan, s) }
+func magenta(s string) string { return style(ansiMagenta, s) }
 
 // RenderBar writes a commit attribution summary to w. Layout (color mode):
 //
@@ -182,8 +204,8 @@ func RenderBar(w io.Writer, note *gitnotes.Note, width int) {
 	}
 	genRows := []genRow{
 		{"chat      ", g.Chat, ansiGreen},
-		{"cli       ", g.CLI, "\x1b[36m"},       // cyan
-		{"completion", g.Completion, "\x1b[35m"}, // magenta
+		{"cli       ", g.CLI, ansiCyan},
+		{"completion", g.Completion, ansiMagenta},
 		{"human     ", g.Human, ansiBlue},
 	}
 	for _, r := range genRows {

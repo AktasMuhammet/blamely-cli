@@ -79,6 +79,10 @@ func cmdDaemon() *cobra.Command {
 				&tools.CopilotWatcher{},
 				&tools.CopilotChatWatcher{},
 				&tools.CopilotLogWatcher{},
+				// Antigravity IDE's bundled Gemini agent: no CLI hook fires
+				// (it never goes through Gemini CLI's BeforeTool/AfterTool
+				// framework), so this tails the agent's own transcript logs.
+				&tools.AntigravityGeminiWatcher{},
 			}
 			return daemon.Run(cmd.Context())
 		},

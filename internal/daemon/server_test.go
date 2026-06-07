@@ -417,6 +417,27 @@ func TestDBSink_Record_PreservesExplicitTimestamp(t *testing.T) {
 	}
 }
 
+func TestDBSink_Record_SkipsEmptyRepoPath(t *testing.T) {
+	// A blank repo_path means the watcher couldn't resolve the file to a git
+	// repo — such rows can never surface in `blamely report`, so Record
+	// should silently drop them rather than writing an orphaned edit.
+	db := openTestDB(t)
+	s := &dbSink{db: db}
+	ev := Event{
+		Tool:     "codex",
+		RepoPath: "",
+		FilePath: "f.go",
+		Lines:    []LineRange{{Start: 1, End: 1}},
+	}
+	if err := s.Record(ev); err != nil {
+		t.Fatal(err)
+	}
+	edits, _ := db.EditsForFileSince("", "f.go", 0)
+	if len(edits) != 0 {
+		t.Fatalf("expected no edits stored for empty repo_path, got %d: %+v", len(edits), edits)
+	}
+}
+
 func TestDBSink_Record_RejectsUnknownTool(t *testing.T) {
 	s := &dbSink{db: openTestDB(t)}
 	err := s.Record(Event{Tool: "windsurf", RepoPath: "/r", FilePath: "f"})

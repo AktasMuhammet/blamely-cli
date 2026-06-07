@@ -263,7 +263,7 @@ func TestRenderStats_ContainsCommitHeader(t *testing.T) {
 	note := buildTestNote()
 	meta := commitMeta_{"sha": "deadbeef123456", "subject": "add feature", "author": "dev@test.com", "date": ""}
 	var buf strings.Builder
-	renderStats(&buf, note, meta, 0, false)
+	renderStats(&buf, note, meta, 0)
 	out := buf.String()
 	if !strings.Contains(out, "deadbeef1234") {
 		t.Errorf("output should contain short SHA, got:\n%s", out)
@@ -277,7 +277,7 @@ func TestRenderStats_ContainsChangesSection(t *testing.T) {
 	note := buildTestNote()
 	meta := commitMeta_{"sha": "abc", "subject": "test", "author": "", "date": ""}
 	var buf strings.Builder
-	renderStats(&buf, note, meta, 0, false)
+	renderStats(&buf, note, meta, 0)
 	out := buf.String()
 	if !strings.Contains(out, "Changes:") {
 		t.Errorf("output should contain Changes section:\n%s", out)
@@ -294,7 +294,7 @@ func TestRenderStats_ContainsAIAttribution(t *testing.T) {
 	note := buildTestNote()
 	meta := commitMeta_{"sha": "abc", "subject": "test", "author": "", "date": ""}
 	var buf strings.Builder
-	renderStats(&buf, note, meta, 0, false)
+	renderStats(&buf, note, meta, 0)
 	out := buf.String()
 	if !strings.Contains(out, "AI attribution:") {
 		t.Errorf("output should contain AI attribution section:\n%s", out)
@@ -311,7 +311,7 @@ func TestRenderStats_ContainsGenerationSection(t *testing.T) {
 	note := buildTestNote()
 	meta := commitMeta_{"sha": "abc", "subject": "test", "author": "", "date": ""}
 	var buf strings.Builder
-	renderStats(&buf, note, meta, 0, false)
+	renderStats(&buf, note, meta, 0)
 	out := buf.String()
 	if !strings.Contains(out, "Generation:") {
 		t.Errorf("output should contain Generation section:\n%s", out)
@@ -325,7 +325,7 @@ func TestRenderStats_ContainsFilesSection(t *testing.T) {
 	note := buildTestNote()
 	meta := commitMeta_{"sha": "abc", "subject": "test", "author": "", "date": ""}
 	var buf strings.Builder
-	renderStats(&buf, note, meta, 0, false)
+	renderStats(&buf, note, meta, 0)
 	out := buf.String()
 	if !strings.Contains(out, "Files:") {
 		t.Errorf("output should contain Files section:\n%s", out)
@@ -339,7 +339,7 @@ func TestRenderStats_ContainsTokensSection(t *testing.T) {
 	note := buildTestNote()
 	meta := commitMeta_{"sha": "abc", "subject": "test", "author": "", "date": ""}
 	var buf strings.Builder
-	renderStats(&buf, note, meta, 0, false)
+	renderStats(&buf, note, meta, 0)
 	out := buf.String()
 	if !strings.Contains(out, "Tokens:") {
 		t.Errorf("output should contain Tokens section:\n%s", out)
@@ -354,7 +354,7 @@ func TestRenderStats_CodingTime(t *testing.T) {
 	meta := commitMeta_{"sha": "abc", "subject": "test", "author": "", "date": ""}
 	var buf strings.Builder
 	sessionNanos := int64(45 * 60 * 1e9) // 45 minutes
-	renderStats(&buf, note, meta, sessionNanos, false)
+	renderStats(&buf, note, meta, sessionNanos)
 	out := buf.String()
 	if !strings.Contains(out, "Coding time:") {
 		t.Errorf("output should contain Coding time section:\n%s", out)
@@ -369,7 +369,7 @@ func TestRenderStats_NoTokensSection_WhenNil(t *testing.T) {
 	note.Totals.Tokens = nil
 	meta := commitMeta_{"sha": "abc", "subject": "test", "author": "", "date": ""}
 	var buf strings.Builder
-	renderStats(&buf, note, meta, 0, false)
+	renderStats(&buf, note, meta, 0)
 	out := buf.String()
 	if strings.Contains(out, "Tokens:") {
 		t.Errorf("Tokens section should be omitted when nil:\n%s", out)
@@ -380,7 +380,7 @@ func TestRenderStats_AuthorLine(t *testing.T) {
 	note := buildTestNote()
 	meta := commitMeta_{"sha": "abc", "subject": "test", "author": "dev@example.com", "date": ""}
 	var buf strings.Builder
-	renderStats(&buf, note, meta, 0, false)
+	renderStats(&buf, note, meta, 0)
 	out := buf.String()
 	if !strings.Contains(out, "dev@example.com") {
 		t.Errorf("output should contain author:\n%s", out)

@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -74,6 +76,50 @@ func LineRangeForWholeFile(filePath string) (*LineRange, error) {
 func sha256Hex(b []byte) string {
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
+}
+
+// unifiedDiffHunkHeaderRe matches a unified-diff hunk header and captures the
+// new file's starting line number, e.g. "@@ -135,6 +135,16 @@" -> "135".
+var unifiedDiffHunkHeaderRe = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@`)
+
+// UnifiedDiffAddedRanges walks a unified diff body and returns one per-line
+// LineRange (with its content's SHA) for every `+` line, anchored at its true
+// post-patch line number — derived by tracking each hunk's starting line and
+// advancing through context (` `) and added (`+`) lines (removed `-` lines
+// don't exist in the new file, so they don't advance the counter). suggested
+// is the count of added lines, i.e. len(ranges).
+//
+// Only `+` lines are attributed — context and removed lines carry no new
+// AI-written content. Per-line ranges (vs. one coarse span) are what let
+// attribution survive later edits: each line is re-located by its content
+// hash rather than by position.
+func UnifiedDiffAddedRanges(diff string) (ranges []LineRange, suggested int64) {
+	newLine := 0
+	for _, raw := range strings.Split(diff, "\n") {
+		if hm := unifiedDiffHunkHeaderRe.FindStringSubmatch(raw); hm != nil {
+			if n, err := strconv.Atoi(hm[1]); err == nil {
+				newLine = n
+			}
+			continue
+		}
+		if newLine == 0 {
+			continue // narrative text before the first hunk header
+		}
+		switch {
+		case strings.HasPrefix(raw, "+"):
+			ranges = append(ranges, LineRange{
+				Start: newLine, End: newLine,
+				ContentSHA: sha256Hex([]byte(strings.TrimRight(raw[1:], "\r"))),
+			})
+			suggested++
+			newLine++
+		case strings.HasPrefix(raw, "-"):
+			// removed from the old file — doesn't advance the new-file counter
+		default:
+			newLine++ // context line (unified diff prefixes these with a space)
+		}
+	}
+	return ranges, suggested
 }
 
 // narrowToChangedLines diffs oldStr against newStr, finds the line ranges

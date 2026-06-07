@@ -296,7 +296,8 @@ func DebugGeminiLogs(ctx context.Context, out io.Writer) error {
 	fmt.Fprintln(out, "daemon's /edit endpoint — there is no passive log file to tail, so this")
 	fmt.Fprintln(out, "traces the database directly: every new tool=gemini row is printed the")
 	fmt.Fprintln(out, "moment it's recorded. Trigger an edit in Gemini CLI now and watch for it")
-	fmt.Fprintln(out, "below. Nothing is written to the database by this command. Ctrl-C to stop.\n")
+	fmt.Fprintln(out, "below. Nothing is written to the database by this command. Ctrl-C to stop.")
+	fmt.Fprintln(out)
 	fmt.Fprintln(out, "If nothing appears after you edit a file via Gemini, check:")
 	fmt.Fprintln(out, "  1. ~/.gemini/settings.json has tools.enableHooks=true and an")
 	fmt.Fprintln(out, "     AfterTool/BeforeTool hook running `blamely record gemini` (run")
@@ -305,7 +306,8 @@ func DebugGeminiLogs(ctx context.Context, out io.Writer) error {
 	fmt.Fprintln(out, "  3. `echo '<hook payload>' | blamely record gemini` prints no error.")
 	fmt.Fprintln(out, "     A rejection (e.g. \"daemon rejected: 400 ...\") prints directly to")
 	fmt.Fprintln(out, "     this command's own output — the daemon does NOT log rejected or")
-	fmt.Fprintln(out, "     malformed POSTs to ~/.blamely/daemon.log, so check here first.\n")
+	fmt.Fprintln(out, "     malformed POSTs to ~/.blamely/daemon.log, so check here first.")
+	fmt.Fprintln(out)
 
 	tailToolEdits(ctx, out, store.ToolGemini, "gemini_hook")
 	return nil

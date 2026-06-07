@@ -69,6 +69,13 @@ type dbSink struct {
 }
 
 func (s *dbSink) Record(ev Event) error {
+	// A blank repo_path means the watcher couldn't resolve the file to a git
+	// repo (e.g. edits outside any worktree, or gitutil lookups that failed
+	// silently). Such rows can never be matched to a project in `blamely
+	// report`, so skip them rather than polluting the store with orphans.
+	if ev.RepoPath == "" {
+		return nil
+	}
 	tool := store.Tool(ev.Tool)
 	gt := store.GenType(ev.GenType)
 	if gt == "" {
@@ -82,7 +89,7 @@ func (s *dbSink) Record(ev Event) error {
 	}
 	switch tool {
 	case "",
-		store.ToolClaude, store.ToolCursor, store.ToolCodex, store.ToolCopilot, store.ToolCopyPaste,
+		store.ToolClaude, store.ToolCursor, store.ToolCodex, store.ToolCopilot, store.ToolGemini, store.ToolCopyPaste,
 		store.ToolHuman: // accepted for legacy in-flight events; new emissions should use ""
 	default:
 		return fmt.Errorf("watcher sink: unknown tool %q", ev.Tool)

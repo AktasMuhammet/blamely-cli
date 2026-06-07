@@ -3,6 +3,7 @@ package tools
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -279,6 +280,156 @@ func TestProcessCodexLine_MessageUsageShape(t *testing.T) {
 	}
 }
 
+// ---- wrapped session-line format (current Codex CLI / codex_vscode) ----
+//
+// Newer Codex CLI releases (observed at cli_version 0.137.x) wrap every
+// session line as {"timestamp","type":"event_msg"|"turn_context"|...,
+// "payload":{...}} instead of the old flat {"type","model"/"name", ...}
+// shape `codexLine` was built for. processCodexLine must recognize both.
+
+func gitInitRepo(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+	for _, args := range [][]string{{"init", "-q"}, {"config", "user.email", "t@l"}, {"config", "user.name", "T"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if err := cmd.Run(); err != nil {
+			t.Skipf("git not available: %v", err)
+		}
+	}
+	return repo
+}
+
+func mustMarshalWrapped(t *testing.T, typ string, payload map[string]any) []byte {
+	t.Helper()
+	p, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(map[string]any{
+		"timestamp": "2026-06-08T00:00:00Z",
+		"type":      typ,
+		"payload":   json.RawMessage(p),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestProcessCodexLine_WrappedFormat_AddFileWholeFile(t *testing.T) {
+	repo := gitInitRepo(t)
+	content := "line one\nline two\nline three\n"
+	target := filepath.Join(repo, "new.go")
+	if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sink := &mockSink{}
+	st := &codexState{sink: sink}
+
+	processCodexLine(mustMarshalWrapped(t, "turn_context", map[string]any{"model": "gpt-5.5"}), st)
+
+	patchEnd := mustMarshalWrapped(t, "event_msg", map[string]any{
+		"type":    "patch_apply_end",
+		"success": true,
+		"changes": map[string]any{
+			target: map[string]any{"type": "add", "content": content},
+		},
+	})
+	processCodexLine(patchEnd, st)
+	if len(sink.events) != 0 {
+		t.Fatalf("patch_apply_end should buffer, not record immediately: got %d events", len(sink.events))
+	}
+
+	tokenCount := mustMarshalWrapped(t, "event_msg", map[string]any{
+		"type": "token_count",
+		"info": map[string]any{
+			"last_token_usage": map[string]any{"input_tokens": 1200, "cached_input_tokens": 900, "output_tokens": 80},
+		},
+	})
+	processCodexLine(tokenCount, st)
+
+	if len(sink.events) != 1 {
+		t.Fatalf("expected 1 event after token_count flush, got %d: %+v", len(sink.events), sink.events)
+	}
+	ev := sink.events[0]
+	if ev.Tool != "codex" || ev.GenType != "cli" || ev.Confidence != "high" {
+		t.Errorf("tool=%q gen_type=%q confidence=%q, want codex/cli/high", ev.Tool, ev.GenType, ev.Confidence)
+	}
+	if ev.Model != "gpt-5.5" {
+		t.Errorf("model = %q, want gpt-5.5", ev.Model)
+	}
+	if ev.FilePath != "new.go" {
+		t.Errorf("file_path = %q, want new.go", ev.FilePath)
+	}
+	if len(ev.Lines) != 1 || ev.Lines[0].Start != 1 || ev.Lines[0].End != 3 {
+		t.Errorf("lines = %+v, want whole-file range 1..3", ev.Lines)
+	}
+	if ev.SuggestedLines != 3 {
+		t.Errorf("suggested_lines = %d, want 3", ev.SuggestedLines)
+	}
+	if ev.InputTokens == nil || *ev.InputTokens != 1200 {
+		t.Errorf("input_tokens = %v, want 1200", ev.InputTokens)
+	}
+	if ev.CacheReadTokens == nil || *ev.CacheReadTokens != 900 {
+		t.Errorf("cache_read_tokens = %v, want 900", ev.CacheReadTokens)
+	}
+}
+
+func TestProcessCodexLine_WrappedFormat_UpdateFileUnifiedDiff(t *testing.T) {
+	repo := gitInitRepo(t)
+	target := filepath.Join(repo, "index.html")
+	finalContent := "<html>\n<head></head>\n<body>\n<!-- new line A -->\n<!-- new line B -->\n</body>\n</html>\n"
+	if err := os.WriteFile(target, []byte(finalContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sink := &mockSink{}
+	st := &codexState{sink: sink, model: "gpt-5.5"}
+
+	diff := "@@ -1,4 +1,6 @@\n <html>\n <head></head>\n <body>\n+<!-- new line A -->\n+<!-- new line B -->\n </body>\n </html>\n"
+	patchEnd := mustMarshalWrapped(t, "event_msg", map[string]any{
+		"type":    "patch_apply_end",
+		"success": true,
+		"changes": map[string]any{
+			target: map[string]any{"type": "update", "unified_diff": diff},
+		},
+	})
+	processCodexLine(patchEnd, st)
+	st.flush(0, 0, 0, 0, false) // simulate shutdown drain (mirrors TestProcessCodexLine_FlushWithoutTokensOnShutdown)
+
+	if len(sink.events) != 1 {
+		t.Fatalf("expected 1 event, got %d: %+v", len(sink.events), sink.events)
+	}
+	ev := sink.events[0]
+	if ev.FilePath != "index.html" {
+		t.Errorf("file_path = %q, want index.html", ev.FilePath)
+	}
+	if len(ev.Lines) != 2 || ev.Lines[0].Start != 4 || ev.Lines[1].Start != 5 {
+		t.Errorf("lines = %+v, want ranges anchored at 4 and 5", ev.Lines)
+	}
+	if ev.SuggestedLines != 2 {
+		t.Errorf("suggested_lines = %d, want 2", ev.SuggestedLines)
+	}
+}
+
+func TestProcessCodexLine_WrappedFormat_FailedPatchIgnored(t *testing.T) {
+	sink := &mockSink{}
+	st := &codexState{sink: sink}
+	patchEnd := mustMarshalWrapped(t, "event_msg", map[string]any{
+		"type":    "patch_apply_end",
+		"success": false,
+		"changes": map[string]any{
+			"/repo/x.go": map[string]any{"type": "update", "unified_diff": "@@ -1 +1 @@\n-old\n+new\n"},
+		},
+	})
+	processCodexLine(patchEnd, st)
+	if len(st.pending) != 0 {
+		t.Errorf("failed patch_apply_end should not be buffered, got %d pending", len(st.pending))
+	}
+}
+
 // ---- parseCodexTimestamp ----
 
 func TestParseCodexTimestamp_RFC3339(t *testing.T) {
@@ -319,4 +470,36 @@ func mustMarshalFuncCall(name, patch string) []byte {
 		"arguments": json.RawMessage(patchJSON),
 	})
 	return b
+}
+
+// ---- findCodexSessionFiles tests ----
+
+func TestFindCodexSessionFiles_RecursesDatePartitionedDirs(t *testing.T) {
+	dir := t.TempDir()
+	nested := filepath.Join(dir, "2026", "06", "08")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(nested, "rollout-2026-06-08T00-14-45-abc.jsonl")
+	if err := os.WriteFile(want, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Non-jsonl files anywhere in the tree must be ignored.
+	if err := os.WriteFile(filepath.Join(nested, "notes.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".DS_Store"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := findCodexSessionFiles(dir)
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("findCodexSessionFiles = %v, want [%s]", got, want)
+	}
+}
+
+func TestFindCodexSessionFiles_MissingDir(t *testing.T) {
+	if got := findCodexSessionFiles(filepath.Join(t.TempDir(), "does-not-exist")); len(got) != 0 {
+		t.Fatalf("findCodexSessionFiles on missing dir = %v, want empty", got)
+	}
 }
