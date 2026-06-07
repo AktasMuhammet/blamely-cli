@@ -1,0 +1,324 @@
+package install
+
+import (
+	"archive/zip"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+
+	"github.com/blamely/blamely/internal/config"
+)
+
+// blamelyJetBrainsPluginID is the numeric JetBrains Marketplace id for Blamely
+// (xmlId "ai.blamely"): https://plugins.jetbrains.com/plugin/31746-blamely
+const blamelyJetBrainsPluginID = 31746
+
+// blamelyJetBrainsDirGlob matches the plugin's installed directory name across
+// versions. JetBrains plugin distribution zips contain a single top-level
+// directory named after the Gradle project ("Blamely-intellij[-suffix]"),
+// which lands directly under <configDir>/plugins/ once unzipped — this glob
+// is how we recognise "already installed" and what `uninstall` removes.
+const blamelyJetBrainsDirGlob = "Blamely-intellij*"
+
+// jetbrainsIDELabels is the set of JetBrains product names we offer the
+// Blamely plugin to, matched against each detected IDE's product-info.json
+// "name" field. Mirrors the plugin's listed compatibleVersions
+// (IDEA/WEBSTORM/DATASPELL/PYCHARM/…either Ultimate or Community editions).
+var jetbrainsIDELabels = map[string]bool{
+	"IntelliJ IDEA":           true,
+	"IntelliJ IDEA Community": true,
+	"WebStorm":                true,
+	"DataGrip":                true,
+	"PyCharm":                 true,
+	"PyCharm Community":       true,
+	"PhpStorm":                true,
+	"GoLand":                  true,
+	"CLion":                   true,
+	"RubyMine":                true,
+	"Rider":                   true,
+	"DataSpell":               true,
+}
+
+// jetbrainsIDE is one detected JetBrains IDE installation: enough to compute
+// its plugin directory and ask the marketplace for a build-compatible update.
+type jetbrainsIDE struct {
+	Label       string // display name, e.g. "IntelliJ IDEA"
+	BuildNumber string // e.g. "IU-261.22158.277" — the marketplace compatibility query key
+	PluginsDir  string // ~/Library/Application Support/JetBrains/<dataDir>/plugins
+}
+
+// productInfo is the subset of <App>.app/Contents/Resources/product-info.json
+// we need. It's the same file the IDE itself reads to find its per-version
+// config/plugins directory and build number — reading it directly means we
+// don't have to guess from directory-naming conventions that shift release to
+// release (IntelliJIdea2026.1 vs IU2026.1, seen side-by-side on this machine).
+type productInfo struct {
+	Name              string `json:"name"`
+	ProductCode       string `json:"productCode"`
+	DataDirectoryName string `json:"dataDirectoryName"`
+	BuildNumber       string `json:"buildNumber"`
+}
+
+// JetBrainsPluginResult is one row of the install log's "Editors" group: the
+// outcome of trying to get the Blamely plugin into a single JetBrains IDE.
+type JetBrainsPluginResult struct {
+	Label      string
+	PluginsDir string
+	Installed  bool // true only when THIS run installed the plugin (drives uninstall tracking)
+	Err        error
+}
+
+// InstallJetBrainsPlugins drives the marketplace install for every detected
+// JetBrains IDE: download a build-compatible plugin zip from the JetBrains
+// Marketplace API and unzip it into the IDE's plugins directory — the same
+// artifact "Install Plugin from Disk" consumes, just fetched headlessly.
+//
+// This is the fallback path, not a CLI install: JetBrains IDEs are
+// single-instance, so a headless `idea installPlugins <id>` would just be
+// silently forwarded to an already-running instance and do nothing useful —
+// the marketplace download is the only mechanism that works regardless of
+// whether the IDE is currently open.
+func InstallJetBrainsPlugins() []JetBrainsPluginResult {
+	ides, err := findJetBrainsIDEs()
+	if err != nil || len(ides) == 0 {
+		return nil
+	}
+
+	// The plugin zip is identical for every IDE whose build falls in the same
+	// compatibility window (true for the 2025.x/2026.x line today), so we
+	// cache the last-downloaded file and only re-fetch when the marketplace
+	// hands back a different build for a given IDE.
+	var cachedFile, cachedZipPath string
+	defer func() {
+		if cachedZipPath != "" {
+			_ = os.Remove(cachedZipPath)
+		}
+	}()
+
+	results := make([]JetBrainsPluginResult, 0, len(ides))
+	for _, ide := range ides {
+		if !jetbrainsIDELabels[ide.Label] {
+			continue
+		}
+		r := JetBrainsPluginResult{Label: ide.Label, PluginsDir: ide.PluginsDir}
+		if hasJetBrainsPlugin(ide.PluginsDir) {
+			results = append(results, r)
+			continue
+		}
+
+		file, ferr := compatiblePluginFile(ide.BuildNumber)
+		if ferr != nil {
+			r.Err = ferr
+			results = append(results, r)
+			continue
+		}
+		if cachedZipPath == "" || cachedFile != file {
+			if cachedZipPath != "" {
+				_ = os.Remove(cachedZipPath)
+				cachedZipPath = ""
+			}
+			zipPath, derr := downloadPluginZip(file)
+			if derr != nil {
+				r.Err = derr
+				results = append(results, r)
+				continue
+			}
+			cachedFile, cachedZipPath = file, zipPath
+		}
+		if eerr := extractPluginZip(cachedZipPath, ide.PluginsDir); eerr != nil {
+			r.Err = eerr
+		} else {
+			r.Installed = true
+		}
+		results = append(results, r)
+	}
+	return results
+}
+
+// UninstallJetBrainsPlugins removes the Blamely plugin directory from every
+// plugins directory in `pluginsDirs` — the set this tool installed into.
+// Mirrors UninstallEditorExtensions: only ever removes what WE installed,
+// never a plugin the user (or an IDE's own marketplace browser) added.
+func UninstallJetBrainsPlugins(pluginsDirs []string) error {
+	var firstErr error
+	for _, dir := range pluginsDirs {
+		matches, _ := filepath.Glob(filepath.Join(dir, blamelyJetBrainsDirGlob))
+		for _, m := range matches {
+			if err := os.RemoveAll(m); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
+func hasJetBrainsPlugin(pluginsDir string) bool {
+	matches, _ := filepath.Glob(filepath.Join(pluginsDir, blamelyJetBrainsDirGlob))
+	return len(matches) > 0
+}
+
+// findJetBrainsIDEs scans the usual macOS app locations for JetBrains IDEs by
+// reading their bundled product-info.json. Toolbox-managed and manually
+// installed IDEs both end up under /Applications or ~/Applications as plain
+// .app bundles (confirmed: IntelliJ IDEA + WebStorm under ~/Applications,
+// DataGrip under /Applications — all Toolbox-managed on this machine).
+func findJetBrainsIDEs() ([]jetbrainsIDE, error) {
+	if runtime.GOOS != "darwin" {
+		return nil, nil // TODO: Linux (~/.local/share/JetBrains) / Windows (%APPDATA%\JetBrains)
+	}
+	home, err := config.Home()
+	if err != nil {
+		return nil, err
+	}
+
+	var apps []string
+	for _, base := range []string{"/Applications", filepath.Join(home, "Applications")} {
+		matches, _ := filepath.Glob(filepath.Join(base, "*.app"))
+		apps = append(apps, matches...)
+	}
+
+	var ides []jetbrainsIDE
+	seen := map[string]bool{}
+	for _, app := range apps {
+		data, err := os.ReadFile(filepath.Join(app, "Contents", "Resources", "product-info.json"))
+		if err != nil {
+			continue
+		}
+		var pi productInfo
+		if err := json.Unmarshal(data, &pi); err != nil ||
+			pi.DataDirectoryName == "" || pi.BuildNumber == "" || pi.ProductCode == "" {
+			continue
+		}
+		configDir := filepath.Join(home, "Library", "Application Support", "JetBrains", pi.DataDirectoryName)
+		if !dirExists(configDir) || seen[configDir] {
+			continue // not a real per-user JetBrains config layout, or a duplicate bundle
+		}
+		seen[configDir] = true
+		ides = append(ides, jetbrainsIDE{
+			Label:       pi.Name,
+			BuildNumber: pi.ProductCode + "-" + pi.BuildNumber,
+			PluginsDir:  filepath.Join(configDir, "plugins"),
+		})
+	}
+	return ides, nil
+}
+
+// marketplaceUpdate is the subset of the JetBrains Marketplace "updates" API
+// response we need: https://plugins.jetbrains.com/api/plugins/<id>/updates?build=<build>
+type marketplaceUpdate struct {
+	Version string `json:"version"`
+	File    string `json:"file"` // relative path, e.g. "31746/1046753/Blamely-intellij-1.0.0.zip"
+}
+
+// compatiblePluginFile asks the marketplace for an update of the Blamely
+// plugin compatible with the given IDE build (e.g. "IU-261.22158.277"),
+// returning the relative file path used to build the download URL. The API
+// returns updates newest-first; the first entry is what the IDE's own plugin
+// browser would offer.
+func compatiblePluginFile(buildNumber string) (string, error) {
+	url := fmt.Sprintf("https://plugins.jetbrains.com/api/plugins/%d/updates?build=%s",
+		blamelyJetBrainsPluginID, buildNumber)
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("query marketplace: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("marketplace returned %s", resp.Status)
+	}
+	var updates []marketplaceUpdate
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&updates); err != nil {
+		return "", fmt.Errorf("decode marketplace response: %w", err)
+	}
+	for _, u := range updates {
+		if u.File != "" {
+			return u.File, nil
+		}
+	}
+	return "", fmt.Errorf("no plugin build compatible with %s", buildNumber)
+}
+
+// downloadPluginZip fetches the plugin distribution zip into a temp file and
+// returns its path; the caller removes it once every IDE has been processed.
+// plugins.jetbrains.com/files/ 301-redirects to its CDN — http.Client follows
+// redirects by default, so a plain GET is enough.
+func downloadPluginZip(file string) (string, error) {
+	client := &http.Client{Timeout: 2 * time.Minute}
+	resp, err := client.Get("https://plugins.jetbrains.com/files/" + file)
+	if err != nil {
+		return "", fmt.Errorf("download plugin: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("download returned %s", resp.Status)
+	}
+
+	tmp, err := os.CreateTemp("", "blamely-jetbrains-plugin-*.zip")
+	if err != nil {
+		return "", err
+	}
+	defer tmp.Close()
+	if _, err := io.Copy(tmp, io.LimitReader(resp.Body, 200<<20)); err != nil {
+		_ = os.Remove(tmp.Name())
+		return "", fmt.Errorf("save plugin zip: %w", err)
+	}
+	return tmp.Name(), nil
+}
+
+// extractPluginZip unpacks the plugin distribution zip directly into
+// pluginsDir, preserving the archive's internal layout. JetBrains plugin zips
+// contain a single top-level directory (e.g. "Blamely-intellij/") that becomes
+// the installed plugin's directory once it sits alongside the IDE's others.
+func extractPluginZip(zipPath, pluginsDir string) error {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return fmt.Errorf("open plugin zip: %w", err)
+	}
+	defer r.Close()
+
+	if err := os.MkdirAll(pluginsDir, 0o755); err != nil {
+		return err
+	}
+	cleanRoot := filepath.Clean(pluginsDir) + string(os.PathSeparator)
+	for _, f := range r.File {
+		dest := filepath.Join(pluginsDir, f.Name)
+		if !strings.HasPrefix(dest, cleanRoot) {
+			return fmt.Errorf("plugin zip entry escapes destination: %q", f.Name)
+		}
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(dest, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+			return err
+		}
+		if err := writeZipEntry(f, dest); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeZipEntry(f *zip.File, dest string) error {
+	rc, err := f.Open()
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	out, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, rc)
+	return err
+}
