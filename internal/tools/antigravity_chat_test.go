@@ -174,8 +174,9 @@ func TestAntigravityGeminiWatcher_CreateEmitsWholeFileChatEdit(t *testing.T) {
 }
 
 func TestConversationDBPath(t *testing.T) {
-	transcript := "/Users/me/.gemini/antigravity-ide/brain/447f1fc3-conv/.system_generated/logs/transcript.jsonl"
-	want := "/Users/me/.gemini/antigravity-ide/conversations/447f1fc3-conv.db"
+	ideRoot := filepath.Join(filepath.FromSlash("/Users/me"), ".gemini", "antigravity-ide")
+	transcript := filepath.Join(ideRoot, "brain", "447f1fc3-conv", ".system_generated", "logs", "transcript.jsonl")
+	want := filepath.Join(ideRoot, "conversations", "447f1fc3-conv.db")
 	if got := conversationDBPath(transcript); got != want {
 		t.Fatalf("conversationDBPath = %q, want %q", got, want)
 	}
