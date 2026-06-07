@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/blamely/blamely/internal/config"
@@ -40,7 +41,7 @@ func Run() error {
 	}
 
 	printDetected(detected)
-	fmt.Printf("  binary stable path: %s\n\n", binPath)
+	info("Binary", binPath)
 
 	s, err := LoadState()
 	if err != nil {
@@ -52,20 +53,26 @@ func Run() error {
 	s.InstalledAt = time.Now()
 	s.BinaryPath = binPath
 
-	// 1. AI tool hooks (only for tools that are actually detected).
+	// Hooks: a `blamely record <tool>` hook merged into each detected AI
+	// tool's own settings/config file, plus the global git post-commit hook
+	// that turns recorded edits into per-commit attribution notes. Grouped
+	// together because they're the same mechanism (config-file merge) and the
+	// same thing a user would look for when checking "is blamely wired up?".
+	section("Hooks")
+
 	if detected.Claude.Present {
 		added, settingsPath, err := InstallClaudeHook(binPath)
 		if err != nil {
 			return fmt.Errorf("claude hook: %w", err)
 		}
 		if added {
-			fmt.Printf("  ✓ Claude hook installed at %s\n", settingsPath)
+			ok("Claude Code", settingsPath)
 		} else {
-			fmt.Printf("  • Claude hook already present at %s\n", settingsPath)
+			info("Claude Code", "hook already present · "+settingsPath)
 		}
 		s.ClaudeHookAdded = true
 	} else {
-		fmt.Println("  • Claude Code not detected — skipping settings.json hook")
+		info("Claude Code", "not detected — skipped")
 	}
 
 	if detected.Cursor.Present {
@@ -74,13 +81,13 @@ func Run() error {
 			return fmt.Errorf("cursor hook: %w", err)
 		}
 		if added {
-			fmt.Printf("  ✓ Cursor hook installed at %s\n", hooksPath)
+			ok("Cursor", hooksPath)
 		} else {
-			fmt.Printf("  • Cursor hook already present at %s\n", hooksPath)
+			info("Cursor", "hook already present · "+hooksPath)
 		}
 		s.CursorHookAdded = true
 	} else {
-		fmt.Println("  • Cursor not detected — skipping hooks.json hook")
+		info("Cursor", "not detected — skipped")
 	}
 
 	if detected.Codex.Present {
@@ -89,13 +96,13 @@ func Run() error {
 			return fmt.Errorf("codex hook: %w", err)
 		}
 		if added {
-			fmt.Printf("  ✓ Codex hook installed at %s\n", configPath)
+			ok("Codex CLI", configPath)
 		} else {
-			fmt.Printf("  • Codex hook already present at %s\n", configPath)
+			info("Codex CLI", "hook already present · "+configPath)
 		}
 		s.CodexHookAdded = true
 	} else {
-		fmt.Println("  • Codex not detected — skipping config.toml hook")
+		info("Codex CLI", "not detected — skipped")
 	}
 
 	if detected.Copilot.Present {
@@ -104,13 +111,13 @@ func Run() error {
 			return fmt.Errorf("copilot hook: %w", err)
 		}
 		if added {
-			fmt.Printf("  ✓ Copilot hook installed at %s\n", hookPath)
+			ok("GitHub Copilot", hookPath)
 		} else {
-			fmt.Printf("  • Copilot hook already present at %s\n", hookPath)
+			info("GitHub Copilot", "hook already present · "+hookPath)
 		}
 		s.CopilotHookAdded = true
 	} else {
-		fmt.Println("  • Copilot not detected — skipping blamely.json hook")
+		info("GitHub Copilot", "not detected — skipped")
 	}
 
 	if detected.Gemini.Present {
@@ -119,16 +126,15 @@ func Run() error {
 			return fmt.Errorf("gemini hook: %w", err)
 		}
 		if added {
-			fmt.Printf("  ✓ Gemini hook installed at %s\n", settingsPath)
+			ok("Gemini CLI", settingsPath)
 		} else {
-			fmt.Printf("  • Gemini hook already present at %s\n", settingsPath)
+			info("Gemini CLI", "hook already present · "+settingsPath)
 		}
 		s.GeminiHookAdded = true
 	} else {
-		fmt.Println("  • Gemini CLI not detected — skipping settings.json hook")
+		info("Gemini CLI", "not detected — skipped")
 	}
 
-	// 2. Global git post-commit hook.
 	prior, hadPrior, err := InstallGitHook(binPath)
 	if err != nil {
 		return fmt.Errorf("git hook: %w", err)
@@ -137,15 +143,70 @@ func Run() error {
 	s.HadCoreHooksPath = hadPrior
 	s.GitHookInstalled = true
 	if hadPrior {
-		fmt.Printf("  ✓ Global git post-commit hook installed (previous core.hooksPath %q stashed)\n", prior)
+		ok("Git post-commit", fmt.Sprintf("global hook installed · previous core.hooksPath %q stashed", prior))
 	} else {
-		fmt.Println("  ✓ Global git post-commit hook installed (no previous core.hooksPath)")
+		ok("Git post-commit", "global hook installed")
 	}
 
-	// 3. Daemon agent. We invalidate any stale port file BEFORE registering
-	// the agent so the post-install health check can't false-positive on the
-	// previous daemon's port. Then we register/restart and wait for the new
-	// daemon to come up.
+	// Editors: marketplace-distributed extensions that give a VS Code-family
+	// editor its own attribution surface (chat-panel detection, inline UI, …),
+	// auto-installed via each editor's bundled CLI when the editor is present.
+	// Separate from Hooks because these come from an external marketplace
+	// (VS Code Marketplace / Open VSX) rather than a config-file merge.
+	section("Editors")
+
+	var editorLabelsInstalled []string
+	for _, r := range InstallEditorExtensions() {
+		switch {
+		case r.Err != nil:
+			fail(r.Label, r.Err.Error())
+		case r.CLIPath == "":
+			info(r.Label, "not detected — skipped")
+		case r.Installed:
+			ok(r.Label, "extension installed from marketplace · "+blamelyExtensionID)
+			editorLabelsInstalled = append(editorLabelsInstalled, r.Label)
+		default:
+			info(r.Label, "extension already installed · "+blamelyExtensionID)
+		}
+	}
+	s.EditorExtensionsInstalled = mergeLabels(s.EditorExtensionsInstalled, editorLabelsInstalled)
+
+	// JetBrains IDEs (IntelliJ IDEA, WebStorm, GoLand, …) don't expose a CLI
+	// extension-install flow the way Code-OSS forks do, so we go straight to
+	// the JetBrains Marketplace: download a build-compatible plugin zip and
+	// unzip it into the IDE's plugins directory.
+	jetResults := InstallJetBrainsPlugins()
+	if len(jetResults) == 0 {
+		info("JetBrains IDEs", "not detected — skipped")
+	} else {
+		var jetbrainsRestartNeeded bool
+		var jetbrainsDirsInstalled []string
+		for _, r := range jetResults {
+			switch {
+			case r.Err != nil:
+				fail(r.Label, r.Err.Error())
+			case r.Installed:
+				ok(r.Label, "plugin installed from marketplace · ai.blamely")
+				jetbrainsDirsInstalled = append(jetbrainsDirsInstalled, r.PluginsDir)
+				jetbrainsRestartNeeded = true
+			default:
+				info(r.Label, "plugin already installed · ai.blamely")
+			}
+		}
+		s.JetBrainsPluginsInstalled = mergeLabels(s.JetBrainsPluginsInstalled, jetbrainsDirsInstalled)
+		if jetbrainsRestartNeeded {
+			info("JetBrains IDEs", "restart to load the newly installed plugin")
+		}
+	}
+
+	// System: the background daemon that receives hook events, the shell PATH
+	// entry, and the default config/exclude files that shape what attribution
+	// looks like. The plumbing that makes the above two groups actually work.
+	section("System")
+
+	// We invalidate any stale port file BEFORE registering the agent so the
+	// post-install health check can't false-positive on the previous daemon's
+	// port. Then we register/restart and wait for the new daemon to come up.
 	if portPath, perr := config.PortFile(); perr == nil {
 		_ = os.Remove(portPath)
 	}
@@ -154,52 +215,49 @@ func Run() error {
 		return fmt.Errorf("daemon agent: %w", err)
 	}
 	s.LaunchAgentInstalled = true
-	fmt.Printf("  ✓ Daemon agent installed (%s)\n", agentRef)
+	ok("Daemon agent", agentRef)
 
 	// Block until the daemon actually answers /health, so the user knows
 	// hooks are being listened to before this command exits.
 	if port, derr := daemon.WaitForReady(8 * time.Second); derr != nil {
 		diagnoseDaemon(derr, agentRef)
 	} else {
-		fmt.Printf("  ✓ Daemon listening on 127.0.0.1:%d (ready to receive hooks)\n", port)
+		ok("Daemon", fmt.Sprintf("listening on 127.0.0.1:%d · ready to receive hooks", port))
 	}
 
-	// 4. PATH entry in the user's shell rc so `blamely` is on PATH after
-	// they reload their shell. Best-effort — if shell detection fails or the
-	// rc isn't writable, we print a manual hint instead of failing the
-	// install (the binary is still on disk and the daemon is still wired up).
+	// Best-effort — if shell detection fails or the rc isn't writable, we
+	// print a manual hint instead of failing the install (the binary is still
+	// on disk and the daemon is still wired up).
 	if rcPath, added, perr := InstallPathEntry(); perr != nil {
-		fmt.Printf("  • Could not auto-add ~/.blamely/bin to PATH: %v\n", perr)
+		fail("PATH", fmt.Sprintf("could not auto-add ~/.blamely/bin: %v", perr))
 	} else {
 		s.PathRcFile = rcPath
 		if added {
 			s.PathEntryAdded = true
-			fmt.Printf("  ✓ PATH entry added to %s (reload your shell or run `source %s`)\n", rcPath, rcPath)
+			ok("PATH", fmt.Sprintf("added to %s · reload your shell or run `source %s`", rcPath, rcPath))
 		} else {
-			fmt.Printf("  • PATH entry already present in %s\n", rcPath)
+			info("PATH", "entry already present in "+rcPath)
 		}
 	}
 
-	// 5. Default exclude file. We never overwrite an existing one — users
-	// edit ~/.blamely/exclude to customise what's skipped from attribution,
-	// and a fresh install must keep their edits intact.
+	// Default exclude/config files. We never overwrite an existing one —
+	// users edit these to customise what's skipped from attribution and what
+	// each commit's git note includes, and a fresh install must keep their
+	// edits intact.
 	if excludePath, created, eerr := config.EnsureDefaultExcludeFile(); eerr != nil {
-		fmt.Printf("  • Could not write default exclude file: %v\n", eerr)
+		fail("Exclude list", eerr.Error())
 	} else if created {
-		fmt.Printf("  ✓ Default exclude list written to %s\n", excludePath)
+		ok("Exclude list", excludePath)
 	} else {
-		fmt.Printf("  • Exclude list already present at %s\n", excludePath)
+		info("Exclude list", "already present · "+excludePath)
 	}
 
-	// 5b. Default config file. Like the exclude list, we never overwrite an
-	// existing one — users edit ~/.blamely/config.json to choose what each
-	// commit's git note includes (file detail, conversation, tokens, …).
 	if configPath, created, cerr := config.EnsureDefaultConfigFile(); cerr != nil {
-		fmt.Printf("  • Could not write default config file: %v\n", cerr)
+		fail("Config", cerr.Error())
 	} else if created {
-		fmt.Printf("  ✓ Default config written to %s\n", configPath)
+		ok("Config", configPath)
 	} else {
-		fmt.Printf("  • Config already present at %s\n", configPath)
+		info("Config", "already present · "+configPath)
 	}
 
 	if err := SaveState(s); err != nil {
@@ -252,6 +310,14 @@ func Uninstall() error {
 		_, err := UninstallGeminiHook()
 		report("removed Gemini record hook from ~/.gemini/settings.json", err)
 	}
+	if len(s.EditorExtensionsInstalled) > 0 {
+		report(fmt.Sprintf("removed Blamely extension from %s", strings.Join(s.EditorExtensionsInstalled, ", ")),
+			UninstallEditorExtensions(s.EditorExtensionsInstalled))
+	}
+	if len(s.JetBrainsPluginsInstalled) > 0 {
+		report(fmt.Sprintf("removed Blamely plugin from %d JetBrains IDE(s)", len(s.JetBrainsPluginsInstalled)),
+			UninstallJetBrainsPlugins(s.JetBrainsPluginsInstalled))
+	}
 	if s.LaunchAgentInstalled {
 		report("removed daemon agent", UninstallDaemonAgent())
 	}
@@ -279,8 +345,27 @@ func Uninstall() error {
 	return nil
 }
 
+// mergeLabels folds freshly-installed editor labels into the persisted set,
+// de-duplicating. Re-running `install` after an editor was added shouldn't
+// drop the editors recorded by earlier runs.
+func mergeLabels(existing, fresh []string) []string {
+	seen := make(map[string]bool, len(existing)+len(fresh))
+	out := make([]string, 0, len(existing)+len(fresh))
+	for _, l := range append(append([]string{}, existing...), fresh...) {
+		if !seen[l] {
+			seen[l] = true
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
 func printDetected(d *Detected) {
-	fmt.Println("Detected AI tools:")
+	if uiColor() {
+		fmt.Printf("%sDetected%s\n", uiBold, uiReset)
+	} else {
+		fmt.Println("Detected")
+	}
 	for _, row := range []struct {
 		name string
 		p    ToolPresence
@@ -291,34 +376,32 @@ func printDetected(d *Detected) {
 		{"GitHub Copilot", d.Copilot},
 		{"Gemini CLI", d.Gemini},
 	} {
-		mark := "absent"
-		if row.p.Present {
-			mark = "found"
-		}
 		hint := ""
 		if h := row.p.FirstHint(); h != "" {
-			extra := ""
+			hint = h
 			if more := len(row.p.Hints) - 1; more > 0 {
-				extra = fmt.Sprintf(" (+%d more)", more)
+				hint += fmt.Sprintf("  (+%d more)", more)
 			}
-			hint = "  (" + h + extra + ")"
 		}
-		fmt.Printf("  %-16s %s%s\n", row.name, mark, hint)
+		if row.p.Present {
+			ok(row.name, hint)
+		} else {
+			info(row.name, "not detected")
+		}
 	}
-	fmt.Println()
 }
 
 func printNextSteps(d *Detected) {
-	fmt.Println("Next steps:")
+	section("Next steps")
 	if d.Claude.Present {
-		fmt.Println("  • Make an edit with Claude Code, then commit. Run `blamely report HEAD` to see the per-line attribution.")
+		fmt.Println("  · Make an edit with Claude Code, then commit. Run `blamely report HEAD` to see the per-line attribution.")
 	} else {
-		fmt.Println("  • Claude Code wasn't detected. Install it, run `blamely install` again, or add the hook manually.")
+		fmt.Println("  · Claude Code wasn't detected. Install it, run `blamely install` again, or add the hook manually.")
 	}
 	if !d.Cursor.Present && !d.Codex.Present && !d.Copilot.Present && !d.Gemini.Present {
-		fmt.Println("  • Cursor/Codex/Copilot/Gemini integrations will activate automatically once those tools appear.")
+		fmt.Println("  · Cursor/Codex/Copilot/Gemini integrations will activate automatically once those tools appear.")
 	}
-	fmt.Println("  • `blamely status` shows the daemon health.")
-	fmt.Println("  • `blamely uninstall` reverses every change above.")
+	fmt.Println("  · `blamely status` shows the daemon health.")
+	fmt.Println("  · `blamely uninstall` reverses every change above.")
 }
 

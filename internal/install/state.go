@@ -12,19 +12,29 @@ import (
 
 // State is what we stash so `uninstall` can reverse the install.
 type State struct {
-	InstalledAt          time.Time `json:"installed_at"`
-	BinaryPath           string    `json:"binary_path"`
-	PriorCoreHooksPath   string    `json:"prior_core_hookspath"`
-	HadCoreHooksPath     bool      `json:"had_core_hookspath"`
-	ClaudeHookAdded      bool      `json:"claude_hook_added"`
-	CursorHookAdded      bool      `json:"cursor_hook_added"`
-	CodexHookAdded       bool      `json:"codex_hook_added"`
-	CopilotHookAdded     bool      `json:"copilot_hook_added"`
-	GeminiHookAdded      bool      `json:"gemini_hook_added"`
-	PathEntryAdded       bool      `json:"path_entry_added"`
-	PathRcFile           string    `json:"path_rc_file"`
-	LaunchAgentInstalled bool      `json:"launch_agent_installed"`
-	GitHookInstalled     bool      `json:"git_hook_installed"`
+	InstalledAt        time.Time `json:"installed_at"`
+	BinaryPath         string    `json:"binary_path"`
+	PriorCoreHooksPath string    `json:"prior_core_hookspath"`
+	HadCoreHooksPath   bool      `json:"had_core_hookspath"`
+	ClaudeHookAdded    bool      `json:"claude_hook_added"`
+	CursorHookAdded    bool      `json:"cursor_hook_added"`
+	CodexHookAdded     bool      `json:"codex_hook_added"`
+	CopilotHookAdded   bool      `json:"copilot_hook_added"`
+	GeminiHookAdded    bool      `json:"gemini_hook_added"`
+	// EditorExtensionsInstalled lists the editors (by label, e.g. "VS Code",
+	// "Cursor", "Antigravity IDE") whose Blamely marketplace extension THIS
+	// tool installed — never extensions the user installed themselves — so
+	// `uninstall` removes only what it added.
+	EditorExtensionsInstalled []string `json:"editor_extensions_installed,omitempty"`
+	// JetBrainsPluginsInstalled lists the absolute <configDir>/plugins
+	// directories THIS tool unzipped the Blamely plugin into — never plugins
+	// the user installed via the IDE's own marketplace browser — so
+	// `uninstall` removes only the directories it created.
+	JetBrainsPluginsInstalled []string `json:"jetbrains_plugins_installed,omitempty"`
+	PathEntryAdded            bool     `json:"path_entry_added"`
+	PathRcFile                string   `json:"path_rc_file"`
+	LaunchAgentInstalled      bool     `json:"launch_agent_installed"`
+	GitHookInstalled          bool     `json:"git_hook_installed"`
 }
 
 func LoadState() (*State, error) {

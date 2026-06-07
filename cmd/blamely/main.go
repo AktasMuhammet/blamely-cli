@@ -333,6 +333,7 @@ func cmdLog() *cobra.Command {
 	parent.AddCommand(cmdLogCopilot())
 	parent.AddCommand(cmdLogCodex())
 	parent.AddCommand(cmdLogClaude())
+	parent.AddCommand(cmdLogGemini())
 	return parent
 }
 
@@ -366,6 +367,16 @@ func cmdLogClaude() *cobra.Command {
 		Short: "Explain how to trace Claude Code attribution (hook-driven)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return tools.DebugClaudeLogs(cmd.Context(), os.Stdout)
+		},
+	}
+}
+
+func cmdLogGemini() *cobra.Command {
+	return &cobra.Command{
+		Use:   "gemini",
+		Short: "Explain how to trace Gemini CLI attribution (hook-driven)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return tools.DebugGeminiLogs(cmd.Context(), os.Stdout)
 		},
 	}
 }

@@ -16,6 +16,7 @@ const (
 	ToolCursor  Tool = "cursor"
 	ToolCodex   Tool = "codex"
 	ToolCopilot Tool = "copilot"
+	ToolGemini  Tool = "gemini"
 	// ToolHuman is retained ONLY to recognise legacy rows written before the
 	// human/tool split. New code never writes this value — human-typed code
 	// is represented by tool="" + gen_type=GenTypeHuman. Readers normalise
@@ -679,6 +680,41 @@ func (db *DB) RecentPluginEdits(sources []string, afterID int64) ([]PluginEditRo
 		WHERE (%s) AND e.id > ?
 		ORDER BY e.id ASC`, like),
 		args...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PluginEditRow
+	for rows.Next() {
+		var r PluginEditRow
+		if err := rows.Scan(&r.ID, &r.Ts, &r.Tool, &r.Confidence, &r.GenType,
+			&r.Model, &r.RepoPath, &r.FilePath, &r.RawMeta,
+			&r.StartLine, &r.EndLine); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// RecentEditsByTool returns edits for the given tool with id > afterID,
+// ordered oldest-first. Used by live-log tracers for hook-driven tools
+// (e.g. gemini) whose events arrive solely via the HTTP /edit endpoint —
+// there's no separate watcher stream to print them as they're recorded, so
+// the tracer polls the table directly and shows rows as they land.
+func (db *DB) RecentEditsByTool(tool Tool, afterID int64) ([]PluginEditRow, error) {
+	rows, err := db.Query(`
+		SELECT e.id, e.ts, e.tool, e.confidence, e.gen_type,
+		       COALESCE(e.model,''), e.repo_path, e.file_path, COALESCE(e.raw_meta,''),
+		       COALESCE(el.start_line,0), COALESCE(el.end_line,0)
+		FROM edits e
+		LEFT JOIN edit_lines el ON el.edit_id = e.id AND el.rowid = (
+		    SELECT MIN(rowid) FROM edit_lines WHERE edit_id = e.id
+		)
+		WHERE e.tool = ? AND e.id > ?
+		ORDER BY e.id ASC`,
+		string(tool), afterID,
 	)
 	if err != nil {
 		return nil, err

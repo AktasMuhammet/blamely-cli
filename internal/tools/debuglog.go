@@ -192,33 +192,75 @@ func tailPluginEdits(ctx context.Context, out io.Writer) {
 				if r.ID > lastID {
 					lastID = r.ID
 				}
-				ts := time.Unix(0, r.Ts)
-				model := r.Model
-				if model == "" {
-					model = "?"
+				printPluginEditRow(out, r, "plugin")
+			}
+		}
+	}
+}
+
+// printPluginEditRow renders one polled edits-table row in the same format
+// printSink uses for watcher events, so HTTP-arriving and watcher-detected
+// signals look identical in the trace output. fallbackSrc is shown when
+// raw_meta carries no "source" field.
+func printPluginEditRow(out io.Writer, r store.PluginEditRow, fallbackSrc string) {
+	ts := time.Unix(0, r.Ts)
+	model := r.Model
+	if model == "" {
+		model = "?"
+	}
+	file := r.FilePath
+	if file == "" {
+		file = "—"
+	}
+	lineRange := ""
+	if r.StartLine > 0 {
+		if r.EndLine > r.StartLine {
+			lineRange = fmt.Sprintf(" L%d-%d", r.StartLine, r.EndLine)
+		} else {
+			lineRange = fmt.Sprintf(" L%d", r.StartLine)
+		}
+	}
+	var meta struct {
+		Source string `json:"source"`
+	}
+	_ = json.Unmarshal([]byte(r.RawMeta), &meta)
+	src := meta.Source
+	if src == "" {
+		src = fallbackSrc
+	}
+	fmt.Fprintf(out, "%s  [%-10s] tool=%-7s model=%-22s conf=%-6s src=%-22s file=%s%s\n",
+		ts.Format("15:04:05"), r.GenType, r.Tool, model, r.Confidence, src, file, lineRange)
+}
+
+// tailToolEdits polls SQLite every 2 s for new edits-table rows for the given
+// tool and prints them as they're recorded. Used for hook-driven tools whose
+// events arrive solely via the HTTP /edit endpoint — there's no passive log
+// or watcher stream to trace, so the database itself is the live signal.
+func tailToolEdits(ctx context.Context, out io.Writer, tool store.Tool, fallbackSrc string) {
+	db, err := store.Open()
+	if err != nil {
+		return
+	}
+	defer db.Close()
+
+	var lastID int64
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			rows, err := db.RecentEditsByTool(tool, lastID)
+			if err != nil {
+				continue
+			}
+			for _, r := range rows {
+				if r.ID > lastID {
+					lastID = r.ID
 				}
-				file := r.FilePath
-				if file == "" {
-					file = "—"
-				}
-				lineRange := ""
-				if r.StartLine > 0 {
-					if r.EndLine > r.StartLine {
-						lineRange = fmt.Sprintf(" L%d-%d", r.StartLine, r.EndLine)
-					} else {
-						lineRange = fmt.Sprintf(" L%d", r.StartLine)
-					}
-				}
-				var meta struct {
-					Source string `json:"source"`
-				}
-				_ = json.Unmarshal([]byte(r.RawMeta), &meta)
-				src := meta.Source
-				if src == "" {
-					src = "plugin"
-				}
-				fmt.Fprintf(out, "%s  [%-10s] tool=%-7s model=%-22s conf=%-6s src=%-22s file=%s%s\n",
-					ts.Format("15:04:05"), r.GenType, r.Tool, model, r.Confidence, src, file, lineRange)
+				printPluginEditRow(out, r, fallbackSrc)
 			}
 		}
 	}
@@ -235,8 +277,36 @@ func DebugCodexLogs(ctx context.Context, out io.Writer) error {
 func DebugClaudeLogs(ctx context.Context, out io.Writer) error {
 	fmt.Fprintln(out, "Claude Code attribution is hook-driven: the PostToolUse hook pipes each")
 	fmt.Fprintln(out, "edit to `blamely record claude`, which POSTs directly to the daemon's /edit")
-	fmt.Fprintln(out, "endpoint — there is no passive log file to tail. To trace it, run the")
-	fmt.Fprintln(out, "daemon with BLAMELY_DEBUG and watch its stderr, or inspect the git note")
-	fmt.Fprintln(out, "after a commit. Nothing to stream here.")
+	fmt.Fprintln(out, "endpoint — there is no passive log file to tail. To trace it, replay a")
+	fmt.Fprintln(out, "captured hook payload through `blamely record claude` directly (errors")
+	fmt.Fprintln(out, "print to that command's own output, not ~/.blamely/daemon.log), or")
+	fmt.Fprintln(out, "inspect the git note after a commit. Nothing to stream here.")
+	return nil
+}
+
+// DebugGeminiLogs traces Gemini CLI attribution. Gemini is hook-driven — the
+// AfterTool/BeforeTool hooks pipe each tool call straight to `blamely record
+// gemini`, which POSTs to the daemon's /edit endpoint — so there's no passive
+// log file to tail. The edits table itself is the only live signal: we poll
+// it for new tool=gemini rows and print them as they land, in the same format
+// `blamely log copilot` uses for its plugin events.
+func DebugGeminiLogs(ctx context.Context, out io.Writer) error {
+	fmt.Fprintln(out, "Gemini CLI attribution is hook-driven: the AfterTool/BeforeTool hooks pipe")
+	fmt.Fprintln(out, "each tool call to `blamely record gemini`, which POSTs directly to the")
+	fmt.Fprintln(out, "daemon's /edit endpoint — there is no passive log file to tail, so this")
+	fmt.Fprintln(out, "traces the database directly: every new tool=gemini row is printed the")
+	fmt.Fprintln(out, "moment it's recorded. Trigger an edit in Gemini CLI now and watch for it")
+	fmt.Fprintln(out, "below. Nothing is written to the database by this command. Ctrl-C to stop.\n")
+	fmt.Fprintln(out, "If nothing appears after you edit a file via Gemini, check:")
+	fmt.Fprintln(out, "  1. ~/.gemini/settings.json has tools.enableHooks=true and an")
+	fmt.Fprintln(out, "     AfterTool/BeforeTool hook running `blamely record gemini` (run")
+	fmt.Fprintln(out, "     `blamely doctor` or `blamely install` to (re)write it).")
+	fmt.Fprintln(out, "  2. The daemon is running (`blamely status`).")
+	fmt.Fprintln(out, "  3. `echo '<hook payload>' | blamely record gemini` prints no error.")
+	fmt.Fprintln(out, "     A rejection (e.g. \"daemon rejected: 400 ...\") prints directly to")
+	fmt.Fprintln(out, "     this command's own output — the daemon does NOT log rejected or")
+	fmt.Fprintln(out, "     malformed POSTs to ~/.blamely/daemon.log, so check here first.\n")
+
+	tailToolEdits(ctx, out, store.ToolGemini, "gemini_hook")
 	return nil
 }

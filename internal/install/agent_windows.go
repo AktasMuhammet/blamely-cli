@@ -11,6 +11,12 @@ import (
 const scheduledTaskName = "Blamely Daemon"
 
 func InstallDaemonAgent(binaryPath string) (string, error) {
+	// A stale task from a prior install under a different security context
+	// (e.g. an elevated session) can make /Create /F fail with "Access is
+	// denied" because the current user doesn't own it. Clear it first —
+	// best-effort, since a missing task also errors.
+	_ = exec.Command("schtasks", "/Delete", "/F", "/TN", scheduledTaskName).Run()
+
 	// /F = force overwrite; /SC ONLOGON = run at every user logon; /RL LIMITED = user privileges.
 	args := []string{
 		"/Create", "/F",
@@ -20,7 +26,7 @@ func InstallDaemonAgent(binaryPath string) (string, error) {
 		"/RL", "LIMITED",
 	}
 	if out, err := exec.Command("schtasks", args...).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("schtasks /Create: %v: %s", err, string(out))
+		return "", fmt.Errorf("schtasks /Create: %v: %s\n\n  hint: a previous \"Blamely Daemon\" task may exist under a different\n  account or elevation level. Open Task Scheduler, delete the\n  \"Blamely Daemon\" task under Task Scheduler Library, then re-run\n  `blamely install`", err, string(out))
 	}
 	// Kill any prior running instance so a reinstall picks up the new
 	// binary; then start fresh. Both are best-effort.
