@@ -43,15 +43,16 @@ func TestLoadConfig_PartialOverlayKeepsOtherDefaults(t *testing.T) {
 	if !n.FileLines || !n.Message || !n.CodingTime || !n.Tokens {
 		t.Errorf("unspecified sections must stay on: %+v", n)
 	}
-	// Per-role conversation toggles must also default on when not specified.
-	if !n.ConversationUser || !n.ConversationAssistant {
-		t.Errorf("per-role conversation toggles must default on: %+v", n)
+	// conversation_user defaults on; conversation_assistant defaults off.
+	if !n.ConversationUser || n.ConversationAssistant {
+		t.Errorf("conversation_user must default on, conversation_assistant off: %+v", n)
 	}
 }
 
 func TestLoadConfig_PerRoleConversation(t *testing.T) {
-	// Keep conversation on but drop only the user (prompt) turns.
-	writeConfig(t, `{"note":{"conversation_user":false}}`)
+	// Keep conversation on, drop the user (prompt) turns, and explicitly enable
+	// assistant turns (which now default off).
+	writeConfig(t, `{"note":{"conversation_user":false,"conversation_assistant":true}}`)
 	n := LoadConfig().Note
 	if !n.Conversation || n.ConversationUser || !n.ConversationAssistant {
 		t.Fatalf("want conversation on, user off, assistant on: %+v", n)

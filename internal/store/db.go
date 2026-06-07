@@ -125,6 +125,12 @@ var migrations = []string{
 	/* 14 */ `CREATE INDEX IF NOT EXISTS edits_repo_branch ON edits(repo_path, branch)`,
 	// Migration 15: work-session ids INTEGER → TEXT UUID (see migrateWorkSessionsUUID).
 	/* 15 */ `SELECT 1`,
+	// Migration 16: soft-delete marker. When the editor reports a tracked file as
+	// deleted we set deleted_at = unix-nanos instead of removing rows, so a later
+	// undo/rollback (file re-created) can clear it and recover the attribution
+	// history. NULL = live; non-NULL = hidden from the live gutter. Rename/move
+	// updates file_path in place; copy clones the live rows to the new path.
+	/* 16 */ `ALTER TABLE edits ADD COLUMN deleted_at INTEGER`,
 }
 
 func (db *DB) migrate() error {

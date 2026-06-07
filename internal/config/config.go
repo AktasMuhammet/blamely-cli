@@ -12,10 +12,11 @@ const configFileName = "config.json"
 
 // NoteConfig toggles which sections the post-commit git note includes.
 //
-// Every field defaults to true, so a missing config file — or one that lists
-// only the toggles you want off — preserves full output. The note is always
-// built in full and disabled sections are stripped just before it is written
-// (see gitnotes.AttributeAndWrite), so turning a section off never changes how
+// All fields default to true except ConversationAssistant (off by default), so
+// a missing config file — or one that lists only the toggles you want to flip —
+// preserves that baseline. The note is always built in full and disabled
+// sections are stripped just before it is written (see
+// gitnotes.AttributeAndWrite), so turning a section off never changes how
 // attribution itself is computed, only what is persisted.
 type NoteConfig struct {
 	// FileLines includes the per-line attribution detail inside each file
@@ -30,8 +31,9 @@ type NoteConfig struct {
 	// ConversationUser includes the USER (prompt) turns. Disable to keep the
 	// assistant's replies but omit what the developer typed.
 	ConversationUser bool `json:"conversation_user"`
-	// ConversationAssistant includes the ASSISTANT (model reply) turns. Disable
-	// to keep the user's prompts but omit the model's responses.
+	// ConversationAssistant includes the ASSISTANT (model reply) turns. Defaults
+	// to false — assistant replies are typically long and add little value to
+	// the note; enable to keep the model's responses alongside the user's prompts.
 	ConversationAssistant bool `json:"conversation_assistant"`
 	// Message includes the commit message in the note.
 	Message bool `json:"message"`
@@ -53,7 +55,7 @@ func DefaultConfig() Config {
 		FileLines:             true,
 		Conversation:          true,
 		ConversationUser:      true,
-		ConversationAssistant: true,
+		ConversationAssistant: false,
 		Message:               true,
 		CodingTime:            true,
 		Tokens:                true,

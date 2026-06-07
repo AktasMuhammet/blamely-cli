@@ -101,6 +101,7 @@ func Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.health)
 	mux.HandleFunc("/edit", s.ingest)
+	mux.HandleFunc("/fs", s.fsEvent)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
