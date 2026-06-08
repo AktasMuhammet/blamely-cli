@@ -18,20 +18,29 @@ const scheduledTaskName = "Blamely Daemon"
 
 const startupVBSName = "blamely-daemon.vbs"
 
+var (
+	shell32           = syscall.NewLazyDLL("shell32.dll")
+	procIsUserAnAdmin = shell32.NewProc("IsUserAnAdmin")
+)
+
 func InstallDaemonAgent(binaryPath string) (string, error) {
+	// ONLOGON scheduled tasks require elevation on most Windows builds, even for
+	// the current user. Non-admin installs go straight to the Startup folder.
+	if !isWindowsAdmin() {
+		return installStartupAgent(binaryPath)
+	}
 	if ref, err := installScheduledTask(binaryPath); err == nil {
 		return ref, nil
-	} else if !isSchtasksAccessDenied(err) {
+	} else if isSchtasksAccessDenied(err) {
+		return installStartupAgent(binaryPath)
+	} else {
 		return "", err
 	}
-	// ONLOGON scheduled tasks often need an elevated shell on Windows, even
-	// when the task runs as the current user. Fall back to a per-user Startup
-	// shortcut — no admin rights required.
-	ref, err := installStartupAgent(binaryPath)
-	if err != nil {
-		return "", fmt.Errorf("%w\n\n  hint: run PowerShell as Administrator and re-run `blamely install`,\n  or open Task Scheduler, delete any \"Blamely Daemon\" task, then retry", err)
-	}
-	return ref, nil
+}
+
+func isWindowsAdmin() bool {
+	r, _, _ := procIsUserAnAdmin.Call()
+	return r != 0
 }
 
 func installScheduledTask(binaryPath string) (string, error) {
