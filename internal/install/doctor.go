@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -127,14 +128,20 @@ func (d *doctor) path() {
 		return
 	}
 	binDir := stripFile(want)
-	for _, p := range strings.Split(os.Getenv("PATH"), ":") {
-		if p == binDir {
+	sep := string(os.PathListSeparator)
+	for _, p := range strings.Split(os.Getenv("PATH"), sep) {
+		if strings.EqualFold(strings.TrimSpace(p), binDir) {
 			d.ok("$PATH contains "+binDir, "")
 			return
 		}
 	}
-	d.warn("$PATH", "does not contain "+binDir,
-		"restart your shell or `source ~/.zshrc` (the install added the entry)")
+	fix := "open a new terminal"
+	if runtime.GOOS != "windows" {
+		fix = "restart your shell or `source ~/.zshrc` (the install added the entry)"
+	} else {
+		fix = "open a new terminal, or run: $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')"
+	}
+	d.warn("$PATH", "does not contain "+binDir, fix)
 }
 
 func (d *doctor) db() {

@@ -34,72 +34,8 @@ const (
 	pathBlockEnd   = "# <<< blamely path <<<"
 )
 
-// InstallPathEntry appends the blamely-path block to the user's shell rc file
-// (chosen from $SHELL). Returns the rc path, whether anything was added (vs.
-// already present), and any error. Idempotent: if the marker block is already
-// present, returns added=false and leaves the file untouched.
-func InstallPathEntry() (rcPath string, added bool, err error) {
-	rcPath, kind, err := detectShellRC()
-	if err != nil {
-		return "", false, err
-	}
-
-	block, err := renderPathBlock(kind)
-	if err != nil {
-		return rcPath, false, err
-	}
-
-	current, err := readFileTolerant(rcPath)
-	if err != nil {
-		return rcPath, false, err
-	}
-	if strings.Contains(current, pathBlockStart) {
-		return rcPath, false, nil
-	}
-
-	// Ensure the rc file ends with a newline before appending so our block
-	// starts on its own line.
-	var sep string
-	if len(current) > 0 && !strings.HasSuffix(current, "\n") {
-		sep = "\n"
-	}
-	updated := current + sep + block
-	if err := os.MkdirAll(filepath.Dir(rcPath), 0o755); err != nil {
-		return rcPath, false, fmt.Errorf("mkdir %s: %w", filepath.Dir(rcPath), err)
-	}
-	if err := atomicWrite(rcPath, []byte(updated), 0o644); err != nil {
-		return rcPath, false, err
-	}
-	return rcPath, true, nil
-}
-
-// UninstallPathEntry removes the marker-delimited blamely path block from the
-// rc file recorded by the install. If rcPath is empty, falls back to
-// detecting the current shell's rc. Returns true if a block was removed.
-func UninstallPathEntry(rcPath string) (string, bool, error) {
-	if rcPath == "" {
-		p, _, err := detectShellRC()
-		if err != nil {
-			return "", false, err
-		}
-		rcPath = p
-	}
-	current, err := readFileTolerant(rcPath)
-	if err != nil {
-		return rcPath, false, err
-	}
-	if !strings.Contains(current, pathBlockStart) {
-		return rcPath, false, nil
-	}
-	updated := removeBlock(current, pathBlockStart, pathBlockEnd)
-	if updated == current {
-		return rcPath, false, nil
-	}
-	if err := atomicWrite(rcPath, []byte(updated), 0o644); err != nil {
-		return rcPath, false, err
-	}
-	return rcPath, true, nil
-}
+// InstallPathEntry and UninstallPathEntry are implemented in path_unix.go
+// (macOS/Linux) and path_windows.go.
 
 // shellKind tracks which syntax to emit in the rc block.
 type shellKind int
@@ -110,11 +46,10 @@ const (
 )
 
 // detectShellRC chooses an rc file to write to based on $SHELL. It returns
-// the absolute path and the shell kind. Windows is unsupported; PATH there is
-// managed via the registry, which we don't touch.
+// the absolute path and the shell kind. On Windows use installWindowsPathEntry.
 func detectShellRC() (string, shellKind, error) {
 	if runtime.GOOS == "windows" {
-		return "", shellPosix, errors.New("PATH auto-install not supported on Windows")
+		return "", shellPosix, errors.New("use installWindowsPathEntry on Windows")
 	}
 	home, err := config.Home()
 	if err != nil {

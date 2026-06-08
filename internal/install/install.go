@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -236,9 +237,17 @@ func Run() error {
 		s.PathRcFile = rcPath
 		if added {
 			s.PathEntryAdded = true
-			ok("PATH", fmt.Sprintf("added to %s · reload your shell or run `source %s`", rcPath, rcPath))
+			if runtime.GOOS == "windows" {
+				ok("PATH", fmt.Sprintf("added %s to user PATH · open a new terminal", rcPath))
+			} else {
+				ok("PATH", fmt.Sprintf("added to %s · reload your shell or run `source %s`", rcPath, rcPath))
+			}
 		} else {
-			info("PATH", "entry already present in "+rcPath)
+			if runtime.GOOS == "windows" {
+				info("PATH", "entry already present in user PATH ("+rcPath+")")
+			} else {
+				info("PATH", "entry already present in "+rcPath)
+			}
 		}
 	}
 
