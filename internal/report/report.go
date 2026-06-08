@@ -58,10 +58,6 @@ func printNote(n *gitnotes.Note) {
 	}
 	fmt.Println()
 
-	if len(n.Conversation) > 0 {
-		printConversation(n.Conversation)
-	}
-
 	if len(n.Files) == 0 {
 		return
 	}
@@ -146,77 +142,6 @@ func formatModels(models map[string]int) string {
 		parts[i] = e.name + "  " + dim(fmt.Sprintf("(%d lines)", e.count))
 	}
 	return strings.Join(parts, "  ·  ")
-}
-
-// printConversation renders the user/assistant conversation in a clean,
-// premium terminal format. User prompts are shown in bold; assistant replies
-// are dimmed so the user's intent reads first, then the AI response.
-//
-// Layout (color on):
-//
-//	 Conversation ────────────────────────────────
-//
-//	  ╷ User
-//	  │ How should I structure the auth middleware?
-//
-//	  ╷ claude-opus-4-7
-//	  │ I'll implement a JWT middleware that validates...
-//
-func printConversation(turns []gitnotes.ConvTurn) {
-	color := colorEnabled()
-	sep := strings.Repeat("─", 44)
-	label := "Conversation"
-	if color {
-		label = ansiBold + label + ansiReset
-	}
-	fmt.Printf("%s %s\n\n", label, sep)
-
-	for _, t := range turns {
-		roleLabel := t.Role
-		var roleColor, textColor string
-		if color {
-			if t.Role == "user" {
-				roleColor = ansiBold
-			} else {
-				roleColor = "\x1b[36m" + ansiBold // cyan bold for assistant
-			}
-			textColor = ansiReset
-		}
-
-		if color {
-			fmt.Printf("  %s╷%s %s%s%s\n", ansiDim, ansiReset, roleColor, roleLabel, ansiReset)
-		} else {
-			fmt.Printf("  ╷ %s\n", roleLabel)
-		}
-
-		// Wrap the text at 68 chars so it fits in a standard 80-col terminal.
-		words := strings.Fields(t.Text)
-		line := ""
-		for _, w := range words {
-			if len(line)+1+len(w) > 68 && line != "" {
-				if color {
-					fmt.Printf("  %s│%s %s%s%s\n", ansiDim, ansiReset, textColor, line, ansiReset)
-				} else {
-					fmt.Printf("  │ %s\n", line)
-				}
-				line = w
-			} else {
-				if line == "" {
-					line = w
-				} else {
-					line += " " + w
-				}
-			}
-		}
-		if line != "" {
-			if color {
-				fmt.Printf("  %s│%s %s%s%s\n", ansiDim, ansiReset, textColor, line, ansiReset)
-			} else {
-				fmt.Printf("  │ %s\n", line)
-			}
-		}
-		fmt.Println()
-	}
 }
 
 // formatDuration renders a duration as "Xh Ym" / "Ym Ss" / "Ss" depending on

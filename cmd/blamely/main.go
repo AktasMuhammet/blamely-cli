@@ -42,6 +42,7 @@ func main() {
 	root.AddCommand(cmdRecord())
 	root.AddCommand(cmdAttribute())
 	root.AddCommand(cmdReport())
+	root.AddCommand(cmdBlame())
 	root.AddCommand(cmdStats())
 	root.AddCommand(cmdHistory())
 	root.AddCommand(cmdStatus())
@@ -273,6 +274,20 @@ func cmdStats() *cobra.Command {
 			return report.RenderStats(sha)
 		},
 	}
+}
+
+func cmdBlame() *cobra.Command {
+	var rev string
+	c := &cobra.Command{
+		Use:   "blame <file>",
+		Short: "Per-line attribution for a file: who wrote each line — human or AI tool/model",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return report.RenderBlame(args[0], rev)
+		},
+	}
+	c.Flags().StringVar(&rev, "rev", "HEAD", "revision to blame (commit, branch, tag)")
+	return c
 }
 
 func cmdHistory() *cobra.Command {

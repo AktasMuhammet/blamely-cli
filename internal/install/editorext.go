@@ -57,7 +57,8 @@ var editorExtensionTargets = []editorExtensionTarget{
 type EditorExtensionResult struct {
 	Label     string
 	CLIPath   string // "" => editor not found on this machine
-	Installed bool   // true only when THIS run installed it (drives uninstall tracking)
+	Installed bool   // true only when THIS run did the initial install (drives uninstall tracking)
+	Updated   bool   // true when the extension was already present and we force-reinstalled it to pull the latest marketplace version
 	Err       error
 }
 
@@ -81,14 +82,16 @@ func InstallEditorExtensions() []EditorExtensionResult {
 			results = append(results, r)
 			continue
 		}
-		if extensionInstalled(cliPath, blamelyExtensionID) {
-			results = append(results, r)
-			continue
-		}
-		out, err := exec.Command(cliPath, "--install-extension", blamelyExtensionID).CombinedOutput()
+		// Force-reinstall unconditionally: a fresh marketplace pull both
+		// installs it the first time and updates it to latest on every
+		// subsequent run, so users never get stuck on a stale version.
+		wasPresent := extensionInstalled(cliPath, blamelyExtensionID)
+		out, err := exec.Command(cliPath, "--install-extension", blamelyExtensionID, "--force").CombinedOutput()
 		if err != nil {
-			r.Err = fmt.Errorf("%s --install-extension %s: %w: %s",
+			r.Err = fmt.Errorf("%s --install-extension %s --force: %w: %s",
 				filepath.Base(cliPath), blamelyExtensionID, err, strings.TrimSpace(string(out)))
+		} else if wasPresent {
+			r.Updated = true
 		} else {
 			r.Installed = true
 		}

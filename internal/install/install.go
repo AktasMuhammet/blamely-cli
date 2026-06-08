@@ -165,6 +165,8 @@ func Run() error {
 		case r.Installed:
 			ok(r.Label, "extension installed from marketplace · "+blamelyExtensionID)
 			editorLabelsInstalled = append(editorLabelsInstalled, r.Label)
+		case r.Updated:
+			ok(r.Label, "extension updated to latest · "+blamelyExtensionID)
 		default:
 			info(r.Label, "extension already installed · "+blamelyExtensionID)
 		}
