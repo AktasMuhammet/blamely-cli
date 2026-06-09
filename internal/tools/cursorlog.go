@@ -356,7 +356,7 @@ func emitCursorLogEvent(abs string, sink daemon.Sink) {
 		}
 	}
 	lr, err := LineRangeForWholeFile(abs)
-	if err != nil || lr == nil {
+	if err != nil || len(lr) == 0 {
 		return
 	}
 	ev := daemon.Event{
@@ -366,7 +366,7 @@ func emitCursorLogEvent(abs string, sink daemon.Sink) {
 		GenType:    "chat", // cursor log events are AI apply events (Composer)
 		RepoPath:   repo,
 		FilePath:   rel,
-		Lines:      []daemon.LineRange{{Start: lr.Start, End: lr.End, ContentSHA: lr.ContentSHA}},
+		Lines:      toDaemonLineRanges(lr),
 		RawMeta:    `{"source":"cursor_log"}`,
 	}
 	if err := sink.Record(ev); err != nil {

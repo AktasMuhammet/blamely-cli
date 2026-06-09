@@ -146,7 +146,7 @@ func extractCopilotRanges(p copilotHookPayload) (string, []LineRange, int64) {
 		if lr == nil {
 			return in.Path, nil, suggested
 		}
-		return in.Path, []LineRange{*lr}, suggested
+		return in.Path, lr, suggested
 
 	case "insert_edit_into_file":
 		// Payload: {path, code, explanation?}
@@ -191,7 +191,7 @@ func extractCopilotRanges(p copilotHookPayload) (string, []LineRange, int64) {
 		if lr == nil {
 			return in.FilePath, nil, suggested
 		}
-		return in.FilePath, []LineRange{*lr}, suggested
+		return in.FilePath, lr, suggested
 
 	case "MultiEdit":
 		var in multiEditInput

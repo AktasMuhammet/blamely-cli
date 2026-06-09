@@ -292,65 +292,72 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	// transcript_path is written into raw_meta by the Claude hook as of blamely
 	// 0.2; older edits silently produce no conversation. Must run BEFORE
 	// MarshalIndent/writeNote so it ends up in the persisted note.
+	//
+	// Guard on AILines: a commit with zero AI-attributed lines had no AI tool
+	// involved, so any "matching" session/transcript found in the time window
+	// is necessarily a different (possibly cross-repo) conversation that
+	// happens to overlap — attaching it would mislabel a human-only commit.
 	sinceConv := db.PreviousCommitTimestampNanos(repoID, commitNanos)
 	const slackNanos = int64(5 * 1e9)
 	const maxConvTurns = 12
-	if sessions, err := db.SessionTranscriptsForPeriod(repoID, sinceConv, commitNanos+slackNanos); err == nil {
-		for _, s := range sessions {
-			if len(note.Conversation) >= maxConvTurns {
-				break
-			}
-			turns, err := tools.ReadTranscriptConversationWindow(s.TranscriptPath, maxConvTurns, 300, sinceConv, commitNanos+slackNanos)
-			if err != nil {
-				continue
-			}
-			for _, t := range turns {
+	if note.Totals.AILines > 0 {
+		if sessions, err := db.SessionTranscriptsForPeriod(repoID, sinceConv, commitNanos+slackNanos); err == nil {
+			for _, s := range sessions {
 				if len(note.Conversation) >= maxConvTurns {
 					break
 				}
-				note.Conversation = append(note.Conversation, ConvTurn{Role: t.Role, Text: t.Text})
-			}
-		}
-	}
-
-	// Persist the user prompts of each session in this commit window into the
-	// prompts table (keyed by session_id), so the conversation survives transcript
-	// rotation/deletion and can be shown without re-reading the transcript. Best
-	// effort: failures here never block note writing.
-	if sessions, err := db.SessionTranscriptsForPeriod(repoID, sinceConv, commitNanos+slackNanos); err == nil {
-		for _, s := range sessions {
-			turns, err := tools.ReadTranscriptConversation(s.TranscriptPath, 200, 4000)
-			if err != nil || len(turns) == 0 {
-				continue
-			}
-			userPrompts := make([]string, 0, len(turns))
-			for _, t := range turns {
-				if t.Role == "user" && t.Text != "" {
-					userPrompts = append(userPrompts, t.Text)
+				turns, err := tools.ReadTranscriptConversationWindow(s.TranscriptPath, maxConvTurns, 300, sinceConv, commitNanos+slackNanos)
+				if err != nil {
+					continue
+				}
+				for _, t := range turns {
+					if len(note.Conversation) >= maxConvTurns {
+						break
+					}
+					note.Conversation = append(note.Conversation, ConvTurn{Role: t.Role, Text: t.Text})
 				}
 			}
-			if len(userPrompts) > 0 {
-				_ = db.UpsertUserPrompts(s.SessionID, repoID, s.Tool, userPrompts, commitNanos)
-			}
 		}
-	}
 
-	// Copilot / Cursor chat panels persist a delta-encoded chat JSONL rather
-	// than a Claude-style transcript. Pull its conversation (if no Claude
-	// transcript already supplied one) and its per-session token usage, which
-	// is the only place Copilot/Cursor token counts are observable locally.
-	until := commitNanos + slackNanos
-	if refs, err := db.ChatSessionPathsForPeriod(repoID, sinceConv, until); err == nil {
-		for _, ref := range refs {
-			if len(note.Conversation) == 0 {
-				if turns, err := tools.ReadChatSessionConversation(ref.Path, 10, 300, sinceConv, until); err == nil {
-					for _, t := range turns {
-						note.Conversation = append(note.Conversation, ConvTurn{Role: t.Role, Text: t.Text})
+		// Persist the user prompts of each session in this commit window into the
+		// prompts table (keyed by session_id), so the conversation survives transcript
+		// rotation/deletion and can be shown without re-reading the transcript. Best
+		// effort: failures here never block note writing.
+		if sessions, err := db.SessionTranscriptsForPeriod(repoID, sinceConv, commitNanos+slackNanos); err == nil {
+			for _, s := range sessions {
+				turns, err := tools.ReadTranscriptConversation(s.TranscriptPath, 200, 4000)
+				if err != nil || len(turns) == 0 {
+					continue
+				}
+				userPrompts := make([]string, 0, len(turns))
+				for _, t := range turns {
+					if t.Role == "user" && t.Text != "" {
+						userPrompts = append(userPrompts, t.Text)
 					}
 				}
+				if len(userPrompts) > 0 {
+					_ = db.UpsertUserPrompts(s.SessionID, repoID, s.Tool, userPrompts, commitNanos)
+				}
 			}
-			if usage, err := tools.ReadChatSessionUsage(ref.Path, sinceConv, until); err == nil {
-				applyChatUsage(note, ref.Tool, usage)
+		}
+
+		// Copilot / Cursor chat panels persist a delta-encoded chat JSONL rather
+		// than a Claude-style transcript. Pull its conversation (if no Claude
+		// transcript already supplied one) and its per-session token usage, which
+		// is the only place Copilot/Cursor token counts are observable locally.
+		until := commitNanos + slackNanos
+		if refs, err := db.ChatSessionPathsForPeriod(repoID, sinceConv, until); err == nil {
+			for _, ref := range refs {
+				if len(note.Conversation) == 0 {
+					if turns, err := tools.ReadChatSessionConversation(ref.Path, 10, 300, sinceConv, until); err == nil {
+						for _, t := range turns {
+							note.Conversation = append(note.Conversation, ConvTurn{Role: t.Role, Text: t.Text})
+						}
+					}
+				}
+				if usage, err := tools.ReadChatSessionUsage(ref.Path, sinceConv, until); err == nil {
+					applyChatUsage(note, ref.Tool, usage)
+				}
 			}
 		}
 	}
@@ -909,7 +916,15 @@ func pickEdit(edits []store.Edit, ln int, content string, minNanos, maxNanos int
 		if e.TimestampNanos <= minNanos || e.TimestampNanos > maxNanos {
 			continue
 		}
-		if coversContentSHA(e.Lines, content) || (allowLineMatch && coversLine(e.Lines, ln)) {
+		// Session scope: content-SHA must also be at the recorded line so a
+		// human copy-paste of AI lines doesn't get attributed as AI. Cross-session
+		// fallback (allowLineMatch=false, e.g. cherry-pick) skips the line check
+		// because line numbers legitimately differ after rebase/squash.
+		shaLn := 0
+		if allowLineMatch {
+			shaLn = ln
+		}
+		if coversContentSHA(e.Lines, content, shaLn) || (allowLineMatch && coversLine(e.Lines, ln)) {
 			return e
 		}
 	}
@@ -937,21 +952,23 @@ func coversLine(lines []store.EditLine, n int) bool {
 }
 
 // coversContentSHA returns true when any edit line's stored ContentSHA matches
-// the SHA-256 of the committed line's content. This is the fallback for when
-// line numbers drifted after the AI applied the edit (e.g. the human added
-// lines earlier in the file before committing). Only called when coversLine
-// already returned false, and only when the edit has per-line hashes (chat
-// edits from the textEditGroup path always carry them; log/velocity edits don't).
-// Empty content or an edit with no ContentSHAs is never a match.
-func coversContentSHA(lines []store.EditLine, content string) bool {
+// the SHA-256 of the committed line's content. When ln > 0, the matching edit
+// line must also have StartLine == ln, so a human copy-paste of AI-generated
+// content at a different position is not mis-attributed. Pass ln = 0 for the
+// cross-session fallback (cherry-pick/squash) where line numbers may differ.
+func coversContentSHA(lines []store.EditLine, content string, ln int) bool {
 	if content == "" {
 		return false
 	}
 	want := sha256HexStr([]byte(content))
 	for _, l := range lines {
-		if l.ContentSHA != "" && l.ContentSHA == want {
-			return true
+		if l.ContentSHA == "" || l.ContentSHA != want {
+			continue
 		}
+		if ln > 0 && l.StartLine != ln {
+			continue
+		}
+		return true
 	}
 	return false
 }

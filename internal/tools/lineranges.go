@@ -48,8 +48,17 @@ func LocateNewString(filePath, newString string) (*LineRange, error) {
 	}, nil
 }
 
-// LineRangeForWholeFile returns 1..N for a full-file Write.
-func LineRangeForWholeFile(filePath string) (*LineRange, error) {
+// LineRangeForWholeFile returns one 1-based, single-line LineRange per line of
+// a full-file Write, each carrying that line's own content SHA — the same
+// per-line CONTENT convention UnifiedDiffAddedRanges uses (sha256 of the line
+// text with any trailing \r stripped). A single combined whole-file hash can
+// never match a per-line lookup, which left every "create a new file" event
+// unattributable (skipped by the line-based path because it carried a
+// content_sha, but invisible to the content_sha path because its hash covered
+// the whole blob, not one line) — see e.g. Codex `patch_apply: "add"` events.
+// Per-line hashes also survive later partial edits: lines that remain
+// untouched keep matching by hash even after the file's line numbers shift.
+func LineRangeForWholeFile(filePath string) ([]LineRange, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", filePath, err)
@@ -57,20 +66,20 @@ func LineRangeForWholeFile(filePath string) (*LineRange, error) {
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<16), 1<<24)
-	lines := 0
-	var hasher = sha256.New()
+	var out []LineRange
+	ln := 0
 	for sc.Scan() {
-		lines++
-		hasher.Write(sc.Bytes())
-		hasher.Write([]byte{'\n'})
+		ln++
+		text := strings.TrimRight(sc.Text(), "\r")
+		out = append(out, LineRange{Start: ln, End: ln, ContentSHA: sha256Hex([]byte(text))})
 	}
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("scan %s: %w", filePath, err)
 	}
-	if lines == 0 {
+	if len(out) == 0 {
 		return nil, nil
 	}
-	return &LineRange{Start: 1, End: lines, ContentSHA: hex.EncodeToString(hasher.Sum(nil))}, nil
+	return out, nil
 }
 
 func sha256Hex(b []byte) string {

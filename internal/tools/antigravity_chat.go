@@ -101,13 +101,14 @@ type transcriptFileState struct {
 	lastTouch time.Time
 	seen      map[int]bool // step_index already emitted, dedups re-reads after offset resets
 
-	// model is the conversation's Gemini model, lazily resolved (and cached)
-	// from the conversation's SQLite db on first emit. modelChecked guards
-	// against re-querying the db on every line once we know there's no model
-	// to find (a query miss is just as final as a hit — the db is static once
-	// a conversation accumulates turns, so retrying buys nothing).
-	model        string
-	modelChecked bool
+	// model is the conversation's Gemini model, resolved from the conversation's
+	// SQLite db. The db is written by Antigravity asynchronously — it typically
+	// lags the transcript by seconds to minutes — so we retry on each emit until
+	// the model is found rather than locking in an empty string on first miss.
+	// modelAttempts caps retries so a conversation with no model data doesn't
+	// trigger a DB open on every step indefinitely.
+	model         string
+	modelAttempts int
 }
 
 func (w *antigravityTranscriptWatcher) run(ctx context.Context, sink daemon.Sink) error {
@@ -239,11 +240,11 @@ func (w *antigravityTranscriptWatcher) handleLine(path, line string, st *transcr
 	}
 	if wholeFile {
 		lr, err := LineRangeForWholeFile(abs)
-		if err != nil || lr == nil {
+		if err != nil || len(lr) == 0 {
 			return
 		}
-		ranges = []daemon.LineRange{{Start: lr.Start, End: lr.End, ContentSHA: lr.ContentSHA}}
-		suggested = int64(lr.End - lr.Start + 1)
+		ranges = toDaemonLineRanges(lr)
+		suggested = int64(len(lr))
 	}
 	if len(ranges) == 0 {
 		return
@@ -264,9 +265,13 @@ func (w *antigravityTranscriptWatcher) handleLine(path, line string, st *transcr
 	if t, err := time.Parse(time.RFC3339, step.CreatedAt); err == nil {
 		when = t
 	}
-	if !st.modelChecked {
-		st.model = modelFromConversationDB(conversationDBPath(path))
-		st.modelChecked = true
+	const maxModelAttempts = 8
+	if st.model == "" && st.modelAttempts < maxModelAttempts {
+		st.modelAttempts++
+		if m := modelFromConversationDB(conversationDBPath(path)); m != "" {
+			st.model = m
+			st.modelAttempts = maxModelAttempts // stop retrying
+		}
 	}
 	ev := daemon.Event{
 		When:           when,

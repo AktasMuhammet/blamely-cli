@@ -376,11 +376,11 @@ func emitCodexPatchApplyEvents(payload json.RawMessage, when time.Time, st *code
 		switch change.Type {
 		case "add":
 			full, err := LineRangeForWholeFile(abs)
-			if err != nil || full == nil {
+			if err != nil || len(full) == 0 {
 				continue
 			}
-			lines = []daemon.LineRange{{Start: full.Start, End: full.End, ContentSHA: full.ContentSHA}}
-			suggested = int64(full.End - full.Start + 1)
+			lines = toDaemonLineRanges(full)
+			suggested = int64(len(full))
 		case "update":
 			ranges, n := UnifiedDiffAddedRanges(change.UnifiedDiff)
 			if len(ranges) == 0 {

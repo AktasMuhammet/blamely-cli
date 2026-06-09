@@ -2,10 +2,16 @@
 # Blamely build + install / uninstall helper for local development.
 #
 # Usage:
-#   ./scripts/install.sh            build + install
-#   ./scripts/install.sh uninstall  uninstall + remove binary
-#   ./scripts/install.sh rebuild    rebuild without re-running install
-#   ./scripts/install.sh repair     remove stale legacy hooks only
+#   ./scripts/install.sh                  build + install (CLI + hooks only)
+#   ./scripts/install.sh --with-plugins   also install the VS Code/JetBrains IDE plugins
+#   ./scripts/install.sh uninstall        uninstall + remove binary
+#   ./scripts/install.sh rebuild          rebuild without re-running install
+#   ./scripts/install.sh repair           remove stale legacy hooks only
+#
+# IDE plugins are skipped by default here: re-downloading the marketplace
+# build on every local install is slow and can clobber a sideloaded dev build
+# of the plugin you're working on. Pass --with-plugins to include them — the
+# distributed installers and release pipeline always do.
 set -e
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -44,7 +50,12 @@ do_install() {
     build_binary
 
     info "Running blamely install..."
-    "$STABLE_BIN" install
+    if [ "$WITH_PLUGINS" = "1" ]; then
+        "$STABLE_BIN" install
+    else
+        "$STABLE_BIN" install --skip-plugins
+        info "Skipped IDE/editor plugin install (local dev default) — pass --with-plugins to include it."
+    fi
     ok "Blamely installed."
 
     # Clean up any stale legacy hooks (no-op if there are none).
@@ -100,13 +111,24 @@ do_repair() {
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
-case "${1:-install}" in
+# --with-plugins can appear anywhere (`./scripts/install.sh --with-plugins` or
+# `./scripts/install.sh install --with-plugins`); whatever's left is the subcommand.
+WITH_PLUGINS=0
+SUBCMD="install"
+for arg in "$@"; do
+    case "$arg" in
+        --with-plugins) WITH_PLUGINS=1 ;;
+        *)              SUBCMD="$arg" ;;
+    esac
+done
+
+case "$SUBCMD" in
     install)   do_install ;;
     rebuild)   do_rebuild ;;
     uninstall) do_uninstall ;;
     repair)    do_repair ;;
     *)
-        echo "Usage: $0 [install|rebuild|uninstall|repair]"
+        echo "Usage: $0 [install|rebuild|uninstall|repair] [--with-plugins]"
         exit 1
         ;;
 esac

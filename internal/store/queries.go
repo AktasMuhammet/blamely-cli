@@ -563,12 +563,16 @@ type ChatSessionRef struct {
 // the VS Code / Cursor chat-session JSONL files the chat-session watcher tagged
 // while a chat panel was producing responses.
 //
-// Unlike TranscriptPathsForPeriod the repo filter also accepts repo_path=''
-// rows: chat-session markers carry no file/repo context, so they're stored with
-// an empty repo_path and must still be matched for the commit's window.
+// Chat-session response markers carry no file/repo context (the editor event
+// isn't tied to a file), so the watcher records them with an empty repo_path.
+// Matching repo_path='' rows unconditionally would leak a chat session into
+// EVERY repo whose commit window overlaps it. Instead, an empty-repo_path row
+// is only trusted for this repo if the SAME chat_session_path also appears on
+// a textedit row that DOES carry this repo's path — i.e. that chat session
+// actually produced edits here.
 func (db *DB) ChatSessionPathsForPeriod(repoPath string, sinceNanos, untilNanos int64) ([]ChatSessionRef, error) {
 	rows, err := db.Query(`
-		SELECT DISTINCT raw_meta FROM edits
+		SELECT repo_path, raw_meta FROM edits
 		WHERE (repo_path = ? OR repo_path = '') AND ts >= ? AND ts <= ?
 		  AND raw_meta LIKE '%chat_session_path%'`,
 		repoPath, sinceNanos, untilNanos)
@@ -576,11 +580,16 @@ func (db *DB) ChatSessionPathsForPeriod(repoPath string, sinceNanos, untilNanos 
 		return nil, err
 	}
 	defer rows.Close()
-	seen := map[string]bool{}
-	var out []ChatSessionRef
+	type rawRow struct {
+		repoPath string
+		path     string
+		tool     string
+	}
+	var parsed []rawRow
+	confirmed := map[string]bool{}
 	for rows.Next() {
-		var raw string
-		if err := rows.Scan(&raw); err != nil {
+		var rp, raw string
+		if err := rows.Scan(&rp, &raw); err != nil {
 			continue
 		}
 		var m struct {
@@ -590,9 +599,20 @@ func (db *DB) ChatSessionPathsForPeriod(repoPath string, sinceNanos, untilNanos 
 		if err := json.Unmarshal([]byte(raw), &m); err != nil || m.ChatSessionPath == "" {
 			continue
 		}
-		if !seen[m.ChatSessionPath] {
-			seen[m.ChatSessionPath] = true
-			out = append(out, ChatSessionRef{Path: m.ChatSessionPath, Tool: Tool(m.Tool)})
+		parsed = append(parsed, rawRow{repoPath: rp, path: m.ChatSessionPath, tool: m.Tool})
+		if rp == repoPath {
+			confirmed[m.ChatSessionPath] = true
+		}
+	}
+	seen := map[string]bool{}
+	var out []ChatSessionRef
+	for _, r := range parsed {
+		if r.repoPath != repoPath && !confirmed[r.path] {
+			continue // unconfirmed cross-repo chat session — would leak
+		}
+		if !seen[r.path] {
+			seen[r.path] = true
+			out = append(out, ChatSessionRef{Path: r.path, Tool: Tool(r.tool)})
 		}
 	}
 	return out, rows.Err()

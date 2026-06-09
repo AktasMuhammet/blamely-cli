@@ -166,13 +166,17 @@ func cmdDetect() *cobra.Command {
 }
 
 func cmdInstall() *cobra.Command {
-	return &cobra.Command{
+	var skipPlugins bool
+	c := &cobra.Command{
 		Use:   "install",
 		Short: "Install Blamely (Claude hook, global git hook, daemon agent)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return install.Run()
+			return install.Run(!skipPlugins)
 		},
 	}
+	c.Flags().BoolVar(&skipPlugins, "skip-plugins", false,
+		"skip installing the VS Code-family/JetBrains IDE plugins (CLI + hooks only — handy for local dev builds)")
+	return c
 }
 
 func cmdUninstall() *cobra.Command {

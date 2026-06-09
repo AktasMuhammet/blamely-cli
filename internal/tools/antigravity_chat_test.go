@@ -165,8 +165,15 @@ func TestAntigravityGeminiWatcher_CreateEmitsWholeFileChatEdit(t *testing.T) {
 	if ev.FilePath != "style.css" {
 		t.Errorf("file_path = %q, want style.css", ev.FilePath)
 	}
-	if len(ev.Lines) != 1 || ev.Lines[0].Start != 1 || ev.Lines[0].End != 2 {
-		t.Errorf("lines = %+v, want whole-file range 1..2", ev.Lines)
+	// One single-line range per line (each with its own content SHA), not one
+	// combined whole-file range — so per-line content_sha attribution can match.
+	if len(ev.Lines) != 2 {
+		t.Fatalf("lines = %+v, want 2 single-line ranges", ev.Lines)
+	}
+	for i := range ev.Lines {
+		if ev.Lines[i].Start != i+1 || ev.Lines[i].End != i+1 {
+			t.Errorf("lines[%d] = %+v, want %d..%d", i, ev.Lines[i], i+1, i+1)
+		}
 	}
 	if ev.SuggestedLines != 2 {
 		t.Errorf("suggested_lines = %d, want 2", ev.SuggestedLines)

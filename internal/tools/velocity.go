@@ -184,7 +184,7 @@ func (v *VelocityWatcher) handleChange(
 		return // can't attribute — skip
 	}
 	lr, err := LineRangeForWholeFile(abs)
-	if err != nil || lr == nil {
+	if err != nil || len(lr) == 0 {
 		return
 	}
 
@@ -195,7 +195,7 @@ func (v *VelocityWatcher) handleChange(
 		GenType:    genType,
 		RepoPath:   repoID,
 		FilePath:   rel,
-		Lines:      []daemon.LineRange{{Start: lr.Start, End: lr.End, ContentSHA: lr.ContentSHA}},
+		Lines:      toDaemonLineRanges(lr),
 		RawMeta:    `{"source":"velocity_detector"}`,
 	}
 	if err := sink.Record(ev); err != nil {

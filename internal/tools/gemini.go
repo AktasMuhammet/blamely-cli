@@ -93,7 +93,7 @@ func extractGeminiRanges(p geminiHookPayload) (string, []LineRange, int64) {
 		if lr == nil {
 			return in.FilePath, nil, suggested
 		}
-		return in.FilePath, []LineRange{*lr}, suggested
+		return in.FilePath, lr, suggested
 
 	case "replace":
 		var in struct {

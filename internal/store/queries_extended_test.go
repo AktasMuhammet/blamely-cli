@@ -402,25 +402,31 @@ func TestSessionTranscriptsForPeriod_DedupsBySession(t *testing.T) {
 
 // ── ChatSessionPathsForPeriod ─────────────────────────────────────────────────
 
-func TestChatSessionPathsForPeriod_MatchesRepoAndEmpty(t *testing.T) {
+func TestChatSessionPathsForPeriod_MatchesRepoAndConfirmedEmpty(t *testing.T) {
 	db := openTestDB(t)
 	ts := time.Now().UnixNano()
-	// Row with matching repo_path.
+	// Textedit row with matching repo_path — confirms /cs1.jsonl belongs to /r.
 	raw1, _ := json.Marshal(map[string]string{"chat_session_path": "/cs1.jsonl", "tool": "copilot"})
 	insertEdit(t, db, "/r", "f.go", ToolCopilot, GenTypeChat, ts, string(raw1))
-	// Row with empty repo_path (chat-session marker).
+	// Session-response marker for the SAME chat session, recorded with an
+	// empty repo_path (the editor event isn't tied to a file) — must be
+	// included now that /cs1.jsonl is confirmed for /r.
+	raw1b, _ := json.Marshal(map[string]string{"chat_session_path": "/cs1.jsonl", "tool": "copilot"})
+	insertEdit(t, db, "", "", ToolCopilot, GenTypeChat, ts+1, string(raw1b))
+	// Unrelated chat session recorded with an empty repo_path and never
+	// confirmed against /r — must NOT leak into /r's results.
 	raw2, _ := json.Marshal(map[string]string{"chat_session_path": "/cs2.jsonl", "tool": "cursor"})
-	insertEdit(t, db, "", "", ToolCursor, GenTypeChat, ts+1, string(raw2))
+	insertEdit(t, db, "", "", ToolCursor, GenTypeChat, ts+2, string(raw2))
 	// Row with different repo_path — must NOT appear.
 	raw3, _ := json.Marshal(map[string]string{"chat_session_path": "/cs3.jsonl", "tool": "cursor"})
-	insertEdit(t, db, "/other", "g.go", ToolCursor, GenTypeChat, ts+2, string(raw3))
+	insertEdit(t, db, "/other", "g.go", ToolCursor, GenTypeChat, ts+3, string(raw3))
 
 	results, err := db.ChatSessionPathsForPeriod("/r", ts-1, ts+10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 2 {
-		t.Errorf("want 2 results (own repo + empty repo), got %d: %v", len(results), results)
+	if len(results) != 1 || results[0].Path != "/cs1.jsonl" {
+		t.Errorf("want only the confirmed /cs1.jsonl, got %v", results)
 	}
 }
 

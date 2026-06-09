@@ -124,14 +124,22 @@ func TestLineRangeForWholeFile_SingleLine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lr == nil {
-		t.Fatal("expected non-nil")
+	if len(lr) != 1 {
+		t.Fatalf("want 1 range, got %+v", lr)
 	}
-	if lr.Start != 1 || lr.End != 1 {
-		t.Errorf("want 1..1, got %d..%d", lr.Start, lr.End)
+	if lr[0].Start != 1 || lr[0].End != 1 {
+		t.Errorf("want 1..1, got %d..%d", lr[0].Start, lr[0].End)
+	}
+	if lr[0].ContentSHA != sha256Hex([]byte("package x")) {
+		t.Errorf("want per-line content SHA of %q, got %q", "package x", lr[0].ContentSHA)
 	}
 }
 
+// Each line must carry its OWN content SHA — not one hash for the whole blob —
+// so per-line content_sha attribution (which hashes one current line at a time
+// to re-locate it after drift) can actually match a "whole file written" event.
+// A combined whole-file hash can never equal any single line's hash, which was
+// silently leaving e.g. Codex's `patch_apply: "add"` events unattributed.
 func TestLineRangeForWholeFile_MultiLine(t *testing.T) {
 	dir := t.TempDir()
 	p := writeFile(t, dir, "m.go", "a\nb\nc\nd\ne\n")
@@ -139,8 +147,17 @@ func TestLineRangeForWholeFile_MultiLine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lr == nil || lr.End != 5 {
-		t.Errorf("want end=5, got %+v", lr)
+	if len(lr) != 5 {
+		t.Fatalf("want 5 ranges, got %+v", lr)
+	}
+	for i, want := range []string{"a", "b", "c", "d", "e"} {
+		r := lr[i]
+		if r.Start != i+1 || r.End != i+1 {
+			t.Errorf("range %d: want %d..%d, got %d..%d", i, i+1, i+1, r.Start, r.End)
+		}
+		if r.ContentSHA != sha256Hex([]byte(want)) {
+			t.Errorf("range %d: want content SHA of %q, got %q", i, want, r.ContentSHA)
+		}
 	}
 }
 

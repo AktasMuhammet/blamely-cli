@@ -22,7 +22,14 @@ import (
 //      writes a post-commit script that calls `blamely attribute`.
 //   5. Registers the daemon under launchd / systemd --user / Scheduled Tasks.
 //   6. Persists a state.json so `uninstall` can fully reverse the install.
-func Run() error {
+//
+// installPlugins gates step 3.5: downloading/installing the VS Code-family and
+// JetBrains IDE plugins from their marketplaces. Local dev installs default to
+// skipping this (rebuilding from source already exercises the plugin code, and
+// re-downloading the marketplace build on every `install.sh` run is wasteful
+// and can clobber a sideloaded dev build); the distributed installers and
+// release pipeline always pass true so end users get the full experience.
+func Run(installPlugins bool) error {
 	srcBinPath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("locate blamely binary: %w", err)
@@ -154,51 +161,59 @@ func Run() error {
 	// auto-installed via each editor's bundled CLI when the editor is present.
 	// Separate from Hooks because these come from an external marketplace
 	// (VS Code Marketplace / Open VSX) rather than a config-file merge.
+	//
+	// Skippable via installPlugins=false (local dev installs default to this —
+	// see the doc comment on Run): downloading marketplace builds is slow and
+	// can overwrite a sideloaded dev build of the plugin under test.
 	section("Editors")
-
-	var editorLabelsInstalled []string
-	for _, r := range InstallEditorExtensions() {
-		switch {
-		case r.Err != nil:
-			fail(r.Label, r.Err.Error())
-		case r.CLIPath == "":
-			info(r.Label, "not detected — skipped")
-		case r.Installed:
-			ok(r.Label, "extension installed from marketplace · "+blamelyExtensionID)
-			editorLabelsInstalled = append(editorLabelsInstalled, r.Label)
-		case r.Updated:
-			ok(r.Label, "extension updated to latest · "+blamelyExtensionID)
-		default:
-			info(r.Label, "extension already installed · "+blamelyExtensionID)
-		}
-	}
-	s.EditorExtensionsInstalled = mergeLabels(s.EditorExtensionsInstalled, editorLabelsInstalled)
-
-	// JetBrains IDEs (IntelliJ IDEA, WebStorm, GoLand, …) don't expose a CLI
-	// extension-install flow the way Code-OSS forks do, so we go straight to
-	// the JetBrains Marketplace: download a build-compatible plugin zip and
-	// unzip it into the IDE's plugins directory.
-	jetResults := InstallJetBrainsPlugins()
-	if len(jetResults) == 0 {
-		info("JetBrains IDEs", "not detected — skipped")
+	if !installPlugins {
+		info("Editors", "skipped (--skip-plugins)")
+		info("JetBrains IDEs", "skipped (--skip-plugins)")
 	} else {
-		var jetbrainsRestartNeeded bool
-		var jetbrainsDirsInstalled []string
-		for _, r := range jetResults {
+		var editorLabelsInstalled []string
+		for _, r := range InstallEditorExtensions() {
 			switch {
 			case r.Err != nil:
 				fail(r.Label, r.Err.Error())
+			case r.CLIPath == "":
+				info(r.Label, "not detected — skipped")
 			case r.Installed:
-				ok(r.Label, "plugin installed from marketplace · ai.blamely")
-				jetbrainsDirsInstalled = append(jetbrainsDirsInstalled, r.PluginsDir)
-				jetbrainsRestartNeeded = true
+				ok(r.Label, "extension installed from marketplace · "+blamelyExtensionID)
+				editorLabelsInstalled = append(editorLabelsInstalled, r.Label)
+			case r.Updated:
+				ok(r.Label, "extension updated to latest · "+blamelyExtensionID)
 			default:
-				info(r.Label, "plugin already installed · ai.blamely")
+				info(r.Label, "extension already installed · "+blamelyExtensionID)
 			}
 		}
-		s.JetBrainsPluginsInstalled = mergeLabels(s.JetBrainsPluginsInstalled, jetbrainsDirsInstalled)
-		if jetbrainsRestartNeeded {
-			info("JetBrains IDEs", "restart to load the newly installed plugin")
+		s.EditorExtensionsInstalled = mergeLabels(s.EditorExtensionsInstalled, editorLabelsInstalled)
+
+		// JetBrains IDEs (IntelliJ IDEA, WebStorm, GoLand, …) don't expose a CLI
+		// extension-install flow the way Code-OSS forks do, so we go straight to
+		// the JetBrains Marketplace: download a build-compatible plugin zip and
+		// unzip it into the IDE's plugins directory.
+		jetResults := InstallJetBrainsPlugins()
+		if len(jetResults) == 0 {
+			info("JetBrains IDEs", "not detected — skipped")
+		} else {
+			var jetbrainsRestartNeeded bool
+			var jetbrainsDirsInstalled []string
+			for _, r := range jetResults {
+				switch {
+				case r.Err != nil:
+					fail(r.Label, r.Err.Error())
+				case r.Installed:
+					ok(r.Label, "plugin installed from marketplace · ai.blamely")
+					jetbrainsDirsInstalled = append(jetbrainsDirsInstalled, r.PluginsDir)
+					jetbrainsRestartNeeded = true
+				default:
+					info(r.Label, "plugin already installed · ai.blamely")
+				}
+			}
+			s.JetBrainsPluginsInstalled = mergeLabels(s.JetBrainsPluginsInstalled, jetbrainsDirsInstalled)
+			if jetbrainsRestartNeeded {
+				info("JetBrains IDEs", "restart to load the newly installed plugin")
+			}
 		}
 	}
 
@@ -325,9 +340,24 @@ func Uninstall() error {
 		report(fmt.Sprintf("removed Blamely extension from %s", strings.Join(s.EditorExtensionsInstalled, ", ")),
 			UninstallEditorExtensions(s.EditorExtensionsInstalled))
 	}
-	if len(s.JetBrainsPluginsInstalled) > 0 {
-		report(fmt.Sprintf("removed Blamely plugin from %d JetBrains IDE(s)", len(s.JetBrainsPluginsInstalled)),
-			UninstallJetBrainsPlugins(s.JetBrainsPluginsInstalled))
+	// Don't rely solely on state: the plugin may have been sideloaded for
+	// development, installed manually, or predate state tracking, so it was
+	// never recorded in JetBrainsPluginsInstalled. The "Blamely-intellij*"
+	// directory name is uniquely ours (the same glob install/uninstall already
+	// trust to recognise it), so finding live matches in every detected
+	// JetBrains IDE is a safe, self-sufficient way to discover what to remove.
+	var discoveredJetBrainsDirs []string
+	if ides, err := findJetBrainsIDEs(); err == nil {
+		for _, ide := range ides {
+			if hasJetBrainsPlugin(ide.PluginsDir) {
+				discoveredJetBrainsDirs = append(discoveredJetBrainsDirs, ide.PluginsDir)
+			}
+		}
+	}
+	jetbrainsDirs := mergeLabels(s.JetBrainsPluginsInstalled, discoveredJetBrainsDirs)
+	if len(jetbrainsDirs) > 0 {
+		report(fmt.Sprintf("removed Blamely plugin from %d JetBrains IDE(s)", len(jetbrainsDirs)),
+			UninstallJetBrainsPlugins(jetbrainsDirs))
 	}
 	if s.LaunchAgentInstalled {
 		report("removed daemon agent", UninstallDaemonAgent())
