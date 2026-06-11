@@ -37,6 +37,10 @@ func CopyBinary(src string) (string, error) {
 		return "", err
 	}
 	if same, _ := sameFile(src, dst); same {
+		// Already the stable copy (e.g. re-running `install` from
+		// ~/.blamely/bin). Still self-heal: a binary downloaded straight into
+		// place may carry a quarantine flag / stale signature.
+		_ = prepareInstalledBinary(dst)
 		return dst, nil
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
@@ -69,6 +73,10 @@ func CopyBinary(src string) (string, error) {
 	if err := os.Rename(tmpPath, dst); err != nil {
 		return "", fmt.Errorf("rename to %s: %w", dst, err)
 	}
+	// Make the stable copy Gatekeeper-safe on macOS (strip quarantine +
+	// ad-hoc re-sign) so the daemon agent and git hook can launch it without a
+	// "Killed: 9". No-op on Linux/Windows. Best-effort — never block install.
+	_ = prepareInstalledBinary(dst)
 	return dst, nil
 }
 
