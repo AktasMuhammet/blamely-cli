@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -124,10 +125,18 @@ func Run(ctx context.Context) error {
 
 	// Prefer a Unix domain socket — it bypasses network security tools (e.g.
 	// Trend Micro) that intercept localhost TCP. Falls back to a random TCP port
-	// on systems that don't support AF_UNIX (older Windows builds).
+	// on systems where AF_UNIX is unusable.
+	//
+	// Windows is forced onto TCP even though Go can bind an AF_UNIX socket on
+	// Win10 1803+: the editor plugins can't reach a *filesystem* AF_UNIX socket
+	// reliably there — Node's http `socketPath` is interpreted as a named pipe,
+	// not a Unix socket file. If the daemon bound AF_UNIX, it would write
+	// daemon.sock (not daemon.port), `blamely status` (Go) would connect fine,
+	// but the VS Code / JetBrains plugins would fail and report "daemon not
+	// active". Loopback TCP works identically across Go, Node, and the JVM.
 	sockPath, sockErr := config.SocketFile()
 	var listener net.Listener
-	if sockErr == nil {
+	if sockErr == nil && runtime.GOOS != "windows" {
 		_ = os.Remove(sockPath) // clean up stale socket from a previous run
 		if l, err := net.Listen("unix", sockPath); err == nil {
 			listener = l
@@ -142,7 +151,13 @@ func Run(ctx context.Context) error {
 		}
 	}
 	if listener == nil {
-		// AF_UNIX unavailable or path error — fall back to TCP.
+		// AF_UNIX unavailable, disabled (Windows), or path error — fall back to
+		// TCP. Remove any stale daemon.sock left by a previous run/version so
+		// clients (which prefer the socket when its file exists) don't try a
+		// dead socket and skip the live port.
+		if sockErr == nil {
+			_ = os.Remove(sockPath)
+		}
 		l, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			return fmt.Errorf("listen: %w", err)
