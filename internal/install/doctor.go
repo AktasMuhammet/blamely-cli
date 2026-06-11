@@ -173,11 +173,15 @@ func (d *doctor) hooks() {
 	d.section("AI tool hooks")
 	det, _ := Detect()
 	checks := []hookCheck{
-		{"Claude (~/.claude/settings.json)", config.ClaudeSettingsPath, "blamely record claude", det.Claude.Present},
-		{"Cursor (~/.cursor/hooks.json)", config.CursorHooksPath, "blamely record cursor", det.Cursor.Present},
-		{"Codex (~/.codex/config.toml)", config.CodexConfigPath, "blamely record codex", det.Codex.Present},
-		{"Copilot (~/.copilot/hooks/blamely.json)", config.CopilotBlamelyHookPath, "blamely record copilot", det.Copilot.Present},
-		{"Gemini (~/.gemini/settings.json)", config.GeminiSettingsPath, "blamely record gemini", det.Gemini.Present},
+		// Markers omit the binary name: the hook command is `<path> record
+		// <tool>`, and on Windows <path> ends in `blamely.exe`, so a "blamely
+		// record <tool>" needle would never match. `record <tool>` is the
+		// extension-agnostic tail that's always present.
+		{"Claude (~/.claude/settings.json)", config.ClaudeSettingsPath, "record claude", det.Claude.Present},
+		{"Cursor (~/.cursor/hooks.json)", config.CursorHooksPath, "record cursor", det.Cursor.Present},
+		{"Codex (~/.codex/config.toml)", config.CodexConfigPath, "record codex", det.Codex.Present},
+		{"Copilot (~/.copilot/hooks/blamely.json)", config.CopilotBlamelyHookPath, "record copilot", det.Copilot.Present},
+		{"Gemini (~/.gemini/settings.json)", config.GeminiSettingsPath, "record gemini", det.Gemini.Present},
 	}
 	for _, c := range checks {
 		p, err := c.path()

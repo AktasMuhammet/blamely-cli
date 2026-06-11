@@ -23,7 +23,10 @@ import (
 //     }
 //   }
 
-const copilotBlamelyMarker = "blamely record copilot"
+// Marker omits the binary name: the command is `<path> record copilot`, and on
+// Windows <path> ends in `blamely.exe`, so "blamely record copilot" would never
+// match. `record copilot` is the extension-agnostic tail that's always present.
+const copilotBlamelyMarker = "record copilot"
 
 // copilotHookEvents is every event we register the blamely command under
 // inside our dedicated blamely.json file.

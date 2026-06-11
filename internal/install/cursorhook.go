@@ -19,7 +19,10 @@ import (
 //   }
 // Cursor uses lowercase event names (postToolUse / preToolUse) and no matcher.
 
-const cursorBlamelyMarker = "blamely record cursor"
+// Marker omits the binary name: the command is `<path> record cursor`, and on
+// Windows <path> ends in `blamely.exe`, so "blamely record cursor" would never
+// match. `record cursor` is the extension-agnostic tail that's always present.
+const cursorBlamelyMarker = "record cursor"
 
 // cursorHookEvents is every event under which we register the blamely record
 // command in ~/.cursor/hooks.json.

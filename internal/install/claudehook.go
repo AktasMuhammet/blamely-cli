@@ -16,7 +16,11 @@ const (
 	// Write/Edit tools — still fire our PostToolUse hook. The recorder
 	// attributes the source files that changed during the command.
 	claudeHookMatcher = "Write|Edit|MultiEdit|NotebookEdit|Bash"
-	blamelyHookMarker = "blamely record claude"
+	// Marker omits the binary name on purpose: the command is
+	// `<path> record claude`, and on Windows <path> ends in `blamely.exe`, so a
+	// "blamely record claude" needle would never match. `record claude` is the
+	// extension-agnostic, blamely-specific tail that's always present.
+	blamelyHookMarker = "record claude"
 )
 
 // claudeHookEvents is every event name we register the blamely command under.

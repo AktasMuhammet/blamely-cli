@@ -29,8 +29,11 @@ import (
 //   }
 
 const (
-	geminiHookMatcher   = "*"
-	geminiBlamelyMarker = "blamely record gemini"
+	geminiHookMatcher = "*"
+	// Marker omits the binary name: the command is `<path> record gemini`, and
+	// on Windows <path> ends in `blamely.exe`, so "blamely record gemini" would
+	// never match. `record gemini` is the extension-agnostic tail always present.
+	geminiBlamelyMarker = "record gemini"
 )
 
 // geminiHookEvents is every Gemini hook event under which we register the

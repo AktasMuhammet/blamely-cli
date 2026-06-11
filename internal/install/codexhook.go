@@ -26,7 +26,10 @@ import (
 //   command = "/path/to/blamely record codex"
 //   type = "command"
 
-const codexBlamelyMarker = "blamely record codex"
+// Marker omits the binary name: the command is `<path> record codex`, and on
+// Windows <path> ends in `blamely.exe`, so "blamely record codex" would never
+// match. `record codex` is the extension-agnostic tail that's always present.
+const codexBlamelyMarker = "record codex"
 
 // codexHookEvents is every Codex hook event under which we register the
 // blamely record command.

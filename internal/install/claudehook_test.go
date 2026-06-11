@@ -279,8 +279,10 @@ func TestContainsBlamelyHook(t *testing.T) {
 		{"/usr/local/bin/blamely record claude", true},
 		{"/home/user/.blamely/bin/blamely record claude", true},
 		{"blamely record claude", true},
+		{`C:\Users\me\.blamely\bin\blamely.exe record claude`, true},
 		{"echo hello", false},
 		{"blamely status", false},
+		{"blamely record cursor", false},
 		{"", false},
 	}
 	for _, c := range cases {
