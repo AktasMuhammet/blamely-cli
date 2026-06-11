@@ -192,7 +192,7 @@ func (d *doctor) hooks() {
 				continue
 			}
 			d.bad(c.tool, fmt.Sprintf("file missing (%s)", p),
-				"run `blamely install` (will re-create)")
+				"run `blamely repair` (will create it)")
 			continue
 		}
 		if !strings.Contains(string(data), c.marker) {
@@ -201,7 +201,7 @@ func (d *doctor) hooks() {
 				continue
 			}
 			d.bad(c.tool, "blamely hook NOT present in file",
-				"run `blamely install` (idempotent — merges into existing hooks)")
+				"run `blamely repair` to configure it")
 			continue
 		}
 		d.ok(c.tool, p)

@@ -439,8 +439,8 @@ func printNextSteps(d *Detected) {
 	} else {
 		fmt.Println("  · Claude Code wasn't detected. Install it, run `blamely install` again, or add the hook manually.")
 	}
-	if !d.Cursor.Present && !d.Codex.Present && !d.Copilot.Present && !d.Gemini.Present {
-		fmt.Println("  · Cursor/Codex/Copilot/Gemini integrations will activate automatically once those tools appear.")
+	if !d.Cursor.Present || !d.Codex.Present || !d.Copilot.Present || !d.Gemini.Present {
+		fmt.Println("  · Install Cursor/Codex/Copilot/Gemini later? Run `blamely repair` to wire up its hook (`blamely doctor` checks first).")
 	}
 	fmt.Println("  · `blamely status` shows the daemon health.")
 	fmt.Println("  · `blamely uninstall` reverses every change above.")

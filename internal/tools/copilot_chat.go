@@ -43,6 +43,17 @@ import (
 const copilotChatPollInterval = 3 * time.Second
 const copilotChatStaleCutoff = 24 * time.Hour
 
+// Adaptive polling: the 3s base cadence is fine when nothing is happening, but
+// it makes a freshly-typed chat edit take up to 3–4s to show up. So whenever a
+// session file changed recently we poll at copilotChatActiveInterval instead,
+// for a copilotChatActiveWindow grace period after the last observed change.
+// This cuts perceived detection latency to <1s during active use without
+// walking workspaceStorage any more often than before while idle.
+const (
+	copilotChatActiveInterval = 600 * time.Millisecond
+	copilotChatActiveWindow   = 20 * time.Second
+)
+
 // ── Public watcher types ──────────────────────────────────────────────────────
 
 // CopilotChatWatcher implements daemon.Watcher for GitHub Copilot chat sessions
@@ -162,25 +173,44 @@ func (w *chatSessionWatcher) run(ctx context.Context, sink daemon.Sink) error {
 	var mu sync.Mutex
 	state := map[string]*sessionState{}
 
-	tick := time.NewTicker(copilotChatPollInterval)
-	defer tick.Stop()
+	// Adaptive cadence: scanRoot reports the newest session-file mtime it saw;
+	// while that's within copilotChatActiveWindow of now we poll fast, otherwise
+	// we fall back to the idle base interval.
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	var lastActivity time.Time
 	for {
+		var latest time.Time
 		for _, root := range w.roots {
-			w.scanRoot(root, state, &mu, sink)
+			if t := w.scanRoot(root, state, &mu, sink); t.After(latest) {
+				latest = t
+			}
 		}
 		w.evictStale(state, &mu)
+		if latest.After(lastActivity) {
+			lastActivity = latest
+		}
+		next := copilotChatPollInterval
+		if time.Since(lastActivity) < copilotChatActiveWindow {
+			next = copilotChatActiveInterval
+		}
+		timer.Reset(next)
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-tick.C:
+		case <-timer.C:
 		}
 	}
 }
 
-func (w *chatSessionWatcher) scanRoot(root string, state map[string]*sessionState, mu *sync.Mutex, sink daemon.Sink) {
+// scanRoot walks one workspaceStorage root and processes every chat session
+// file under it. It returns the newest session-file mtime it observed, which
+// run() uses to decide whether to keep polling at the fast active cadence.
+func (w *chatSessionWatcher) scanRoot(root string, state map[string]*sessionState, mu *sync.Mutex, sink daemon.Sink) time.Time {
 	if root == "" {
-		return
+		return time.Time{}
 	}
+	var latest time.Time
 	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -196,16 +226,23 @@ func (w *chatSessionWatcher) scanRoot(root string, state map[string]*sessionStat
 		if !strings.HasSuffix(p, ".jsonl") || !strings.Contains(p, string(filepath.Separator)+"chatSessions"+string(filepath.Separator)) {
 			return nil
 		}
-		w.handleSessionFile(p, state, mu, sink)
+		if mtime := w.handleSessionFile(p, state, mu, sink); mtime.After(latest) {
+			latest = mtime
+		}
 		return nil
 	})
+	return latest
 }
 
-func (w *chatSessionWatcher) handleSessionFile(path string, state map[string]*sessionState, mu *sync.Mutex, sink daemon.Sink) {
+// handleSessionFile processes one chat session JSONL and returns the file's
+// mtime (zero on stat failure) so the caller can track recent activity for
+// adaptive polling.
+func (w *chatSessionWatcher) handleSessionFile(path string, state map[string]*sessionState, mu *sync.Mutex, sink daemon.Sink) time.Time {
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() {
-		return
+		return time.Time{}
 	}
+	mtime := info.ModTime()
 	mu.Lock()
 	st, ok := state[path]
 	if !ok {
@@ -228,16 +265,16 @@ func (w *chatSessionWatcher) handleSessionFile(path string, state map[string]*se
 	w.scanTextEdits(path, st, mu, sink, info.ModTime(), info.Size())
 
 	if info.Size() <= startOffset {
-		return
+		return mtime
 	}
 
 	f, err := os.Open(path)
 	if err != nil {
-		return
+		return mtime
 	}
 	defer f.Close()
 	if _, err := f.Seek(startOffset, 0); err != nil {
-		return
+		return mtime
 	}
 	r := bufio.NewReaderSize(f, 1<<16)
 	now := time.Now()
@@ -255,6 +292,7 @@ func (w *chatSessionWatcher) handleSessionFile(path string, state map[string]*se
 	st.offset = newOffset
 	st.lastTouch = now
 	mu.Unlock()
+	return mtime
 }
 
 // scanTextEdits incrementally scans the bytes appended to the session file

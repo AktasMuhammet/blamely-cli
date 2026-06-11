@@ -94,20 +94,25 @@ func cmdRepair() *cobra.Command {
 	var dryRun bool
 	c := &cobra.Command{
 		Use:   "repair",
-		Short: "Find and remove stale blamely/blamely-cli hooks left in repos",
-		Long: "Scans your home directory for .git/hooks/post-commit files written by\n" +
-			"an old blamely or blamely-cli installation and removes them.\n" +
-			"The global core.hooksPath hook installed by `blamely install` takes over.",
+		Short: "Configure hooks for newly-detected AI tools, remove stale hooks",
+		Long: "Re-checks every AI tool blamely supports (Claude, Cursor, Codex,\n" +
+			"Copilot, Gemini): if one is now present but its hook was never\n" +
+			"configured — e.g. you installed it after running `blamely install` —\n" +
+			"repair configures it.\n\n" +
+			"Also scans your home directory for .git/hooks/post-commit files written\n" +
+			"by an old blamely or blamely-cli installation and removes them. The\n" +
+			"global core.hooksPath hook installed by `blamely install` takes over.\n\n" +
+			"--dry-run only previews stale-hook removal; it does not write hooks.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			result, err := install.Repair(dryRun)
 			if err != nil {
 				return err
 			}
-			if len(result.Found) == 0 {
-				fmt.Println("No stale blamely hooks found.")
-				return nil
-			}
 			if dryRun {
+				if len(result.Found) == 0 {
+					fmt.Println("No stale blamely hooks found.")
+					return nil
+				}
 				fmt.Printf("Would remove %d stale hook(s):\n", len(result.Found))
 				for _, f := range result.Found {
 					fmt.Printf("  - %s\n", f)
@@ -116,14 +121,23 @@ func cmdRepair() *cobra.Command {
 				return nil
 			}
 			for _, p := range result.Removed {
-				fmt.Printf("  ✓ removed %s\n", p)
+				fmt.Printf("  ✓ removed stale hook %s\n", p)
+			}
+			for _, h := range result.HooksAdded {
+				fmt.Printf("  ✓ configured hook for %s\n", h)
 			}
 			for _, e := range result.Errors {
 				fmt.Printf("  ✗ %s\n", e)
 			}
-			fmt.Printf("\nRemoved %d stale hook(s). Your commits will now use the global hook at\n", len(result.Removed))
-			if hooksDir, err := install.GitHooksDirPath(); err == nil {
-				fmt.Printf("  %s/post-commit\n", hooksDir)
+			if len(result.Removed) == 0 && len(result.HooksAdded) == 0 && len(result.Errors) == 0 {
+				fmt.Println("Nothing to repair — hooks are configured and no stale entries were found.")
+				return nil
+			}
+			if len(result.Removed) > 0 {
+				fmt.Printf("\nRemoved %d stale hook(s). Your commits will now use the global hook at\n", len(result.Removed))
+				if hooksDir, err := install.GitHooksDirPath(); err == nil {
+					fmt.Printf("  %s/post-commit\n", hooksDir)
+				}
 			}
 			return nil
 		},

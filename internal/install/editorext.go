@@ -15,6 +15,13 @@ import (
 //   https://open-vsx.org/extension/blamely/blamely                       (Open VSX — Antigravity IDE's gallery, Cursor's fallback)
 const blamelyExtensionID = "Blamely.blamely"
 
+// signatureVerificationError is VS Code's own message when its bundled
+// vsce-sign helper fails to run during `--install-extension`. It's transient
+// and environment-dependent — e.g. it reliably fires when `code` is spawned
+// non-interactively (as blamely install does) but a retry of the exact same
+// command in the same environment succeeds.
+const signatureVerificationError = "Signature verification was not executed"
+
 // editorExtensionTarget describes how to locate one VS Code-family editor's
 // bundled CLI so we can drive its `--install-extension` flow — the exact
 // mechanism each editor's own marketplace search / "Install from VSIX" action
@@ -87,6 +94,9 @@ func InstallEditorExtensions() []EditorExtensionResult {
 		// subsequent run, so users never get stuck on a stale version.
 		wasPresent := extensionInstalled(cliPath, blamelyExtensionID)
 		out, err := exec.Command(cliPath, "--install-extension", blamelyExtensionID, "--force").CombinedOutput()
+		if err != nil && strings.Contains(string(out), signatureVerificationError) {
+			out, err = exec.Command(cliPath, "--install-extension", blamelyExtensionID, "--force").CombinedOutput()
+		}
 		if err != nil {
 			r.Err = fmt.Errorf("%s --install-extension %s --force: %w: %s",
 				filepath.Base(cliPath), blamelyExtensionID, err, strings.TrimSpace(string(out)))

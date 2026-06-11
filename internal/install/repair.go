@@ -21,6 +21,11 @@ type RepairResult struct {
 	Found   []string // paths of stale hooks detected
 	Removed []string // paths actually removed
 	Errors  []string // non-fatal problems
+
+	// HooksAdded lists "<Tool> (<path>)" for every AI-tool hook that was
+	// missing and has now been configured — e.g. the user installed
+	// Codex/Cursor/Gemini after `blamely install` already ran.
+	HooksAdded []string
 }
 
 // Repair scans the user's home directory (up to maxRepairDepth levels) for
@@ -80,7 +85,74 @@ func Repair(dryRun bool) (*RepairResult, error) {
 		}
 		return nil
 	})
-	return result, err
+	if err != nil {
+		return result, err
+	}
+	addMissingToolHooks(dryRun, result)
+	return result, nil
+}
+
+// addMissingToolHooks re-checks every AI tool blamely supports and configures
+// the `blamely record <tool>` hook for any that are present but not yet
+// wired up — the case where the user installs Cursor/Codex/Copilot/Gemini
+// AFTER `blamely install` already ran, so install.Run's per-tool hook step
+// never saw them. Each Install*Hook is idempotent (a no-op, added=false, when
+// the hook is already configured), so this is safe to call on every repair.
+//
+// No-ops entirely under --dry-run (and if blamely itself isn't installed yet
+// — `blamely install` is the right command in that case).
+func addMissingToolHooks(dryRun bool, result *RepairResult) {
+	if dryRun {
+		return
+	}
+	binPath, err := InstalledBinaryPath()
+	if err != nil {
+		return
+	}
+	if _, err := os.Stat(binPath); err != nil {
+		return
+	}
+	det, err := Detect()
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("detect tools: %v", err))
+		return
+	}
+	s, err := LoadState()
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("load state: %v", err))
+		return
+	}
+
+	for _, h := range []struct {
+		name    string
+		present bool
+		install func(string) (bool, string, error)
+		added   *bool
+	}{
+		{"Claude Code", det.Claude.Present, InstallClaudeHook, &s.ClaudeHookAdded},
+		{"Cursor", det.Cursor.Present, InstallCursorHook, &s.CursorHookAdded},
+		{"Codex CLI", det.Codex.Present, InstallCodexHook, &s.CodexHookAdded},
+		{"GitHub Copilot", det.Copilot.Present, InstallCopilotHook, &s.CopilotHookAdded},
+		{"Gemini CLI", det.Gemini.Present, InstallGeminiHook, &s.GeminiHookAdded},
+	} {
+		if !h.present {
+			continue
+		}
+		added, path, err := h.install(binPath)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("%s hook: %v", h.name, err))
+			continue
+		}
+		if added {
+			result.HooksAdded = append(result.HooksAdded, fmt.Sprintf("%s (%s)", h.name, path))
+			*h.added = true
+		}
+	}
+	if len(result.HooksAdded) > 0 {
+		if err := SaveState(s); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("save state: %v", err))
+		}
+	}
 }
 
 // checkStaleHook reads the hook file and returns (true, reason, nil) when the
