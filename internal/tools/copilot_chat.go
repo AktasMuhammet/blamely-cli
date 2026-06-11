@@ -150,9 +150,12 @@ type sessionState struct {
 	// textEditGroup detection scans incrementally from tegOffset (its own
 	// cursor, independent of offset above) and is deduped by edit key in
 	// seenEdits. tegMtime gates re-scans so an unchanged file costs nothing.
-	tegMtime  time.Time
-	tegOffset int64
-	seenEdits map[string]bool
+	// nextReqIdx is the requests-array length seen so far, used to assign a
+	// stable index to whole-new-request appends (k=["requests"]).
+	tegMtime   time.Time
+	tegOffset  int64
+	nextReqIdx int
+	seenEdits  map[string]bool
 }
 
 func (w *chatSessionWatcher) run(ctx context.Context, sink daemon.Sink) error {
@@ -276,11 +279,13 @@ func (w *chatSessionWatcher) scanTextEdits(path string, st *sessionState, mu *sy
 	st.tegMtime = mtime
 	model := st.model
 	startOffset := st.tegOffset
+	nextReqIdx := st.nextReqIdx
 	// VS Code occasionally rewrites a session as a fresh, smaller snapshot —
 	// re-scan from the start when that happens (rare); seenEdits is cleared
 	// too since the rewritten file may renumber requests.
 	if size < startOffset {
 		startOffset = 0
+		nextReqIdx = 0
 		st.seenEdits = map[string]bool{}
 		firstScan = true
 	}
@@ -333,9 +338,12 @@ func (w *chatSessionWatcher) scanTextEdits(path string, st *sessionState, mu *sy
 								}
 							}
 						}
+						nextReqIdx = len(snap.Requests)
 					}
 				case 2:
 					if reqIdx, ok := requestIndex(cl.K, "response"); ok {
+						// Streaming delta: new response part(s) appended to an
+						// existing requests[reqIdx].response array.
 						var parts []json.RawMessage
 						if json.Unmarshal(cl.V, &parts) == nil {
 							for _, part := range parts {
@@ -344,6 +352,26 @@ func (w *chatSessionWatcher) scanTextEdits(path string, st *sessionState, mu *sy
 								for i := range groups {
 									w.recordTextEditGroup(&groups[i], model, path, st, mu, sink, emit, reqIdx)
 								}
+							}
+						}
+					} else if keyPathEquals(cl.K, "requests") {
+						// A whole new request (turn) appended to the top-level
+						// requests array. Its response array may already be
+						// populated — including finalized textEditGroups — in
+						// this single delta, e.g. for a fast/non-streamed turn.
+						var newReqs []struct {
+							Response []json.RawMessage `json:"response"`
+						}
+						if json.Unmarshal(cl.V, &newReqs) == nil {
+							for _, req := range newReqs {
+								for _, part := range req.Response {
+									var groups []textEditGroupPart
+									findTextEditGroups(part, &groups)
+									for i := range groups {
+										w.recordTextEditGroup(&groups[i], model, path, st, mu, sink, emit, nextReqIdx)
+									}
+								}
+								nextReqIdx++
 							}
 						}
 					}
@@ -357,6 +385,7 @@ func (w *chatSessionWatcher) scanTextEdits(path string, st *sessionState, mu *sy
 	newOffset, _ := f.Seek(0, 1)
 	mu.Lock()
 	st.tegOffset = newOffset
+	st.nextReqIdx = nextReqIdx
 	mu.Unlock()
 }
 
@@ -689,4 +718,21 @@ func keyPathHasSuffix(k json.RawMessage, suffix string) bool {
 		return false
 	}
 	return s == suffix
+}
+
+// keyPathEquals reports whether the JSON-encoded k is exactly the
+// single-element path [elem] (e.g. ["requests"]).
+func keyPathEquals(k json.RawMessage, elem string) bool {
+	if len(k) == 0 {
+		return false
+	}
+	var path []json.RawMessage
+	if err := json.Unmarshal(k, &path); err != nil || len(path) != 1 {
+		return false
+	}
+	var s string
+	if err := json.Unmarshal(path[0], &s); err != nil {
+		return false
+	}
+	return s == elem
 }

@@ -272,6 +272,75 @@ func TestScanTextEdits_FullFile(t *testing.T) {
 	}
 }
 
+// TestScanTextEdits_NewRequestAppend verifies a kind=2, k=["requests"] delta —
+// VS Code appending a whole new request (turn) whose response array already
+// contains a finalized textEditGroup, as happens for a fast/non-streamed turn —
+// is detected.
+//
+// Before this fix, only k=["requests", N, "response"] deltas (streaming
+// appends to an EXISTING request) were scanned via requestIndex, which
+// requires a 3+ element key path. A k=["requests"] append (length 1) was
+// silently ignored, so edits delivered this way were never recorded — the
+// real-world failure mode for sukru.html.
+func TestScanTextEdits_NewRequestAppend(t *testing.T) {
+	repo := t.TempDir()
+	for _, args := range [][]string{{"init", "-q"}, {"config", "user.email", "t@l"}, {"config", "user.name", "T"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if err := cmd.Run(); err != nil {
+			t.Skipf("git not available: %v", err)
+		}
+	}
+	target := filepath.Join(repo, "sukru.html")
+	if err := os.WriteFile(target, []byte("<html></html>\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sessDir := t.TempDir()
+	sess := filepath.Join(sessDir, "s.jsonl")
+	// kind=0 snapshot: one prior request already completed (no edits) — the
+	// new appended request below should be assigned reqIdx=1.
+	line1 := `{"kind":0,"v":{"requests":[{"response":[{"kind":"markdownContent","value":"hi"}]}],"inputState":{"selectedModel":{"identifier":"copilot/gpt-5-mini"}}}}` + "\n"
+	// kind=2, k=["requests"]: a whole new request appended, its response
+	// already containing a finalized textEditGroup (non-streamed turn).
+	newReq := fmt.Sprintf(`{"kind":2,"k":["requests"],"v":[{"response":[{"kind":"textEditGroup","uri":{"fsPath":%s,"scheme":"file"},"edits":[[{"text":"<html>\nwelcome sukru\n</html>","range":{"startLineNumber":1,"endLineNumber":1}}]],"done":true}]}]}`+"\n",
+		jsonQuotedFilePath(target))
+	if err := os.WriteFile(sess, []byte(line1+newReq), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w := newCopilotWatcher()
+	var mu sync.Mutex
+	st := &sessionState{}
+	sink := &captureSink{}
+
+	fi, err := os.Stat(sess)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.scanTextEdits(sess, st, &mu, sink, time.Now(), fi.Size())
+
+	if len(sink.events) != 1 {
+		t.Fatalf("want 1 event, got %d", len(sink.events))
+	}
+	ev := sink.events[0]
+	if ev.Tool != "copilot" || ev.GenType != "chat" || ev.FilePath != "sukru.html" {
+		t.Errorf("unexpected event: %+v", ev)
+	}
+	if ev.Model != "gpt-5-mini" {
+		t.Errorf("model: want gpt-5-mini, got %q", ev.Model)
+	}
+	if len(ev.Lines) != 3 {
+		t.Errorf("want 3 line ranges, got %d", len(ev.Lines))
+	}
+
+	// Re-scanning at the same mtime is a no-op (mtime gate + dedup).
+	w.scanTextEdits(sess, st, &mu, sink, st.tegMtime, fi.Size())
+	if len(sink.events) != 1 {
+		t.Errorf("unchanged mtime: want 1 event, got %d", len(sink.events))
+	}
+}
+
 // TestFindTextEditGroups_Nested verifies textEditGroups are found inside a
 // kind=0 snapshot tree, not just a flat kind=2 response array.
 func TestFindTextEditGroups_Nested(t *testing.T) {
