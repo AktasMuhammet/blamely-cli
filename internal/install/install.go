@@ -237,10 +237,10 @@ func Run(installPlugins bool) error {
 
 	// Block until the daemon actually answers /health, so the user knows
 	// hooks are being listened to before this command exits.
-	if port, derr := daemon.WaitForReady(8 * time.Second); derr != nil {
+	if sock, derr := daemon.WaitForReady(8 * time.Second); derr != nil {
 		diagnoseDaemon(derr, agentRef)
 	} else {
-		ok("Daemon", fmt.Sprintf("listening on 127.0.0.1:%d · ready to receive hooks", port))
+		ok("Daemon", fmt.Sprintf("listening on %s · ready to receive hooks", sock))
 	}
 
 	// Best-effort — if shell detection fails or the rc isn't writable, we

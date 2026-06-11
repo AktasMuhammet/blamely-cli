@@ -131,6 +131,39 @@ var migrations = []string{
 	// history. NULL = live; non-NULL = hidden from the live gutter. Rename/move
 	// updates file_path in place; copy clones the live rows to the new path.
 	/* 16 */ `ALTER TABLE edits ADD COLUMN deleted_at INTEGER`,
+	// Migration 17: content_sha_norm — a secondary hash of the line's
+	// whitespace-normalized text (trim + collapse internal whitespace),
+	// computed alongside content_sha at record time. Used as a fallback
+	// match when an autoformatter reflows an AI-written line (reindent,
+	// trailing commas, etc.) and the exact content_sha no longer matches.
+	/* 17 */ `ALTER TABLE edit_lines ADD COLUMN content_sha_norm TEXT`,
+	// Migration 18-19: edit_removed_lines — per-line content hashes of lines an
+	// AI edit DELETED (old_string / unified-diff "-" lines), mirroring
+	// edit_lines' content_sha/content_sha_norm but for removed content. Deleted
+	// lines have no stable post-edit position, so they live in their own table
+	// rather than edit_lines (whose start_line/end_line are meaningful for
+	// positional matching of added lines). Used at commit time to attribute
+	// `type:"delete"` ranges to the AI tool that removed them.
+	/* 18 */ `CREATE TABLE IF NOT EXISTS edit_removed_lines (
+		id               INTEGER PRIMARY KEY AUTOINCREMENT,
+		edit_id          INTEGER NOT NULL REFERENCES edits(id) ON DELETE CASCADE,
+		content_sha      TEXT NOT NULL,
+		content_sha_norm TEXT
+	)`,
+	/* 19 */ `CREATE INDEX IF NOT EXISTS edit_removed_lines_edit ON edit_removed_lines(edit_id)`,
+	// Migration 20: file_snapshots — the daemon's cache of each tracked file's
+	// full content as of the last recorded edit. Used as the "before" baseline
+	// for edits that don't carry their own pre-edit content (whole-file
+	// overwrites like Write/write_file, and Copilot's textEditGroup edits),
+	// so removed-line hashes can still be computed for them. Refreshed after
+	// every recorded edit, regardless of tool.
+	/* 20 */ `CREATE TABLE IF NOT EXISTS file_snapshots (
+		repo_path  TEXT NOT NULL,
+		file_path  TEXT NOT NULL,
+		content    TEXT NOT NULL,
+		updated_at INTEGER NOT NULL,
+		PRIMARY KEY (repo_path, file_path)
+	)`,
 }
 
 func (db *DB) migrate() error {

@@ -16,7 +16,7 @@ import (
 func TestParseCodeActionEdit(t *testing.T) {
 	content := "Created At: 2026-06-07T21:00:59Z\nCompleted At: 2026-06-07T21:01:01Z\nThe following changes were made by the replace_file_content tool to: /Users/abdulkerimatik/development/training/gemini-test/index.html. If relevant, proactively run terminal commands to execute this code for the USER. Don't ask for permission.\n[diff_block_start]\n@@ -135,6 +135,16 @@\n           </svg>\n           GitHub\n         </button>\n+        <button type=\"button\" class=\"social-btn\" id=\"ldap-login-btn\">\n+          <svg></svg>\n+          LDAP\n+        </button>\n       </div>\n \n       <!-- Sign Up Prompt -->\n[diff_block_end]\n\nPlease note..."
 
-	path, ranges, suggested, wholeFile := parseCodeAction(content)
+	path, ranges, suggested, wholeFile, removed := parseCodeAction(content)
 	if wholeFile {
 		t.Fatalf("expected edit (not wholeFile)")
 	}
@@ -35,12 +35,15 @@ func TestParseCodeActionEdit(t *testing.T) {
 			t.Errorf("range[%d] = %+v, want start/end %d", i, r, wantStarts[i])
 		}
 	}
+	if len(removed) != 0 {
+		t.Errorf("removed = %+v, want none (diff has no removed lines)", removed)
+	}
 }
 
 func TestParseCodeActionCreate(t *testing.T) {
 	content := "Created At: 2026-06-07T18:22:53Z\nCompleted At: 2026-06-07T18:22:55Z\nCreated file file:///Users/abdulkerimatik/development/training/gemini-test/style.css with requested content.\nIf relevant, proactively run terminal commands to execute this code for the USER. Don't ask for permission."
 
-	path, ranges, _, wholeFile := parseCodeAction(content)
+	path, ranges, _, wholeFile, _ := parseCodeAction(content)
 	if !wholeFile {
 		t.Fatalf("expected wholeFile=true")
 	}

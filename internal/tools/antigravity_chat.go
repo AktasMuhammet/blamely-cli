@@ -231,7 +231,7 @@ func (w *antigravityTranscriptWatcher) handleLine(path, line string, st *transcr
 		return
 	}
 
-	abs, ranges, suggested, wholeFile := parseCodeAction(step.Content)
+	abs, ranges, suggested, wholeFile, removed := parseCodeAction(step.Content)
 	if abs == "" {
 		return
 	}
@@ -282,6 +282,7 @@ func (w *antigravityTranscriptWatcher) handleLine(path, line string, st *transcr
 		RepoPath:       repo,
 		FilePath:       rel,
 		Lines:          ranges,
+		RemovedLines:   removed,
 		SuggestedLines: suggested,
 		RawMeta: fmt.Sprintf(`{"source":"antigravity_gemini_transcript","transcript_path":%q,"step_index":%d}`,
 			path, step.StepIndex),
@@ -333,27 +334,30 @@ var diffHunkHeaderRe = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@
 
 // parseCodeAction extracts the target file path from a CODE_ACTION step's
 // narrative `content`, plus either:
-//   - the per-line additions from its unified diff (replace_file_content), or
+//   - the per-line additions from its unified diff (replace_file_content), and
+//     the content hashes of any lines the diff removed, or
 //   - a `wholeFile` signal telling the caller to attribute every line in the
 //     file as written (file creation — content isn't echoed in the transcript,
 //     so the caller re-reads the file from disk via LineRangeForWholeFile).
 //
-// Only `+` diff lines are attributed to the model — context and removed lines
-// carry no new AI-written content.
-func parseCodeAction(content string) (path string, ranges []daemon.LineRange, suggested int64, wholeFile bool) {
+// Only `+` diff lines are attributed to the model as additions — context lines
+// carry no new AI-written content. `-` lines are hashed separately (via
+// UnifiedDiffRemovedLineHashes) so the commit-time attribution pass can
+// recognize lines this edit deleted.
+func parseCodeAction(content string) (path string, ranges []daemon.LineRange, suggested int64, wholeFile bool, removed []daemon.RemovedLineHash) {
 	if m := codeActionCreatePathRe.FindStringSubmatch(content); m != nil {
-		return fileURIToPath(m[1]), nil, 0, true
+		return fileURIToPath(m[1]), nil, 0, true, nil
 	}
 	m := codeActionEditPathRe.FindStringSubmatch(content)
 	if m == nil {
-		return "", nil, 0, false
+		return "", nil, 0, false, nil
 	}
 	path = strings.TrimSpace(m[1])
 
 	start := strings.Index(content, "[diff_block_start]")
 	end := strings.Index(content, "[diff_block_end]")
 	if start < 0 || end < 0 || end <= start {
-		return path, nil, 0, false
+		return path, nil, 0, false, nil
 	}
 	block := content[start+len("[diff_block_start]") : end]
 
@@ -370,9 +374,11 @@ func parseCodeAction(content string) (path string, ranges []daemon.LineRange, su
 		}
 		switch {
 		case strings.HasPrefix(raw, "+"):
+			text := strings.TrimRight(raw[1:], "\r")
 			ranges = append(ranges, daemon.LineRange{
 				Start: newLine, End: newLine,
-				ContentSHA: sha256Hex([]byte(strings.TrimRight(raw[1:], "\r"))),
+				ContentSHA:     sha256Hex([]byte(text)),
+				ContentSHANorm: sha256HexNorm(text),
 			})
 			suggested++
 			newLine++
@@ -383,7 +389,8 @@ func parseCodeAction(content string) (path string, ranges []daemon.LineRange, su
 			newLine++
 		}
 	}
-	return path, ranges, suggested, false
+	removed = toDaemonRemovedLines(UnifiedDiffRemovedLineHashes(block))
+	return path, ranges, suggested, false, removed
 }
 
 // fileURIToPath converts a "file:///abs/path" URI from the transcript's

@@ -15,9 +15,18 @@ import (
 // LineRange is a 1-based, inclusive line range together with the SHA of the
 // new text. Used as an anchor for re-locating the range after later edits.
 type LineRange struct {
-	Start      int
-	End        int
-	ContentSHA string
+	Start          int
+	End            int
+	ContentSHA     string
+	ContentSHANorm string
+}
+
+// DeletedLineHash is the content hash of a single line removed by an edit —
+// the deletion-side counterpart to LineRange's ContentSHA/ContentSHANorm.
+// Blank/whitespace-only lines are never hashed (both fields stay "").
+type DeletedLineHash struct {
+	ContentSHA     string
+	ContentSHANorm string
 }
 
 // LocateNewString finds where `newString` lives in `filePath` and returns
@@ -42,9 +51,10 @@ func LocateNewString(filePath, newString string) (*LineRange, error) {
 	endLine := startLine + strings.Count(trimmed, "\n")
 	_ = end
 	return &LineRange{
-		Start:      startLine,
-		End:        endLine,
-		ContentSHA: sha256Hex([]byte(trimmed)),
+		Start:          startLine,
+		End:            endLine,
+		ContentSHA:     sha256Hex([]byte(trimmed)),
+		ContentSHANorm: sha256HexNorm(trimmed),
 	}, nil
 }
 
@@ -71,7 +81,7 @@ func LineRangeForWholeFile(filePath string) ([]LineRange, error) {
 	for sc.Scan() {
 		ln++
 		text := strings.TrimRight(sc.Text(), "\r")
-		out = append(out, LineRange{Start: ln, End: ln, ContentSHA: sha256Hex([]byte(text))})
+		out = append(out, LineRange{Start: ln, End: ln, ContentSHA: sha256Hex([]byte(text)), ContentSHANorm: sha256HexNorm(text)})
 	}
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("scan %s: %w", filePath, err)
@@ -85,6 +95,27 @@ func LineRangeForWholeFile(filePath string) ([]LineRange, error) {
 func sha256Hex(b []byte) string {
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
+}
+
+// NormalizeLineText collapses a line's leading/trailing and internal
+// whitespace runs to single spaces. Used to compute a fallback content hash
+// that survives autoformatter reflows (reindentation, trailing-comma /
+// quote-style changes that don't alter whitespace runs, line wrapping) which
+// would otherwise change a line's exact bytes and break the primary
+// content_sha match, falsely demoting AI-written lines to "Human".
+func NormalizeLineText(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// sha256HexNorm returns the hex SHA-256 of the normalized line text, or ""
+// for blank/whitespace-only lines — mirroring the content_sha convention so
+// blank lines don't spuriously collide across the whole file.
+func sha256HexNorm(text string) string {
+	norm := NormalizeLineText(text)
+	if norm == "" {
+		return ""
+	}
+	return sha256Hex([]byte(norm))
 }
 
 // unifiedDiffHunkHeaderRe matches a unified-diff hunk header and captures the
@@ -116,9 +147,11 @@ func UnifiedDiffAddedRanges(diff string) (ranges []LineRange, suggested int64) {
 		}
 		switch {
 		case strings.HasPrefix(raw, "+"):
+			text := strings.TrimRight(raw[1:], "\r")
 			ranges = append(ranges, LineRange{
 				Start: newLine, End: newLine,
-				ContentSHA: sha256Hex([]byte(strings.TrimRight(raw[1:], "\r"))),
+				ContentSHA:     sha256Hex([]byte(text)),
+				ContentSHANorm: sha256HexNorm(text),
 			})
 			suggested++
 			newLine++
@@ -129,6 +162,48 @@ func UnifiedDiffAddedRanges(diff string) (ranges []LineRange, suggested int64) {
 		}
 	}
 	return ranges, suggested
+}
+
+// UnifiedDiffRemovedLineHashes walks a unified diff and returns a content hash
+// for every line genuinely removed by the patch — i.e. "-" lines not paired
+// with identical-content "+"/context lines elsewhere in the same hunk. Per
+// hunk, it reconstructs the "old" text (context + "-" lines, in order) and the
+// "new" text (context + "+" lines, in order) and delegates to
+// RemovedLineHashes: shared context lines cover each other and only the truly
+// removed lines are reported, mirroring the pairing semantics
+// gitnotes/diff.go's flushHunk uses to classify excess "-" lines as deletions.
+func UnifiedDiffRemovedLineHashes(diff string) []DeletedLineHash {
+	var out []DeletedLineHash
+	var oldBuf, newBuf []string
+	inHunk := false
+	flush := func() {
+		if inHunk && len(oldBuf) > 0 {
+			out = append(out, RemovedLineHashes(strings.Join(oldBuf, "\n"), strings.Join(newBuf, "\n"))...)
+		}
+		oldBuf, newBuf = nil, nil
+	}
+	for _, raw := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(raw, "@@") {
+			flush()
+			inHunk = true
+			continue
+		}
+		if !inHunk {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(raw, "+"):
+			newBuf = append(newBuf, strings.TrimRight(raw[1:], "\r"))
+		case strings.HasPrefix(raw, "-"):
+			oldBuf = append(oldBuf, strings.TrimRight(raw[1:], "\r"))
+		default:
+			text := strings.TrimRight(strings.TrimPrefix(raw, " "), "\r")
+			oldBuf = append(oldBuf, text)
+			newBuf = append(newBuf, text)
+		}
+	}
+	flush()
+	return out
 }
 
 // narrowToChangedLines diffs oldStr against newStr, finds the line ranges
@@ -174,10 +249,12 @@ func narrowToChangedLines(oldStr, newStr string, full LineRange) ([]LineRange, i
 				text = strings.TrimRight(newLines[rel-1], "\r")
 			}
 			sha := ""
+			shaNorm := ""
 			if strings.TrimSpace(text) != "" {
 				sha = sha256Hex([]byte(text))
+				shaNorm = sha256HexNorm(text)
 			}
-			rs = append(rs, LineRange{Start: abs, End: abs, ContentSHA: sha})
+			rs = append(rs, LineRange{Start: abs, End: abs, ContentSHA: sha, ContentSHANorm: shaNorm})
 		}
 		return rs
 	}
@@ -262,6 +339,39 @@ func AddedOrChangedRanges(oldContent, newContent []byte) []LineRange {
 	}
 	if curStart != 0 {
 		out = append(out, LineRange{Start: curStart, End: len(newLines)})
+	}
+	return out
+}
+
+// RemovedLineHashes returns a content hash for every line present in oldStr
+// but not in newStr — the deletion-side counterpart to CountAddedLines.
+//
+// AddedOrChangedRanges([]byte(newStr), []byte(oldStr)) treats oldStr as the
+// "new" content: it returns the ranges of oldStr lines not covered by newStr,
+// i.e. exactly the lines this edit removed. Each non-blank removed line is
+// hashed (both content_sha and content_sha_norm); blank/whitespace-only lines
+// are skipped, mirroring the content_sha_norm convention so they never
+// spuriously match other blank lines.
+func RemovedLineHashes(oldStr, newStr string) []DeletedLineHash {
+	oldLines := strings.Split(oldStr, "\n")
+	if n := len(oldLines); n > 0 && oldLines[n-1] == "" {
+		oldLines = oldLines[:n-1]
+	}
+	var out []DeletedLineHash
+	for _, r := range AddedOrChangedRanges([]byte(newStr), []byte(oldStr)) {
+		for ln := r.Start; ln <= r.End; ln++ {
+			if ln < 1 || ln > len(oldLines) {
+				continue
+			}
+			text := strings.TrimRight(oldLines[ln-1], "\r")
+			if strings.TrimSpace(text) == "" {
+				continue
+			}
+			out = append(out, DeletedLineHash{
+				ContentSHA:     sha256Hex([]byte(text)),
+				ContentSHANorm: sha256HexNorm(text),
+			})
+		}
 	}
 	return out
 }

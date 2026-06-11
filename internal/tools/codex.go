@@ -287,7 +287,7 @@ func processCodexLine(raw []byte, st *codexState) {
 				RepoPath:   repo,
 				FilePath:   rel,
 				Model:      st.model,
-				Lines:      []daemon.LineRange{{Start: f.StartLine, End: f.EndLine, ContentSHA: f.ContentSHA}},
+				Lines:      []daemon.LineRange{{Start: f.StartLine, End: f.EndLine, ContentSHA: f.ContentSHA, ContentSHANorm: f.ContentSHANorm}},
 				RawMeta:    fmt.Sprintf(`{"source":"codex_session","patch_name":%q}`, name),
 			})
 		}
@@ -372,6 +372,7 @@ func emitCodexPatchApplyEvents(payload json.RawMessage, when time.Time, st *code
 		}
 
 		var lines []daemon.LineRange
+		var removed []daemon.RemovedLineHash
 		var suggested int64
 		switch change.Type {
 		case "add":
@@ -388,6 +389,7 @@ func emitCodexPatchApplyEvents(payload json.RawMessage, when time.Time, st *code
 			}
 			lines = toDaemonLineRanges(ranges)
 			suggested = n
+			removed = toDaemonRemovedLines(UnifiedDiffRemovedLineHashes(change.UnifiedDiff))
 		default:
 			continue
 		}
@@ -401,6 +403,7 @@ func emitCodexPatchApplyEvents(payload json.RawMessage, when time.Time, st *code
 			FilePath:       rel,
 			Model:          st.model,
 			Lines:          lines,
+			RemovedLines:   removed,
 			SuggestedLines: suggested,
 			RawMeta:        fmt.Sprintf(`{"source":"codex_session","patch_apply":%q}`, change.Type),
 		})
@@ -437,7 +440,7 @@ func flushCodexTokenCount(payload json.RawMessage, st *codexState) {
 func toDaemonLineRanges(rs []LineRange) []daemon.LineRange {
 	out := make([]daemon.LineRange, len(rs))
 	for i, r := range rs {
-		out[i] = daemon.LineRange{Start: r.Start, End: r.End, ContentSHA: r.ContentSHA}
+		out[i] = daemon.LineRange{Start: r.Start, End: r.End, ContentSHA: r.ContentSHA, ContentSHANorm: r.ContentSHANorm}
 	}
 	return out
 }
@@ -462,10 +465,11 @@ func looksLikePatch(name string) bool {
 
 // patchedFile is one file mutated by an apply_patch call.
 type patchedFile struct {
-	Path       string
-	StartLine  int
-	EndLine    int
-	ContentSHA string
+	Path           string
+	StartLine      int
+	EndLine        int
+	ContentSHA     string
+	ContentSHANorm string
 }
 
 // parsePatchFiles handles three shapes the arguments may take:
@@ -547,10 +551,11 @@ func parsePatchBody(body string) []patchedFile {
 		}
 		content := strings.Join(added, "\n")
 		out = append(out, patchedFile{
-			Path:       curPath,
-			StartLine:  1, // anchored later via content_sha
-			EndLine:    len(added),
-			ContentSHA: sha256Of(content),
+			Path:           curPath,
+			StartLine:      1, // anchored later via content_sha
+			EndLine:        len(added),
+			ContentSHA:     sha256Of(content),
+			ContentSHANorm: sha256OfNorm(content),
 		})
 		curPath = ""
 		added = nil
@@ -580,6 +585,16 @@ func parsePatchBody(body string) []patchedFile {
 func sha256Of(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(h[:])
+}
+
+// sha256OfNorm is sha256Of for the whitespace-normalized text, mirroring
+// content_sha_norm's blank-string convention for empty/whitespace-only input.
+func sha256OfNorm(s string) string {
+	norm := NormalizeLineText(s)
+	if norm == "" {
+		return ""
+	}
+	return sha256Of(norm)
 }
 
 // ReadCodexSessionUsage scans a Codex session JSONL and returns the latest

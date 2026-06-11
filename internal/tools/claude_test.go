@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -183,7 +184,7 @@ func TestExtractClaudeRanges_EditDeletion(t *testing.T) {
 		"new_string": "",
 	})
 	p := claudeHookPayload{ToolName: "Edit", ToolInput: raw}
-	file, ranges, suggested, err := extractClaudeRanges(p)
+	file, ranges, suggested, removed, _, err := extractClaudeRanges(p)
 	if err != nil {
 		t.Fatalf("extractClaudeRanges: %v", err)
 	}
@@ -195,6 +196,9 @@ func TestExtractClaudeRanges_EditDeletion(t *testing.T) {
 	}
 	if suggested != 4 {
 		t.Errorf("suggested: want 4 (deleted lines), got %d", suggested)
+	}
+	if len(removed) != 4 {
+		t.Errorf("removed: want 4 deleted-line hashes, got %d", len(removed))
 	}
 }
 
@@ -209,7 +213,7 @@ func TestExtractClaudeRanges_MultiEditMixedDeletion(t *testing.T) {
 		},
 	})
 	p := claudeHookPayload{ToolName: "MultiEdit", ToolInput: raw}
-	_, _, suggested, err := extractClaudeRanges(p)
+	_, _, suggested, _, _, err := extractClaudeRanges(p)
 	if err != nil {
 		t.Fatalf("extractClaudeRanges: %v", err)
 	}
@@ -228,11 +232,105 @@ func TestExtractClaudeRanges_EditWhitespaceOnlyTreatedAsDeletion(t *testing.T) {
 		"new_string": "  \n  \n", // whitespace-only
 	})
 	p := claudeHookPayload{ToolName: "Edit", ToolInput: raw}
-	_, ranges, suggested, _ := extractClaudeRanges(p)
+	_, ranges, suggested, _, _, _ := extractClaudeRanges(p)
 	if ranges != nil {
 		t.Errorf("whitespace-only new_string should produce no ranges, got %+v", ranges)
 	}
 	if suggested != 3 {
 		t.Errorf("suggested should reflect deleted lines (3), got %d", suggested)
+	}
+}
+
+// TestExtractClaudeRanges_WriteReturnsFullContent verifies that Write's 5th
+// return value carries the full new file content. Write overwrites the whole
+// file with no "before" text of its own, so RecordClaudeFromStdin uses this
+// to fetch the daemon's cached snapshot and compute removed-line hashes.
+func TestExtractClaudeRanges_WriteReturnsFullContent(t *testing.T) {
+	raw, _ := json.Marshal(map[string]any{
+		"file_path": "/tmp/w.go",
+		"content":   "package main\n",
+	})
+	p := claudeHookPayload{ToolName: "Write", ToolInput: raw}
+	_, _, _, _, newFullContent, err := extractClaudeRanges(p)
+	if err != nil {
+		t.Fatalf("extractClaudeRanges: %v", err)
+	}
+	if newFullContent == nil || *newFullContent != "package main\n" {
+		t.Errorf("newFullContent: want %q, got %v", "package main\n", newFullContent)
+	}
+}
+
+// TestExtractClaudeRanges_EditReturnsNilFullContent verifies that Edit (which
+// always carries explicit before/after text of its own) leaves the 5th
+// return value nil — only Write needs the snapshot fallback.
+func TestExtractClaudeRanges_EditReturnsNilFullContent(t *testing.T) {
+	raw, _ := json.Marshal(map[string]any{
+		"file_path":  "/tmp/x.go",
+		"old_string": "a\nb\nc\nd",
+		"new_string": "",
+	})
+	p := claudeHookPayload{ToolName: "Edit", ToolInput: raw}
+	_, _, _, _, newFullContent, err := extractClaudeRanges(p)
+	if err != nil {
+		t.Fatalf("extractClaudeRanges: %v", err)
+	}
+	if newFullContent != nil {
+		t.Errorf("newFullContent: want nil, got %q", *newFullContent)
+	}
+}
+
+// TestExtractClaudeRanges_WriteMultiScriptContent verifies that a Write
+// payload whose content chains together multiple scripts/alphabets (Latin,
+// Cyrillic, Greek, Arabic, CJK) survives JSON marshal/unmarshal and per-line
+// hashing intact: content_sha/content_sha_norm are computed over each line's
+// exact UTF-8 bytes, line splitting on "\n" stays correct for multi-byte
+// runes, and the full content returned for the snapshot-diff fallback is
+// byte-identical to the input.
+func TestExtractClaudeRanges_WriteMultiScriptContent(t *testing.T) {
+	lines := []string{
+		"Hello, World!",    // Latin
+		"Привет, мир!",     // Cyrillic
+		"Γειά σου, Κόσμε!", // Greek
+		"你好，世界！",          // CJK (Chinese)
+		"こんにちは世界",         // CJK (Japanese)
+		"مرحبا بالعالم",    // Arabic (RTL)
+	}
+	content := strings.Join(lines, "\n") + "\n"
+
+	raw, _ := json.Marshal(map[string]any{
+		"file_path": "/tmp/i18n.txt",
+		"content":   content,
+	})
+	p := claudeHookPayload{ToolName: "Write", ToolInput: raw}
+	file, ranges, suggested, removed, newFullContent, err := extractClaudeRanges(p)
+	if err != nil {
+		t.Fatalf("extractClaudeRanges: %v", err)
+	}
+	if file != "/tmp/i18n.txt" {
+		t.Errorf("file: want /tmp/i18n.txt, got %q", file)
+	}
+	if removed != nil {
+		t.Errorf("removed: want nil for Write, got %+v", removed)
+	}
+	if suggested != int64(len(lines)) {
+		t.Errorf("suggested: want %d, got %d", len(lines), suggested)
+	}
+	if newFullContent == nil || *newFullContent != content {
+		t.Fatalf("newFullContent: JSON round-trip corrupted multi-script content:\nwant %q\ngot  %v", content, newFullContent)
+	}
+	if len(ranges) != len(lines) {
+		t.Fatalf("ranges: want %d (one per non-blank line), got %d", len(lines), len(ranges))
+	}
+	for i, want := range lines {
+		r := ranges[i]
+		if r.Start != i+1 || r.End != i+1 {
+			t.Errorf("ranges[%d]: want [%d,%d], got [%d,%d]", i, i+1, i+1, r.Start, r.End)
+		}
+		if r.ContentSHA != sha256Hex([]byte(want)) {
+			t.Errorf("ranges[%d].ContentSHA: hash mismatch for %q", i, want)
+		}
+		if r.ContentSHANorm != sha256HexNorm(want) {
+			t.Errorf("ranges[%d].ContentSHANorm: norm-hash mismatch for %q", i, want)
+		}
 	}
 }

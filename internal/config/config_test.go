@@ -28,8 +28,11 @@ func TestLoadConfig_DefaultsWhenMissing(t *testing.T) {
 		t.Fatalf("missing config should yield defaults; got %+v", cfg)
 	}
 	n := cfg.Note
-	if !(n.FileLines && n.Conversation && n.Message && n.CodingTime && n.Tokens) {
+	if !(n.FileLines && n.Message && n.CodingTime && n.Tokens) {
 		t.Fatalf("defaults should be all-on: %+v", n)
+	}
+	if n.Conversation {
+		t.Fatalf("conversation should default off: %+v", n)
 	}
 }
 
@@ -50,9 +53,9 @@ func TestLoadConfig_PartialOverlayKeepsOtherDefaults(t *testing.T) {
 }
 
 func TestLoadConfig_PerRoleConversation(t *testing.T) {
-	// Keep conversation on, drop the user (prompt) turns, and explicitly enable
-	// assistant turns (which now default off).
-	writeConfig(t, `{"note":{"conversation_user":false,"conversation_assistant":true}}`)
+	// Turn conversation on, drop the user (prompt) turns, and explicitly enable
+	// assistant turns (which default off).
+	writeConfig(t, `{"note":{"conversation":true,"conversation_user":false,"conversation_assistant":true}}`)
 	n := LoadConfig().Note
 	if !n.Conversation || n.ConversationUser || !n.ConversationAssistant {
 		t.Fatalf("want conversation on, user off, assistant on: %+v", n)

@@ -211,7 +211,7 @@ func TestParseDiff_ReplaceMoreWithFewer(t *testing.T) {
 		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)
 	}
 	// First del (line 10) is paired with the add and dropped. Lines 11, 12 remain.
-	wantDel := []int{11, 12}
+	wantDel := []DeletedLine{{LineNum: 11, Content: "oldB"}, {LineNum: 12, Content: "oldC"}}
 	if got := c.Deleted["foo.go"]; !reflect.DeepEqual(got, wantDel) {
 		t.Errorf("Deleted: want %v, got %v", wantDel, got)
 	}
@@ -294,7 +294,7 @@ func TestParseDiff_PureDeletion(t *testing.T) {
 	if len(c.Added) != 0 {
 		t.Errorf("Added: want empty, got %v", c.Added)
 	}
-	wantDel := []int{5, 6}
+	wantDel := []DeletedLine{{LineNum: 5, Content: "gone1"}, {LineNum: 6, Content: "gone2"}}
 	if got := c.Deleted["foo.go"]; !reflect.DeepEqual(got, wantDel) {
 		t.Errorf("Deleted: want %v, got %v", wantDel, got)
 	}

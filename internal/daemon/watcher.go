@@ -52,15 +52,29 @@ type Event struct {
 	// watcher observed the event, before any partial-acceptance/user-editing.
 	SuggestedLines int64
 	Lines          []LineRange
+	// RemovedLines holds content hashes of lines this edit DELETED (from
+	// old_string / unified-diff "-" lines). Used at commit time to attribute
+	// `type:"delete"` ranges back to this edit.
+	RemovedLines []RemovedLineHash
 	// Branch is the checked-out branch for this edit. Watchers usually leave it
 	// empty; the sink resolves it from RepoPath. Editor-pushed events may set it.
 	Branch string
 }
 
 type LineRange struct {
-	Start      int
-	End        int
-	ContentSHA string
+	Start          int
+	End            int
+	ContentSHA     string
+	ContentSHANorm string
+}
+
+// RemovedLineHash is the content hash of a single line an edit deleted — the
+// deletion-side counterpart to LineRange's ContentSHA/ContentSHANorm. Shared
+// by Event.RemovedLines and EditPayload.RemovedLines (the json tags are
+// inert on Event, which is never marshaled).
+type RemovedLineHash struct {
+	ContentSHA     string `json:"content_sha"`
+	ContentSHANorm string `json:"content_sha_norm,omitempty"`
 }
 
 // dbSink writes Events directly through to the SQLite store.
@@ -135,7 +149,13 @@ func (s *dbSink) Record(ev Event) error {
 		if r.Start <= 0 || r.End < r.Start {
 			continue
 		}
-		e.Lines = append(e.Lines, store.EditLine{StartLine: r.Start, EndLine: r.End, ContentSHA: r.ContentSHA})
+		e.Lines = append(e.Lines, store.EditLine{StartLine: r.Start, EndLine: r.End, ContentSHA: r.ContentSHA, ContentSHANorm: r.ContentSHANorm})
+	}
+	for _, rl := range ev.RemovedLines {
+		if rl.ContentSHA == "" {
+			continue
+		}
+		e.RemovedLines = append(e.RemovedLines, store.RemovedLineHash{ContentSHA: rl.ContentSHA, ContentSHANorm: rl.ContentSHANorm})
 	}
 	sessions.resolve(s.db, &e, ev.Branch)
 	if _, err := s.db.InsertEdit(e); err != nil {

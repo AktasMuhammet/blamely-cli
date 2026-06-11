@@ -291,13 +291,42 @@ func (w *chatSessionWatcher) scanTextEdits(path string, st *sessionState, mu *sy
 		if m := findSelectedModel(cl); m != "" {
 			model = displayModel(m)
 		}
-		var groups []textEditGroupPart
-		findTextEditGroups(cl.V, &groups)
-		if cl.Kind == 0 {
-			findTextEditGroups(json.RawMessage(line), &groups)
-		}
-		for i := range groups {
-			w.recordTextEditGroup(&groups[i], model, path, st, mu, sink, emit)
+		// textEditGroups are tagged with the chat request index they belong to
+		// (requests[N].response[...]) so that edits from different turns never
+		// collide in recordTextEditGroup's dedup key, even when both happen to
+		// start at the same line (e.g. the model rewrites the whole file again
+		// in a follow-up turn).
+		switch cl.Kind {
+		case 0:
+			var snap struct {
+				Requests []struct {
+					Response []json.RawMessage `json:"response"`
+				} `json:"requests"`
+			}
+			if json.Unmarshal(cl.V, &snap) == nil {
+				for reqIdx, r := range snap.Requests {
+					for _, part := range r.Response {
+						var groups []textEditGroupPart
+						findTextEditGroups(part, &groups)
+						for i := range groups {
+							w.recordTextEditGroup(&groups[i], model, path, st, mu, sink, emit, reqIdx)
+						}
+					}
+				}
+			}
+		case 2:
+			if reqIdx, ok := requestIndex(cl.K, "response"); ok {
+				var parts []json.RawMessage
+				if json.Unmarshal(cl.V, &parts) == nil {
+					for _, part := range parts {
+						var groups []textEditGroupPart
+						findTextEditGroups(part, &groups)
+						for i := range groups {
+							w.recordTextEditGroup(&groups[i], model, path, st, mu, sink, emit, reqIdx)
+						}
+					}
+				}
+			}
 		}
 	}
 }
@@ -345,7 +374,9 @@ func (w *chatSessionWatcher) handleLine(path, line string, st *sessionState, sin
 
 // recordTextEditGroup records one finalized textEditGroup as a per-file chat
 // edit. The tool is always w.tool — the watcher knows which editor it belongs to.
-func (w *chatSessionWatcher) recordTextEditGroup(teg *textEditGroupPart, model, sessionPath string, st *sessionState, mu *sync.Mutex, sink daemon.Sink, emit bool) {
+// reqIdx is the chat request (turn) this textEditGroup belongs to, used to keep
+// the dedup key below from colliding across separate turns.
+func (w *chatSessionWatcher) recordTextEditGroup(teg *textEditGroupPart, model, sessionPath string, st *sessionState, mu *sync.Mutex, sink daemon.Sink, emit bool, reqIdx int) {
 	if !teg.Done {
 		return
 	}
@@ -359,8 +390,17 @@ func (w *chatSessionWatcher) recordTextEditGroup(teg *textEditGroupPart, model, 
 
 	var ranges []daemon.LineRange
 	var suggested int64
+	hasRemoval := false
 	for _, grp := range teg.Edits {
 		for _, e := range grp {
+			// endLineNumber > startLineNumber means this edit's range spans
+			// existing lines (VS Code's half-open convention) — a candidate
+			// for removed-line attribution, computed below once we have the
+			// pre-edit snapshot. Checked regardless of e.Text so pure
+			// multi-line deletions (empty replacement text) are caught too.
+			if e.Range.EndLineNumber > e.Range.StartLineNumber {
+				hasRemoval = true
+			}
 			if strings.TrimSpace(e.Text) == "" {
 				continue
 			}
@@ -370,22 +410,27 @@ func (w *chatSessionWatcher) recordTextEditGroup(teg *textEditGroupPart, model, 
 			}
 			for i, lt := range strings.Split(strings.TrimSuffix(e.Text, "\n"), "\n") {
 				ln := start + i
+				text := strings.TrimRight(lt, "\r")
 				ranges = append(ranges, daemon.LineRange{
 					Start: ln, End: ln,
-					ContentSHA: sha256Hex([]byte(strings.TrimRight(lt, "\r"))),
+					ContentSHA:     sha256Hex([]byte(text)),
+					ContentSHANorm: sha256HexNorm(text),
 				})
 				suggested++
 			}
 		}
 	}
-	if len(ranges) == 0 {
+	if len(ranges) == 0 && !hasRemoval {
 		return
 	}
 
-	// Dedup key: file + startLineNumber of each edit group. Streaming applies
-	// write multiple done=true checkpoints for the same region with growing
-	// content — keying on start positions collapses them into one emission.
-	key := abs
+	// Dedup key: file + chat request index + startLineNumber of each edit group.
+	// Streaming applies write multiple done=true checkpoints for the same region
+	// with growing content within ONE turn — keying on start positions collapses
+	// those into one emission. The request index keeps separate turns (e.g. a
+	// follow-up that rewrites the file again, also starting at line 1) from
+	// colliding and silently dropping the later, correct edit.
+	key := fmt.Sprintf("%s|%d", abs, reqIdx)
 	for _, grp := range teg.Edits {
 		for _, e := range grp {
 			key += fmt.Sprintf("|%d", e.Range.StartLineNumber)
@@ -417,6 +462,24 @@ func (w *chatSessionWatcher) recordTextEditGroup(teg *textEditGroupPart, model, 
 			rel = r
 		}
 	}
+
+	// Copilot's textEditGroup edits carry only the new text and a line range,
+	// not the replaced text — fetch the daemon's cached snapshot (the file's
+	// content as of its last recorded edit) so multi-line replacements can
+	// still be checked for removed lines.
+	var removed []DeletedLineHash
+	if hasRemoval {
+		if snapshot, ok := fetchSnapshot(repo, rel); ok {
+			for _, grp := range teg.Edits {
+				for _, e := range grp {
+					if e.Range.EndLineNumber > e.Range.StartLineNumber {
+						removed = append(removed, removedLinesForTextEditRange(snapshot, e.Range.StartLineNumber, e.Range.EndLineNumber, e.Text)...)
+					}
+				}
+			}
+		}
+	}
+
 	ev := daemon.Event{
 		When:           time.Now(),
 		Tool:           string(w.tool),
@@ -427,6 +490,7 @@ func (w *chatSessionWatcher) recordTextEditGroup(teg *textEditGroupPart, model, 
 		FilePath:       rel,
 		Lines:          ranges,
 		SuggestedLines: suggested,
+		RemovedLines:   toDaemonRemovedLines(removed),
 		RawMeta: fmt.Sprintf(`{"source":"copilot_chat_textedit","tool":%q,"chat_session_path":%q}`,
 			string(w.tool), sessionPath),
 	}

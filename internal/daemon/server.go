@@ -10,7 +10,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -18,6 +20,20 @@ import (
 	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/store"
 )
+
+// UnixHTTPClient returns an *http.Client that routes all requests through the
+// Unix domain socket at sockPath, regardless of the URL host. Use
+// "http://unix/<path>" as the request URL (the host is ignored).
+func UnixHTTPClient(sockPath string) *http.Client {
+	return &http.Client{
+		Timeout: 2 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", sockPath)
+			},
+		},
+	}
+}
 
 type Server struct {
 	db   *store.DB
@@ -40,18 +56,20 @@ type EditPayload struct {
 	HashBefore       string `json:"hash_before,omitempty"`
 	HashAfter        string `json:"hash_after,omitempty"`
 	// SuggestedLines: AI's original suggestion size before user edits.
-	SuggestedLines int64   `json:"suggested_lines,omitempty"`
-	Lines          []Range `json:"lines"`
-	RawMeta        string  `json:"raw_meta,omitempty"`
+	SuggestedLines int64              `json:"suggested_lines,omitempty"`
+	Lines          []Range            `json:"lines"`
+	RemovedLines   []RemovedLineHash  `json:"removed_lines,omitempty"`
+	RawMeta        string             `json:"raw_meta,omitempty"`
 	// Branch is the editor's checked-out branch when the edit was made. Optional:
 	// the daemon resolves it from repo_path if empty (e.g. watcher-sourced edits).
 	Branch string `json:"branch,omitempty"`
 }
 
 type Range struct {
-	Start      int    `json:"start"`
-	End        int    `json:"end"`
-	ContentSHA string `json:"content_sha,omitempty"`
+	Start          int    `json:"start"`
+	End            int    `json:"end"`
+	ContentSHA     string `json:"content_sha,omitempty"`
+	ContentSHANorm string `json:"content_sha_norm,omitempty"`
 }
 
 // Watchers is the list of background tailers (Codex/Cursor/Copilot) the
@@ -102,24 +120,50 @@ func Run(ctx context.Context) error {
 	mux.HandleFunc("/health", s.health)
 	mux.HandleFunc("/edit", s.ingest)
 	mux.HandleFunc("/fs", s.fsEvent)
+	mux.HandleFunc("/snapshot", s.snapshot)
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return fmt.Errorf("listen: %w", err)
+	// Prefer a Unix domain socket — it bypasses network security tools (e.g.
+	// Trend Micro) that intercept localhost TCP. Falls back to a random TCP port
+	// on systems that don't support AF_UNIX (older Windows builds).
+	sockPath, sockErr := config.SocketFile()
+	var listener net.Listener
+	if sockErr == nil {
+		_ = os.Remove(sockPath) // clean up stale socket from a previous run
+		if l, err := net.Listen("unix", sockPath); err == nil {
+			listener = l
+			if err := writeSocketFile(sockPath); err != nil {
+				_ = listener.Close()
+				_ = os.Remove(sockPath)
+				return err
+			}
+			defer removeSocketFile()
+			go watchListenerFile(ctx, sockPath, cancel)
+			fmt.Fprintf(os.Stderr, "blamelyd listening on %s\n", sockPath)
+		}
 	}
-	addr := listener.Addr().(*net.TCPAddr)
-	if err := writePortFile(addr.Port); err != nil {
-		_ = listener.Close()
-		return err
+	if listener == nil {
+		// AF_UNIX unavailable or path error — fall back to TCP.
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return fmt.Errorf("listen: %w", err)
+		}
+		listener = l
+		addr := listener.Addr().(*net.TCPAddr)
+		if err := writePortFile(addr.Port); err != nil {
+			_ = listener.Close()
+			return err
+		}
+		defer removePortFile()
+		if portPath, err := config.PortFile(); err == nil {
+			go watchListenerFile(ctx, portPath, cancel)
+		}
+		fmt.Fprintf(os.Stderr, "blamelyd listening on 127.0.0.1:%d\n", addr.Port)
 	}
-	defer removePortFile()
 
 	s.http = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-
-	fmt.Fprintf(os.Stderr, "blamelyd listening on 127.0.0.1:%d\n", addr.Port)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -142,6 +186,49 @@ func Run(ctx context.Context) error {
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.WriteString(w, `{"ok":true}`)
+}
+
+// snapshot returns the cached "before" content for repo/file — the file's
+// content as of the last recorded edit, used by whole-file-overwrite tools
+// (Write/write_file) and Copilot's textEditGroup edits to compute removed-line
+// hashes when they have no "before" content of their own. If nothing has been
+// cached yet (this file's first recorded edit), falls back to the file's
+// content at HEAD; found=false if neither is available (e.g. a brand-new
+// untracked file — correctly yields no removed lines).
+func (s *Server) snapshot(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET required", http.StatusMethodNotAllowed)
+		return
+	}
+	repo := r.URL.Query().Get("repo")
+	file := r.URL.Query().Get("file")
+	if repo == "" || file == "" {
+		http.Error(w, "repo, file required", http.StatusBadRequest)
+		return
+	}
+	content, ok, err := s.db.GetFileSnapshot(repo, file)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		content, ok = headFileContent(repo, file)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		Content string `json:"content"`
+		Found   bool   `json:"found"`
+	}{Content: content, Found: ok})
+}
+
+// headFileContent returns file's content at HEAD in repoPath, or ok=false if
+// the repo has no HEAD yet or the file isn't tracked there (e.g. a new file).
+func headFileContent(repoPath, file string) (string, bool) {
+	out, err := exec.Command("git", "-C", repoPath, "show", "HEAD:"+filepath.ToSlash(file)).Output()
+	if err != nil {
+		return "", false
+	}
+	return string(out), true
 }
 
 func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
@@ -224,12 +311,35 @@ func validateAndStore(db *store.DB, p EditPayload) error {
 			return fmt.Errorf("invalid line range [%d,%d]", r.Start, r.End)
 		}
 		e.Lines = append(e.Lines, store.EditLine{
-			StartLine: r.Start, EndLine: r.End, ContentSHA: r.ContentSHA,
+			StartLine: r.Start, EndLine: r.End, ContentSHA: r.ContentSHA, ContentSHANorm: r.ContentSHANorm,
+		})
+	}
+	for _, rl := range p.RemovedLines {
+		if rl.ContentSHA == "" {
+			continue
+		}
+		e.RemovedLines = append(e.RemovedLines, store.RemovedLineHash{
+			ContentSHA: rl.ContentSHA, ContentSHANorm: rl.ContentSHANorm,
 		})
 	}
 	sessions.resolve(db, &e, p.Branch)
-	_, err := db.InsertEdit(e)
-	return err
+	if _, err := db.InsertEdit(e); err != nil {
+		return err
+	}
+	updateFileSnapshot(db, p.RepoPath, p.FilePath)
+	return nil
+}
+
+// updateFileSnapshot caches repo/file's current on-disk content as the
+// "before" baseline for the next edit to this file (see (*Server).snapshot).
+// Best-effort: a read failure (file deleted, permission error, race) just
+// means the next edit falls back to HEAD instead of this edit's result.
+func updateFileSnapshot(db *store.DB, repoPath, filePath string) {
+	data, err := os.ReadFile(filepath.Join(repoPath, filePath))
+	if err != nil {
+		return
+	}
+	_ = db.SetFileSnapshot(repoPath, filePath, string(data), time.Now().UnixNano())
 }
 
 // chatEnrichWindowNanos is the look-back/forward window for correlating a
@@ -294,6 +404,16 @@ func setNullInt(dst *sql.NullInt64, src *int64) {
 	}
 }
 
+// writeSocketFile is a no-op: net.Listen("unix", sockPath) already creates the
+// socket file. Its existence is the indicator — there is nothing to write into it.
+func writeSocketFile(_ string) error { return nil }
+
+func removeSocketFile() {
+	if p, err := config.SocketFile(); err == nil {
+		_ = os.Remove(p)
+	}
+}
+
 func writePortFile(port int) error {
 	p, err := config.PortFile()
 	if err != nil {
@@ -308,6 +428,47 @@ func removePortFile() {
 	}
 }
 
+// watchListenerFile periodically confirms that path — the daemon's socket or
+// port file, its sole discovery mechanism for `blamely status` and the
+// record/snapshot hooks — still exists on disk. If something removes it out
+// from under a live listener (e.g. a racing daemon instance's startup
+// cleanup at server.go:131, or external deletion), the bound listener becomes
+// permanently unreachable to new clients with no way to recreate the file in
+// place. Cancelling ctx triggers a clean shutdown so the platform service
+// manager (launchd KeepAlive / systemd Restart=always) immediately restarts
+// us with a fresh file.
+func watchListenerFile(ctx context.Context, path string, cancel context.CancelFunc) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if _, err := os.Stat(path); err != nil {
+				cancel()
+				return
+			}
+		}
+	}
+}
+
+// ReadSocket returns the Unix domain socket path if the socket file exists,
+// or an error if the daemon is not running. The socket file's existence is the
+// indicator — its content must not be read (it is a socket, not a plain file).
+func ReadSocket() (string, error) {
+	p, err := config.SocketFile()
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Stat(p); err != nil {
+		return "", fmt.Errorf("socket file %s: %w", p, err)
+	}
+	return p, nil
+}
+
+// ReadPort is retained for backward compatibility with callers that still use
+// the TCP port. Returns an error if the port file does not exist.
 func ReadPort() (int, error) {
 	p, err := config.PortFile()
 	if err != nil {

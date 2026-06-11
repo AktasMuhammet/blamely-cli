@@ -22,6 +22,17 @@ type AddedLine struct {
 	Content string
 }
 
+// DeletedLine is one line that was removed (and not replaced in-place) by the
+// commit. LineNum is the 1-based line number in the PRE-commit file. Content
+// is the raw text of the line (without the leading '-'), stripped of trailing
+// carriage returns. Used by attribution to hash the removed line and match it
+// against an AI edit's recorded edit_removed_lines, so AI-caused deletions can
+// be distinguished from human ones.
+type DeletedLine struct {
+	LineNum int
+	Content string
+}
+
 // FileChangeType is the file-level change kind: ADDED, DELETED, MODIFIED,
 // RENAMED, or COPIED. Surfaced in the git note so consumers can render a
 // per-file status without re-running `git diff`. Move is a special case of
@@ -44,10 +55,10 @@ const (
 // copy map for files git detected as copy-with-modifications.
 type CommitChange struct {
 	Added       []AddedLine
-	Deleted     map[string][]int          // pre-commit path → deleted line numbers (pre-image)
-	Renames     map[string]string         // post-commit path → pre-commit path (renamed)
-	Copies      map[string]string         // post-commit path → pre-commit path (copied)
-	FileChanges map[string]FileChangeType // post-commit path → file-level change kind
+	Deleted     map[string][]DeletedLine   // pre-commit path → deleted lines (pre-image)
+	Renames     map[string]string          // post-commit path → pre-commit path (renamed)
+	Copies      map[string]string          // post-commit path → pre-commit path (copied)
+	FileChanges map[string]FileChangeType  // post-commit path → file-level change kind
 }
 
 // DeletedCount returns the per-file count derived from Deleted line numbers.
@@ -133,7 +144,7 @@ func DiffCommit(repoPath, sha string) (*CommitChange, error) {
 // produces false negatives the moment the file's net line count drifts.
 func parseDiff(r io.Reader, excl *config.ExcludeList) (*CommitChange, error) {
 	out := &CommitChange{
-		Deleted:     map[string][]int{},
+		Deleted:     map[string][]DeletedLine{},
 		Renames:     map[string]string{},
 		Copies:      map[string]string{},
 		FileChanges: map[string]FileChangeType{},
@@ -159,7 +170,11 @@ func parseDiff(r io.Reader, excl *config.ExcludeList) (*CommitChange, error) {
 		line    int
 		content string
 	}
-	var hunkDels []int
+	type hunkDel struct {
+		line    int
+		content string
+	}
+	var hunkDels []hunkDel
 	var hunkAdds []hunkAdd
 
 	flushHunk := func() {
@@ -179,8 +194,9 @@ func parseDiff(r io.Reader, excl *config.ExcludeList) (*CommitChange, error) {
 		}
 		// Excess deletes — lines removed without a same-position replacement.
 		for i := n; i < len(hunkDels); i++ {
+			d := hunkDels[i]
 			if curDelFile != "" {
-				out.Deleted[curDelFile] = append(out.Deleted[curDelFile], hunkDels[i])
+				out.Deleted[curDelFile] = append(out.Deleted[curDelFile], DeletedLine{LineNum: d.line, Content: strings.TrimRight(d.content, "\r")})
 			}
 		}
 		// Excess adds — lines added without a same-position predecessor.
@@ -291,7 +307,7 @@ func parseDiff(r io.Reader, excl *config.ExcludeList) (*CommitChange, error) {
 			}
 		case strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---"):
 			if curDelLine > 0 {
-				hunkDels = append(hunkDels, curDelLine)
+				hunkDels = append(hunkDels, hunkDel{line: curDelLine, content: line[1:]})
 			}
 			curDelLine++
 		case strings.HasPrefix(line, " "):

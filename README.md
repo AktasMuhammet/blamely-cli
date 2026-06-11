@@ -111,15 +111,15 @@ Everything Blamely writes lives under `~/.blamely/` (on Windows: `%USERPROFILE%\
 
 ### Note settings (`config.json`)
 
-Controls **what is stored in each commit note** — not how attribution is computed. Every option defaults to **on**; list only the toggles you want off:
+Controls **what is stored in each commit note** — not how attribution is computed. Every option defaults to **on** except `conversation` and `conversation_assistant`, which are opt-in (transcripts may contain sensitive prompt/response content). List only the toggles you want to change:
 
 ```json
 {
   "note": {
     "file_lines": true,
-    "conversation": true,
+    "conversation": false,
     "conversation_user": true,
-    "conversation_assistant": true,
+    "conversation_assistant": false,
     "message": true,
     "coding_time": true,
     "tokens": true
@@ -127,15 +127,15 @@ Controls **what is stored in each commit note** — not how attribution is compu
 }
 ```
 
-| Key | When `false` |
-|-----|--------------|
-| `file_lines` | Drops per-line detail (largest note size reduction) |
-| `conversation` | Stores no transcript turns |
-| `conversation_user` | Omits your prompts |
-| `conversation_assistant` | Omits model replies |
-| `message` | Omits commit message |
-| `coding_time` | Omits coding-time field |
-| `tokens` | Omits token usage |
+| Key | Default | When `true`/`false` |
+|-----|---------|---------------------|
+| `file_lines` | on | `false` drops per-line detail (largest note size reduction) |
+| `conversation` | **off** | `true` stores transcript turns (gated by the per-role toggles below) |
+| `conversation_user` | on | `false` omits your prompts |
+| `conversation_assistant` | **off** | `true` includes model replies |
+| `message` | on | `false` omits commit message |
+| `coding_time` | on | `false` omits coding-time field |
+| `tokens` | on | `false` omits token usage |
 
 Manage from the CLI (changes apply to **future** commits only):
 

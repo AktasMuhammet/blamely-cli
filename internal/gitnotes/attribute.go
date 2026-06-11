@@ -102,11 +102,15 @@ type ByGenType struct {
 }
 
 type Totals struct {
-	AILines      int     `json:"ai_lines"`
-	HumanLines   int     `json:"human_lines"`
-	DeletedLines int     `json:"deleted_lines"`
-	Files        int     `json:"files"`
-	Tokens       *Tokens `json:"tokens,omitempty"`
+	AILines      int `json:"ai_lines"`
+	HumanLines   int `json:"human_lines"`
+	DeletedLines int `json:"deleted_lines"`
+	// AIDeletedLines is the subset of DeletedLines whose removal was matched
+	// to an AI edit's recorded edit_removed_lines hashes. The remaining
+	// DeletedLines - AIDeletedLines were removed by a human.
+	AIDeletedLines int     `json:"ai_deleted_lines,omitempty"`
+	Files          int     `json:"files"`
+	Tokens         *Tokens `json:"tokens,omitempty"`
 	// Models is a per-model line-count rollup. Keys are concrete model
 	// identifiers (e.g. "claude-opus-4-7", "gpt-4o"), not provider names.
 	// Lines whose source AI didn't expose a model name aren't counted here.
@@ -161,11 +165,13 @@ type RangeEntry struct {
 	End   int    `json:"end"`   // inclusive; == Start for a single line
 	Type  string `json:"type"`  // "add" | "delete"
 	// AuthorType is the binary AI-or-human classification. "AI" for any AI
-	// tool (claude/cursor/codex/copilot/gemini), "Human" for typed-by-user
-	// or pasted lines, "" for deletions (we don't attribute who deleted what).
+	// tool (claude/cursor/codex/copilot/gemini), "Human" for typed-by-user,
+	// pasted, or otherwise-unmatched lines (including most deletions: a
+	// deletion is "AI" only when it matches a hash an AI tool recorded as
+	// removed at edit time).
 	AuthorType string `json:"author_type,omitempty"`
 	// Tool is the attributed AI tool. Omitted for human-typed lines (humans
-	// aren't a tool) and for deletes (we don't attribute removals).
+	// aren't a tool) and for deletions that couldn't be matched to an AI edit.
 	Tool    string  `json:"tool,omitempty"`
 	Model   *string `json:"model,omitempty"`
 	GenType *string `json:"gen_type,omitempty"`
@@ -291,7 +297,7 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	//      commits doesn't repeat its whole history on every commit.
 	// transcript_path is written into raw_meta by the Claude hook as of blamely
 	// 0.2; older edits silently produce no conversation. Must run BEFORE
-	// MarshalIndent/writeNote so it ends up in the persisted note.
+	// json.Marshal/writeNote so it ends up in the persisted note.
 	//
 	// Guard on AILines: a commit with zero AI-attributed lines had no AI tool
 	// involved, so any "matching" session/transcript found in the time window
@@ -363,10 +369,10 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	}
 
 	// Apply the user's note-content config (~/.blamely/config.json). The note is
-	// built in full above; here we strip whatever the user disabled, in one
-	// auditable place, just before it is persisted. Defaults are all-on, so a
-	// missing/partial config leaves the note unchanged. Attribution itself is
-	// never affected — only what gets written into the note.
+	// built in full above; here we strip whatever the user disabled (or hasn't
+	// opted into), in one auditable place, just before it is persisted.
+	// Conversation defaults off; everything else defaults on. Attribution
+	// itself is never affected — only what gets written into the note.
 	cfg := config.LoadConfig()
 	if !cfg.Note.Message {
 		note.Message = ""
@@ -388,7 +394,7 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 		}
 	}
 
-	body, err := json.MarshalIndent(note, "", "  ")
+	body, err := json.Marshal(note)
 	if err != nil {
 		return nil, fmt.Errorf("marshal note: %w", err)
 	}
@@ -493,7 +499,7 @@ type perLine struct {
 	edit    *store.Edit
 }
 
-func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []AddedLine, deleted map[string][]int, renames map[string]string, fileChanges map[string]FileChangeType) (*Note, error) {
+func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []AddedLine, deleted map[string][]DeletedLine, renames map[string]string, fileChanges map[string]FileChangeType) (*Note, error) {
 	// Scope AI edits by WORK SESSION (branch + HEAD-at-edit-time), not by a
 	// timestamp window. At commit time the session is the one keyed by this
 	// commit's parent — the HEAD tip while those edits were being made.
@@ -512,8 +518,17 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 	// Intra-session lower bound: an edit already consumed by an earlier commit on
 	// this branch must not re-claim a line in a later commit (sessions can span
 	// many commits). Returns 0 for the first commit → includes all prior edits.
-	// This bounds only the PRIMARY match; the content_sha fallback is unbounded.
+	// Both the primary AND content_sha-drift fallback are bounded below by this:
+	// an AI edit from a PREVIOUS commit (this session or another) must not
+	// re-attribute a line a human copy-pastes into a LATER commit.
 	sinceNanos := db.PreviousCommitTimestampNanos(repoPath, commitNanos)
+
+	// git commit timestamps are second-precision; edit timestamps are
+	// nanosecond-precision. Allow up to 5s of post-commit slack so an
+	// edit recorded in the same wall-clock second as the commit still
+	// counts. (The post-commit hook fires immediately after the commit.)
+	const sameSecondSlackNanos = int64(5 * 1e9)
+	maxNanos := commitNanos + sameSecondSlackNanos
 
 	// Group changed lines by file so we hit the DB once per file.
 	// Also carry the line content for ContentSHA-based fallback attribution
@@ -528,17 +543,13 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		}
 	}
 
-	// editsForFile pulls the session-scoped edits for a file (primary), plus the
-	// repo-wide edits for the same file (content_sha fallback). The fallback is
-	// what re-attributes cherry-picked/squashed AI code: the new commit has a
-	// fresh SHA/timestamp and a different session, but the line content — and
-	// thus its content_sha — is unchanged.
-	editsForFile := func(file string) (sessionEdits, anyEdits []store.Edit, err error) {
+	// editsForFile pulls the current-session edits for a file. Content-sha
+	// matching (both exact and drift fallback) is scoped to THIS session only:
+	// AI-generated content from a previous session that a human copy-pastes
+	// into the current session's commit must attribute as Human.
+	editsForFile := func(file string) (sessionEdits []store.Edit, err error) {
 		if sessionEdits, err = db.EditsForFileInSession(repoPath, file, sessionID); err != nil {
-			return nil, nil, err
-		}
-		if anyEdits, err = db.EditsForFileAny(repoPath, file); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		// Destination of a rename: also pull edits recorded under the old name
 		// so `git mv` doesn't lose history.
@@ -546,37 +557,80 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			if old, err := db.EditsForFileInSession(repoPath, from, sessionID); err == nil {
 				sessionEdits = mergeEditsByTimeDesc(sessionEdits, old)
 			}
-			if old, err := db.EditsForFileAny(repoPath, from); err == nil {
-				anyEdits = mergeEditsByTimeDesc(anyEdits, old)
-			}
 		}
-		return sessionEdits, anyEdits, nil
+		return sessionEdits, nil
 	}
 
 	resolved := make([]perLine, 0, len(added))
+	sessionEditsByFile := map[string][]store.Edit{}
 	for file, lineNos := range byFile {
-		sessionEdits, anyEdits, err := editsForFile(file)
+		sessionEdits, err := editsForFile(file)
 		if err != nil {
 			return nil, err
 		}
-		// git commit timestamps are second-precision; edit timestamps are
-		// nanosecond-precision. Allow up to 5s of post-commit slack so an
-		// edit recorded in the same wall-clock second as the commit still
-		// counts. (The post-commit hook fires immediately after the commit.)
-		const sameSecondSlackNanos = int64(5 * 1e9)
+		sessionEditsByFile[file] = sessionEdits
+
+		// claimedSHA marks content SHAs that have an EXACT (StartLine==ln) match
+		// to some line being committed in this file. That line is the AI edit's
+		// "true" position; any OTHER line in this commit with the same content is
+		// a human copy-paste and must not also match via the drift fallback below.
+		// claimedSHANorm is the same guard for the normalized (autoformatter-drift)
+		// fallback: it's keyed by content_sha_norm so a human copy-paste of an
+		// AI line's (post-format) text doesn't also match via the normalized
+		// drift fallback.
+		claimedSHA := map[string]bool{}
+		claimedSHANorm := map[string]bool{}
+		for _, ln := range lineNos {
+			content := lineContent[fileLineKey{file, ln}]
+			if content == "" {
+				continue
+			}
+			shaWant := sha256HexStr([]byte(content))
+			normWant := sha256HexNormStr(content)
+			for i := range sessionEdits {
+				e := &sessionEdits[i]
+				if e.TimestampNanos <= sinceNanos || e.TimestampNanos > maxNanos {
+					continue
+				}
+				if !claimedSHA[shaWant] && coversContentSHA(e.Lines, content, ln) {
+					claimedSHA[shaWant] = true
+				}
+				if normWant != "" && !claimedSHANorm[normWant] && coversContentSHANorm(e.Lines, content, ln) {
+					claimedSHANorm[normWant] = true
+				}
+				if claimedSHA[shaWant] && (normWant == "" || claimedSHANorm[normWant]) {
+					break
+				}
+			}
+		}
+
 		for _, ln := range lineNos {
 			// Default: human-typed code. tool="" + gen_type=human is the
 			// canonical representation; humans aren't a tool.
 			content := lineContent[fileLineKey{file, ln}]
 			p := perLine{file: file, line: ln, content: content, tool: "", genType: store.GenTypeHuman}
-			// Primary: a session edit covering this line by range OR content_sha,
-			// bounded below by the previous commit (intra-session separator).
-			e := pickEdit(sessionEdits, ln, content, sinceNanos, commitNanos+sameSecondSlackNanos, true)
-			if e == nil {
-				// Fallback: any edit for this file whose content_sha matches this
-				// line's content (line numbers ignored, time-unbounded below —
-				// survives cherry-pick/squash).
-				e = pickEdit(anyEdits, ln, content, 0, commitNanos+sameSecondSlackNanos, false)
+			// Primary: a session edit covering this line by range OR content_sha
+			// (content_sha must be at this exact line), bounded by the previous
+			// commit (intra-session separator).
+			e := pickEdit(sessionEdits, ln, content, sinceNanos, maxNanos, true, false)
+			if e == nil && content != "" && !claimedSHA[sha256HexStr([]byte(content))] {
+				// Drift fallback: this session's content_sha at a DIFFERENT line —
+				// a human insertion/deletion shifted the AI block. Skipped when this
+				// content's true position is already accounted for elsewhere in this
+				// commit (claimedSHA), which means THIS line is a copy, not a drift.
+				e = pickEdit(sessionEdits, ln, content, sinceNanos, maxNanos, false, false)
+			}
+			if e == nil && content != "" {
+				// Normalized fallback: an autoformatter reflowed this line's
+				// whitespace (reindent, trailing-whitespace, tabs/spaces) after the
+				// AI wrote it, so its exact content_sha no longer matches but its
+				// whitespace-collapsed content_sha_norm still does. Try this line's
+				// own position first, then any line in this session (drift), guarded
+				// by claimedSHANorm exactly like the exact-hash drift fallback above.
+				e = pickEdit(sessionEdits, ln, content, sinceNanos, maxNanos, true, true)
+				if e == nil && !claimedSHANorm[sha256HexNormStr(content)] {
+					e = pickEdit(sessionEdits, ln, content, sinceNanos, maxNanos, false, true)
+				}
 			}
 			if e != nil {
 				// Normalise legacy rows: tool="human" pre-dates the split.
@@ -649,18 +703,16 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		// by the pre-commit name for renames (e.g. `git mv old.go new.go`). The
 		// diff parser already filters out modification deletes (paired -/+
 		// inside the same hunk) so everything left here is a genuine deletion.
-		var delLines []int
+		var delLines []DeletedLine
 		if d, ok := deleted[curFileEntry.Path]; ok {
 			delLines = d
 		} else if old, ok := renames[curFileEntry.Path]; ok {
 			delLines = deleted[old]
 		}
-		for _, n := range delLines {
-			curFileEntry.acc = append(curFileEntry.acc, LineEntry{
-				Line:       n,
-				Type:       "delete",
-				AuthorType: "Human",
-			})
+		if len(delLines) > 0 {
+			sessionEdits := sessionEditsByFile[curFileEntry.Path]
+			remSHA, remNorm := removedHashMultisets(sessionEdits)
+			curFileEntry.acc = append(curFileEntry.acc, attributeDeletedLines(delLines, sessionEdits, sinceNanos, maxNanos, remSHA, remNorm, &note.Totals, &note.ByGenType)...)
 		}
 		curFileEntry.Deleted = len(delLines)
 		note.Totals.DeletedLines += curFileEntry.Deleted
@@ -764,10 +816,12 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			kind = FileDeleted
 		}
 		fe := FileEntry{Path: path, Type: string(kind), Deleted: len(delLines)}
-		acc := make([]LineEntry, 0, len(delLines))
-		for _, n := range delLines {
-			acc = append(acc, LineEntry{Line: n, Type: "delete", AuthorType: "Human"})
+		sessionEdits, err := editsForFile(path)
+		if err != nil {
+			return nil, err
 		}
+		remSHA, remNorm := removedHashMultisets(sessionEdits)
+		acc := attributeDeletedLines(delLines, sessionEdits, sinceNanos, maxNanos, remSHA, remNorm, &note.Totals, &note.ByGenType)
 		fe.Lines = collapseToRanges(acc)
 		note.Files = append(note.Files, fe)
 		note.Totals.DeletedLines += fe.Deleted
@@ -857,23 +911,11 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		if p.tool == store.ToolCopyPaste {
 			continue
 		}
-		switch p.genType {
-		case store.GenTypeChat:
-			note.ByGenType.Chat++
-		case store.GenTypeCLI:
-			note.ByGenType.CLI++
-		case store.GenTypeCompletion:
-			note.ByGenType.Completion++
-		case store.GenTypeHuman:
-			note.ByGenType.Human++
-		default:
-			note.ByGenType.Unknown++
-		}
+		bumpGenType(&note.ByGenType, p.genType)
 	}
-	// Deleted lines are always a human action: the user chose to remove them.
-	// They don't appear in `resolved` (which only covers added lines), so we
-	// add them to by_gen_type.human here after the totals are finalised.
-	note.ByGenType.Human += note.Totals.DeletedLines
+	// Deleted lines were already bucketed into by_gen_type per-line above
+	// (attributeDeletedLine), using the matched AI edit's gen_type for
+	// AI-attributed deletions and "human" otherwise.
 
 	return note, nil
 }
@@ -899,6 +941,188 @@ func mergeEditsByTimeDesc(a, b []store.Edit) []store.Edit {
 	return out
 }
 
+// removedHashMultisets builds, per edit, "remaining" multisets of the
+// content_sha / content_sha_norm hashes that edit recorded as removed
+// (edit_removed_lines). pickEditForRemovedLine consumes (decrements) entries
+// from these multisets as deleted lines in this commit are matched, so each
+// recorded removal can attribute at most one deleted line — mirroring how
+// claimedSHA prevents an added line's content_sha from over-attributing.
+func removedHashMultisets(edits []store.Edit) (remainingSHA, remainingNorm map[int64]map[string]int) {
+	remainingSHA = map[int64]map[string]int{}
+	remainingNorm = map[int64]map[string]int{}
+	for i := range edits {
+		e := &edits[i]
+		if len(e.RemovedLines) == 0 {
+			continue
+		}
+		shaSet := map[string]int{}
+		normSet := map[string]int{}
+		for _, r := range e.RemovedLines {
+			if r.ContentSHA != "" {
+				shaSet[r.ContentSHA]++
+			}
+			if r.ContentSHANorm != "" {
+				normSet[r.ContentSHANorm]++
+			}
+		}
+		remainingSHA[e.ID] = shaSet
+		remainingNorm[e.ID] = normSet
+	}
+	return remainingSHA, remainingNorm
+}
+
+// pickEditForRemovedLine returns the edit (confidence/recency-ordered, like
+// pickEdit) recorded within (minNanos, maxNanos] whose edit_removed_lines
+// include a hash matching content — exact content_sha first, then the
+// whitespace-normalized content_sha_norm. A match consumes (decrements) the
+// corresponding entry in remainingSHA/remainingNorm so it can't also
+// attribute another deleted line. Returns nil for blank/whitespace-only
+// content (never recorded at edit time, see tools.RemovedLineHashes) or when
+// no edit's removed-lines include this hash, leaving the line "Human".
+func pickEditForRemovedLine(edits []store.Edit, content string, minNanos, maxNanos int64, remainingSHA, remainingNorm map[int64]map[string]int) *store.Edit {
+	if strings.TrimSpace(content) == "" {
+		return nil
+	}
+	want := sha256HexStr([]byte(content))
+	for i := range edits {
+		e := &edits[i]
+		if e.TimestampNanos <= minNanos || e.TimestampNanos > maxNanos {
+			continue
+		}
+		if set := remainingSHA[e.ID]; set[want] > 0 {
+			set[want]--
+			return e
+		}
+	}
+	wantNorm := sha256HexNormStr(content)
+	if wantNorm == "" {
+		return nil
+	}
+	for i := range edits {
+		e := &edits[i]
+		if e.TimestampNanos <= minNanos || e.TimestampNanos > maxNanos {
+			continue
+		}
+		if set := remainingNorm[e.ID]; set[wantNorm] > 0 {
+			set[wantNorm]--
+			return e
+		}
+	}
+	return nil
+}
+
+// attributeDeletedLine builds the LineEntry for one removed line, matching it
+// against sessionEdits' recorded edit_removed_lines hashes via
+// pickEditForRemovedLine. On a match to an AI tool's edit, it sets
+// AuthorType/Tool/Model/GenType (mirroring an added line's attribution) and
+// increments totals.AIDeletedLines; otherwise the line stays
+// AuthorType:"Human" with no Tool/Model/GenType set, identical to the
+// pre-AI-deletion-attribution output. The resolved gen_type (the matched
+// edit's, or "human") is returned alongside so the caller can bump
+// by_gen_type after inheritBlankDeletedLineAttribution has had a chance to
+// reassign blank lines.
+func attributeDeletedLine(d DeletedLine, sessionEdits []store.Edit, sinceNanos, maxNanos int64, remainingSHA, remainingNorm map[int64]map[string]int, totals *Totals) (LineEntry, store.GenType) {
+	le := LineEntry{Line: d.LineNum, Type: "delete", AuthorType: "Human"}
+	gt := store.GenTypeHuman
+	if e := pickEditForRemovedLine(sessionEdits, d.Content, sinceNanos, maxNanos, remainingSHA, remainingNorm); e != nil {
+		if at := authorTypeFor(e.Tool); at == "AI" {
+			le.AuthorType = at
+			le.Tool = string(e.Tool)
+			if e.Model.Valid {
+				le.Model = strPtr(e.Model.String)
+			}
+			gt = e.GenType
+			if gtStr := string(gt); gtStr != "" && gtStr != string(store.GenTypeUnknown) {
+				le.GenType = strPtr(gtStr)
+			}
+			totals.AIDeletedLines++
+		}
+	}
+	return le, gt
+}
+
+// attributeDeletedLines builds the LineEntry for every line in delLines (see
+// attributeDeletedLine), runs inheritBlankDeletedLineAttribution so blank
+// deleted lines pick up an adjacent AI-attributed deletion's attribution, and
+// finally bumps by_gen_type for each line's (possibly reassigned) gen_type.
+func attributeDeletedLines(delLines []DeletedLine, sessionEdits []store.Edit, sinceNanos, maxNanos int64, remainingSHA, remainingNorm map[int64]map[string]int, totals *Totals, byGenType *ByGenType) []LineEntry {
+	entries := make([]LineEntry, len(delLines))
+	gts := make([]store.GenType, len(delLines))
+	for i, d := range delLines {
+		entries[i], gts[i] = attributeDeletedLine(d, sessionEdits, sinceNanos, maxNanos, remainingSHA, remainingNorm, totals)
+	}
+	inheritBlankDeletedLineAttribution(delLines, entries, gts, totals)
+	for _, gt := range gts {
+		bumpGenType(byGenType, gt)
+	}
+	return entries
+}
+
+// inheritBlankDeletedLineAttribution gives a blank deleted line the
+// AuthorType/Tool/Model/GenType of an adjacent non-blank deleted line from the
+// same removal, when that neighbour was AI-attributed. tools.RemovedLineHashes
+// never records a content_sha for blank/whitespace-only lines, so
+// pickEditForRemovedLine can never match one directly and
+// attributeDeletedLine leaves it "Human" by default — even when an AI deleted
+// the whole surrounding block, blank lines included. Mirrors
+// inheritBlankLineAttribution, which does the same for added lines: look
+// backward for the nearest non-blank neighbour, falling back to forward only
+// if there is no non-blank neighbour at all; a non-AI neighbour leaves the
+// blank line "Human".
+func inheritBlankDeletedLineAttribution(delLines []DeletedLine, entries []LineEntry, gts []store.GenType, totals *Totals) {
+	for i := range entries {
+		if strings.TrimSpace(delLines[i].Content) != "" {
+			continue // non-blank lines keep their own (content-matched) attribution
+		}
+		if entries[i].AuthorType == "AI" {
+			continue // a blank that already matched an AI edit — leave it
+		}
+		src := -1
+		for j := i - 1; j >= 0; j-- {
+			if strings.TrimSpace(delLines[j].Content) != "" {
+				src = j
+				break
+			}
+		}
+		if src == -1 {
+			for j := i + 1; j < len(entries); j++ {
+				if strings.TrimSpace(delLines[j].Content) != "" {
+					src = j
+					break
+				}
+			}
+		}
+		if src == -1 || entries[src].AuthorType != "AI" {
+			continue // no neighbour, or the neighbour is human — keep blank human
+		}
+		entries[i].AuthorType = entries[src].AuthorType
+		entries[i].Tool = entries[src].Tool
+		entries[i].Model = entries[src].Model
+		entries[i].GenType = entries[src].GenType
+		gts[i] = gts[src]
+		totals.AIDeletedLines++
+	}
+}
+
+// bumpGenType increments the by_gen_type bucket matching gt. Shared by added
+// lines (resolved) and deleted lines (attributeDeletedLine) so an
+// AI-attributed deletion counts toward that edit's gen_type (chat/cli) rather
+// than always landing in "human".
+func bumpGenType(by *ByGenType, gt store.GenType) {
+	switch gt {
+	case store.GenTypeChat:
+		by.Chat++
+	case store.GenTypeCLI:
+		by.CLI++
+	case store.GenTypeCompletion:
+		by.Completion++
+	case store.GenTypeHuman:
+		by.Human++
+	default:
+		by.Unknown++
+	}
+}
+
 // pickEdit returns the first edit (the slice is confidence-then-recency ordered)
 // recorded within (minNanos, maxNanos] that claims the given line. A content_sha
 // match always counts; a line-number range match counts only when allowLineMatch
@@ -910,7 +1134,13 @@ func mergeEditsByTimeDesc(a, b []store.Edit) []store.Edit {
 // allowLineMatch = false: it relies on content alone (line numbers are unreliable
 // across cherry-pick/squash) and must NOT be time-bounded, because the original
 // AI edit predates the rewritten commit's timestamp.
-func pickEdit(edits []store.Edit, ln int, content string, minNanos, maxNanos int64, allowLineMatch bool) *store.Edit {
+//
+// useNorm switches the content match from the exact content_sha to the
+// whitespace-normalized content_sha_norm — the autoformatter-drift fallback.
+// When useNorm is true, coversLine is never consulted: position-only matches
+// (edits without a content_sha at all) are already covered by the non-norm
+// primary call, so re-checking them here would just duplicate that result.
+func pickEdit(edits []store.Edit, ln int, content string, minNanos, maxNanos int64, allowLineMatch, useNorm bool) *store.Edit {
 	for i := range edits {
 		e := &edits[i]
 		if e.TimestampNanos <= minNanos || e.TimestampNanos > maxNanos {
@@ -923,6 +1153,12 @@ func pickEdit(edits []store.Edit, ln int, content string, minNanos, maxNanos int
 		shaLn := 0
 		if allowLineMatch {
 			shaLn = ln
+		}
+		if useNorm {
+			if coversContentSHANorm(e.Lines, content, shaLn) {
+				return e
+			}
+			continue
 		}
 		if coversContentSHA(e.Lines, content, shaLn) || (allowLineMatch && coversLine(e.Lines, ln)) {
 			return e
@@ -963,6 +1199,29 @@ func coversContentSHA(lines []store.EditLine, content string, ln int) bool {
 	want := sha256HexStr([]byte(content))
 	for _, l := range lines {
 		if l.ContentSHA == "" || l.ContentSHA != want {
+			continue
+		}
+		if ln > 0 && l.StartLine != ln {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// coversContentSHANorm is coversContentSHA's fallback for the
+// whitespace-normalized hash: it matches a line whose exact bytes changed
+// (e.g. an autoformatter reindented an AI-written line, changed its trailing
+// commas, or adjusted spacing) but whose collapsed-whitespace text still
+// matches the AI-recorded line. Same ln=0 cross-session/drift convention as
+// coversContentSHA.
+func coversContentSHANorm(lines []store.EditLine, content string, ln int) bool {
+	want := sha256HexNormStr(content)
+	if want == "" {
+		return false
+	}
+	for _, l := range lines {
+		if l.ContentSHANorm == "" || l.ContentSHANorm != want {
 			continue
 		}
 		if ln > 0 && l.StartLine != ln {
@@ -1055,4 +1314,16 @@ func equalInt64Ptr(a, b *int64) bool {
 func sha256HexStr(b []byte) string {
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
+}
+
+// sha256HexNormStr is sha256HexStr over the whitespace-normalized line text
+// (see tools.NormalizeLineText), returning "" for blank/whitespace-only
+// content — mirroring content_sha_norm's record-time convention so blank
+// lines never spuriously match each other.
+func sha256HexNormStr(content string) string {
+	norm := tools.NormalizeLineText(content)
+	if norm == "" {
+		return ""
+	}
+	return sha256HexStr([]byte(norm))
 }

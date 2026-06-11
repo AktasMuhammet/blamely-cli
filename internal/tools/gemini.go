@@ -36,7 +36,7 @@ func RecordGeminiFromStdin(r io.Reader) error {
 		return nil
 	}
 
-	filePath, ranges, suggested := extractGeminiRanges(p)
+	filePath, ranges, suggested, removed, newFullContent := extractGeminiRanges(p)
 	if filePath == "" {
 		return nil
 	}
@@ -54,6 +54,15 @@ func RecordGeminiFromStdin(r io.Reader) error {
 		}
 	}
 
+	// write_file overwrites the whole file with no "before" content of its
+	// own — fetch the daemon's cached snapshot (the file's content as of its
+	// last recorded edit) so we can still detect lines this write removed.
+	if newFullContent != nil {
+		if snapshot, ok := fetchSnapshot(repoPath, rel); ok {
+			removed = append(removed, RemovedLineHashes(snapshot, *newFullContent)...)
+		}
+	}
+
 	genType := ReadTranscriptGenType(p.TranscriptPath)
 	if genType == "" {
 		genType = "cli"
@@ -67,6 +76,7 @@ func RecordGeminiFromStdin(r io.Reader) error {
 		FilePath:       rel,
 		SuggestedLines: suggested,
 		Lines:          toDaemonRanges(ranges),
+		RemovedLines:   toDaemonRemovedLines(removed),
 		RawMeta: fmt.Sprintf(`{"session_id":%q,"tool":%q,"transcript_path":%q,"source":"gemini_hook"}`,
 			p.SessionID, p.ToolName, p.TranscriptPath),
 	}
@@ -78,7 +88,7 @@ func RecordGeminiFromStdin(r io.Reader) error {
 	return postToDaemon(payload)
 }
 
-func extractGeminiRanges(p geminiHookPayload) (string, []LineRange, int64) {
+func extractGeminiRanges(p geminiHookPayload) (string, []LineRange, int64, []DeletedLineHash, *string) {
 	switch p.ToolName {
 	case "write_file":
 		var in struct {
@@ -86,14 +96,14 @@ func extractGeminiRanges(p geminiHookPayload) (string, []LineRange, int64) {
 			Content  string `json:"content"`
 		}
 		if err := json.Unmarshal(p.ToolInput, &in); err != nil || in.FilePath == "" {
-			return "", nil, 0
+			return "", nil, 0, nil, nil
 		}
 		suggested := int64(countLines(in.Content))
 		lr, _ := LineRangeForWholeFile(in.FilePath)
 		if lr == nil {
-			return in.FilePath, nil, suggested
+			return in.FilePath, nil, suggested, nil, &in.Content
 		}
-		return in.FilePath, lr, suggested
+		return in.FilePath, lr, suggested, nil, &in.Content
 
 	case "replace":
 		var in struct {
@@ -102,17 +112,18 @@ func extractGeminiRanges(p geminiHookPayload) (string, []LineRange, int64) {
 			NewString string `json:"new_string"`
 		}
 		if err := json.Unmarshal(p.ToolInput, &in); err != nil || in.FilePath == "" {
-			return "", nil, 0
+			return "", nil, 0, nil, nil
 		}
+		removed := RemovedLineHashes(in.OldString, in.NewString)
 		if strings.TrimSpace(in.NewString) == "" && in.OldString != "" {
-			return in.FilePath, nil, int64(countLines(in.OldString))
+			return in.FilePath, nil, int64(countLines(in.OldString)), removed, nil
 		}
 		lr, _ := LocateNewString(in.FilePath, in.NewString)
 		if lr == nil {
-			return in.FilePath, nil, CountAddedLines(in.OldString, in.NewString)
+			return in.FilePath, nil, CountAddedLines(in.OldString, in.NewString), removed, nil
 		}
 		ranges, suggested := narrowToChangedLines(in.OldString, in.NewString, *lr)
-		return in.FilePath, ranges, suggested
+		return in.FilePath, ranges, suggested, removed, nil
 	}
 
 	// Generic: file_path / path + content / new_string / code
@@ -124,14 +135,14 @@ func extractGeminiRanges(p geminiHookPayload) (string, []LineRange, int64) {
 		Code      string `json:"code"`
 	}
 	if err := json.Unmarshal(p.ToolInput, &generic); err != nil {
-		return "", nil, 0
+		return "", nil, 0, nil, nil
 	}
 	fp := generic.FilePath
 	if fp == "" {
 		fp = generic.Path
 	}
 	if fp == "" {
-		return "", nil, 0
+		return "", nil, 0, nil, nil
 	}
 	body := generic.NewString
 	if body == "" {
@@ -143,10 +154,10 @@ func extractGeminiRanges(p geminiHookPayload) (string, []LineRange, int64) {
 	suggested := int64(countLines(body))
 	if body != "" {
 		if lr, _ := LocateNewString(fp, body); lr != nil {
-			return fp, []LineRange{*lr}, suggested
+			return fp, []LineRange{*lr}, suggested, nil, nil
 		}
 	}
-	return fp, nil, suggested
+	return fp, nil, suggested, nil, nil
 }
 
 type geminiUsageMetadata struct {

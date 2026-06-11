@@ -106,7 +106,7 @@ func TestChatWatcher_TextEditGroupEmitsChatEdit(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &teg); err != nil {
 		t.Fatal(err)
 	}
-	w.recordTextEditGroup(&teg, st.model, "/sessions/s.jsonl", st, &mu, sink, true)
+	w.recordTextEditGroup(&teg, st.model, "/sessions/s.jsonl", st, &mu, sink, true, 0)
 
 	if len(sink.events) != 1 {
 		t.Fatalf("want 1 chat edit, got %d (%+v)", len(sink.events), sink.events)
@@ -130,8 +130,8 @@ func TestChatWatcher_TextEditGroupEmitsChatEdit(t *testing.T) {
 		}
 	}
 
-	// Re-recording the SAME edit is deduped — no second event.
-	w.recordTextEditGroup(&teg, st.model, "/sessions/s.jsonl", st, &mu, sink, true)
+	// Re-recording the SAME edit (same request index) is deduped — no second event.
+	w.recordTextEditGroup(&teg, st.model, "/sessions/s.jsonl", st, &mu, sink, true, 0)
 	if len(sink.events) != 1 {
 		t.Errorf("dedup failed: want still 1 event, got %d", len(sink.events))
 	}
@@ -141,9 +141,65 @@ func TestChatWatcher_TextEditGroupEmitsChatEdit(t *testing.T) {
 	var partial textEditGroupPart
 	_ = json.Unmarshal([]byte(fmt.Sprintf(`{"kind":"textEditGroup","uri":{"path":%s,"scheme":"file"},"edits":[[{"text":"x","range":{"startLineNumber":1}}]],"done":false}`,
 		jsonQuotedFilePath(file))), &partial)
-	w.recordTextEditGroup(&partial, st.model, "/sessions/s.jsonl", st, &mu, sink2, true)
+	w.recordTextEditGroup(&partial, st.model, "/sessions/s.jsonl", st, &mu, sink2, true, 0)
 	if len(sink2.events) != 0 {
 		t.Errorf("partial (done=false) should not emit, got %d", len(sink2.events))
+	}
+}
+
+// TestChatWatcher_TextEditGroupSameStartLineDifferentRequest verifies that a
+// follow-up chat turn which rewrites the same file starting at the same line
+// (e.g. "regenerate the whole file") is NOT silently dropped just because an
+// earlier turn already recorded an edit at that start line. This was the root
+// cause of AI edits going undetected: the dedup key ignored which chat request
+// (turn) the textEditGroup belonged to.
+func TestChatWatcher_TextEditGroupSameStartLineDifferentRequest(t *testing.T) {
+	dir := t.TempDir()
+	for _, args := range [][]string{{"init", "-q"}, {"config", "user.email", "t@l"}, {"config", "user.name", "T"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if err := cmd.Run(); err != nil {
+			t.Skipf("git not available: %v", err)
+		}
+	}
+	file := filepath.Join(dir, "app.go")
+	if err := os.WriteFile(file, []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w := newCopilotWatcher()
+	var mu sync.Mutex
+	st := &sessionState{seenEdits: map[string]bool{}}
+	st.model = "gpt-5-mini"
+	sink := &captureSink{}
+
+	// Turn 0: a textEditGroup rewriting the file from line 1 (e.g. matches the
+	// pre-edit/HEAD content).
+	var teg0 textEditGroupPart
+	raw0 := fmt.Sprintf(`{"kind":"textEditGroup","uri":{"path":%s,"scheme":"file"},"edits":[[{"text":"old\nfile\ncontent","range":{"startLineNumber":1}}]],"done":true}`,
+		jsonQuotedFilePath(file))
+	if err := json.Unmarshal([]byte(raw0), &teg0); err != nil {
+		t.Fatal(err)
+	}
+	w.recordTextEditGroup(&teg0, st.model, "/sessions/s.jsonl", st, &mu, sink, true, 0)
+	if len(sink.events) != 1 {
+		t.Fatalf("turn 0: want 1 event, got %d", len(sink.events))
+	}
+
+	// Turn 1: a follow-up textEditGroup ALSO starting at line 1 (the model
+	// regenerated the whole file again with new content). Must still emit.
+	var teg1 textEditGroupPart
+	raw1 := fmt.Sprintf(`{"kind":"textEditGroup","uri":{"path":%s,"scheme":"file"},"edits":[[{"text":"new\nfile\ncontent\nwith\nmore\nlines","range":{"startLineNumber":1}}]],"done":true}`,
+		jsonQuotedFilePath(file))
+	if err := json.Unmarshal([]byte(raw1), &teg1); err != nil {
+		t.Fatal(err)
+	}
+	w.recordTextEditGroup(&teg1, st.model, "/sessions/s.jsonl", st, &mu, sink, true, 1)
+	if len(sink.events) != 2 {
+		t.Fatalf("turn 1: want 2 events total, got %d (%+v)", len(sink.events), sink.events)
+	}
+	if len(sink.events[1].Lines) != 6 {
+		t.Errorf("turn 1: want 6 line entries, got %d", len(sink.events[1].Lines))
 	}
 }
 

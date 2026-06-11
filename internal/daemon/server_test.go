@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -275,6 +277,182 @@ func TestServer_Ingest_RejectsValidationFailure(t *testing.T) {
 	}
 }
 
+// ---------- /snapshot ----------
+
+// requireGit skips the test if `git` isn't on PATH — the HEAD-fallback path
+// shells out to git.
+func requireGit(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed: " + err.Error())
+	}
+}
+
+// initGitRepoWithFile creates a temp git repo containing file with the given
+// content, committed to HEAD. Returns the repo's root path.
+func initGitRepoWithFile(t *testing.T, file, content string) string {
+	t.Helper()
+	requireGit(t)
+	dir := t.TempDir()
+	if out, err := exec.Command("git", "init", "-q", "-b", "main", dir).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(dir, file), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) {
+		base := []string{"-C", dir,
+			"-c", "user.email=test@blamely.test",
+			"-c", "user.name=Blamely Test",
+			"-c", "commit.gpgsign=false",
+		}
+		cmd := exec.Command("git", append(base, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("add", file)
+	run("commit", "-q", "-m", "seed")
+	return dir
+}
+
+func snapshotRequest(s *Server, repo, file string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, "/snapshot?repo="+url.QueryEscape(repo)+"&file="+url.QueryEscape(file), nil)
+	w := httptest.NewRecorder()
+	s.snapshot(w, req)
+	return w
+}
+
+func decodeSnapshotResponse(t *testing.T, w *httptest.ResponseRecorder) (string, bool) {
+	t.Helper()
+	var out struct {
+		Content string `json:"content"`
+		Found   bool   `json:"found"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&out); err != nil {
+		t.Fatalf("decode response: %v (body=%s)", err, w.Body.String())
+	}
+	return out.Content, out.Found
+}
+
+func TestServer_Snapshot_RejectsNonGet(t *testing.T) {
+	s := &Server{db: openTestDB(t)}
+	req := httptest.NewRequest(http.MethodPost, "/snapshot", nil)
+	w := httptest.NewRecorder()
+	s.snapshot(w, req)
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", w.Code)
+	}
+}
+
+func TestServer_Snapshot_RequiresRepoAndFile(t *testing.T) {
+	s := &Server{db: openTestDB(t)}
+	cases := []string{"/snapshot", "/snapshot?repo=/r", "/snapshot?file=f"}
+	for _, target := range cases {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		w := httptest.NewRecorder()
+		s.snapshot(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", target, w.Code)
+		}
+	}
+}
+
+func TestServer_Snapshot_DBHit(t *testing.T) {
+	db := openTestDB(t)
+	s := &Server{db: db}
+	if err := db.SetFileSnapshot("/repo", "main.go", "package main\n", time.Now().UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	w := snapshotRequest(s, "/repo", "main.go")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	content, found := decodeSnapshotResponse(t, w)
+	if !found {
+		t.Error("found = false, want true")
+	}
+	if content != "package main\n" {
+		t.Errorf("content = %q, want %q", content, "package main\n")
+	}
+}
+
+func TestServer_Snapshot_HeadFallback(t *testing.T) {
+	repo := initGitRepoWithFile(t, "main.go", "package main\n")
+	s := &Server{db: openTestDB(t)}
+	// No DB snapshot has been cached for this repo/file — fall back to HEAD.
+	w := snapshotRequest(s, repo, "main.go")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	content, found := decodeSnapshotResponse(t, w)
+	if !found {
+		t.Error("found = false, want true (HEAD fallback)")
+	}
+	if content != "package main\n" {
+		t.Errorf("content = %q, want %q", content, "package main\n")
+	}
+}
+
+func TestServer_Snapshot_NotFound(t *testing.T) {
+	requireGit(t)
+	// Empty repo with no commits and no cached snapshot — neither the DB nor
+	// `git show HEAD:` has anything to offer.
+	dir := t.TempDir()
+	if out, err := exec.Command("git", "init", "-q", "-b", "main", dir).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+	s := &Server{db: openTestDB(t)}
+	w := snapshotRequest(s, dir, "main.go")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	content, found := decodeSnapshotResponse(t, w)
+	if found {
+		t.Error("found = true, want false")
+	}
+	if content != "" {
+		t.Errorf("content = %q, want empty", content)
+	}
+}
+
+func TestServer_Edit_RefreshesSnapshot(t *testing.T) {
+	repo := initGitRepoWithFile(t, "main.go", "package main\n\nfunc Old() {}\n")
+	db := openTestDB(t)
+	s := &Server{db: db}
+
+	// Simulate the edit having already landed on disk (as it would by the
+	// time the editor's hook fires) before the daemon records it.
+	newContent := "package main\n\nfunc New() {}\n"
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte(newContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(EditPayload{
+		Tool:     "claude",
+		RepoPath: repo,
+		FilePath: "main.go",
+		Lines:    []Range{{Start: 3, End: 3}},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/edit", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	s.ingest(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("ingest status = %d, want 204; body=%s", w.Code, w.Body.String())
+	}
+
+	// The next snapshot request should reflect this edit's on-disk result,
+	// not the HEAD content.
+	sw := snapshotRequest(s, repo, "main.go")
+	content, found := decodeSnapshotResponse(t, sw)
+	if !found {
+		t.Fatal("found = false, want true")
+	}
+	if content != newContent {
+		t.Errorf("content = %q, want %q", content, newContent)
+	}
+}
+
 // ---------- port file ----------
 
 func TestPortFile_WriteThenRead(t *testing.T) {
@@ -346,8 +524,9 @@ func TestWaitForReady_HitsHealthy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WaitForReady: %v", err)
 	}
-	if got != port {
-		t.Errorf("port = %d, want %d", got, port)
+	want := fmt.Sprintf("127.0.0.1:%d", port)
+	if got != want {
+		t.Errorf("addr = %s, want %s", got, want)
 	}
 }
 

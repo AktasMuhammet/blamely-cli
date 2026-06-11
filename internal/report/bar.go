@@ -102,14 +102,48 @@ func RenderBar(w io.Writer, note *gitnotes.Note, width int) {
 			fmt.Fprintf(w, "%s  [%s]\n", label, bar)
 			return
 		}
-		// Deletion-only commit. Deletions are 100% human by convention.
-		humanBar := strings.Repeat("-", width)
-		humanLabel := fmt.Sprintf("Human 100%% (%d deleted)", del)
-		if color {
-			humanBar = ansiBlue + strings.Repeat("░", width) + ansiReset
-			humanLabel = ansiBlue + ansiBold + humanLabel + ansiReset
+		// Deletion-only commit. With no AI-attributed deletions, render the
+		// historical full-width "100% human" bar.
+		aiDel := note.Totals.AIDeletedLines
+		if aiDel == 0 {
+			humanBar := strings.Repeat("-", width)
+			humanLabel := fmt.Sprintf("Human 100%% (%d deleted)", del)
+			if color {
+				humanBar = ansiBlue + strings.Repeat("░", width) + ansiReset
+				humanLabel = ansiBlue + ansiBold + humanLabel + ansiReset
+			}
+			fmt.Fprintf(w, "%s  [%s]\n", humanLabel, humanBar)
+			return
 		}
-		fmt.Fprintf(w, "%s  [%s]\n", humanLabel, humanBar)
+
+		// Some (or all) of the deletions were AI-attributed: split the bar
+		// by ai_deleted_lines / deleted_lines, mirroring the added-lines bar
+		// below.
+		huDel := del - aiDel
+		aiCells := (aiDel*width + del/2) / del
+		if aiCells > width {
+			aiCells = width
+		}
+		huCells := width - aiCells
+
+		var aiPart, huPart string
+		if color {
+			aiPart = ansiGreen + strings.Repeat("█", aiCells) + ansiReset
+			huPart = ansiBlue + strings.Repeat("░", huCells) + ansiReset
+		} else {
+			aiPart = strings.Repeat("#", aiCells)
+			huPart = strings.Repeat("-", huCells)
+		}
+
+		aiPct := float64(aiDel) * 100 / float64(del)
+		huPct := float64(huDel) * 100 / float64(del)
+		aiLabel := fmt.Sprintf("AI %.0f%% (%d deleted)", aiPct, aiDel)
+		huLabel := fmt.Sprintf("Human %.0f%% (%d deleted)", huPct, huDel)
+		if color {
+			aiLabel = ansiGreen + ansiBold + aiLabel + ansiReset
+			huLabel = ansiBlue + ansiBold + huLabel + ansiReset
+		}
+		fmt.Fprintf(w, "%s  [%s%s]  %s\n", aiLabel, aiPart, huPart, huLabel)
 		return
 	}
 
@@ -141,9 +175,14 @@ func RenderBar(w io.Writer, note *gitnotes.Note, width int) {
 
 	fmt.Fprintf(w, "%s  [%s%s]  %s\n", aiLabel, aiPart, huPart, huLabel)
 
-	// Deletions side note — not attributed per-line, treated as human.
+	// Deletions side note, broken down by ai_deleted_lines when available.
 	if del > 0 {
-		delLabel := fmt.Sprintf("Deleted: %d lines (treated as 100%% human)", del)
+		var delLabel string
+		if aiDel := note.Totals.AIDeletedLines; aiDel > 0 {
+			delLabel = fmt.Sprintf("Deleted: %d lines (%d AI / %d Human)", del, aiDel, del-aiDel)
+		} else {
+			delLabel = fmt.Sprintf("Deleted: %d lines (treated as 100%% human)", del)
+		}
 		if color {
 			delLabel = ansiDim + delLabel + ansiReset
 		}

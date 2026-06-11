@@ -10,6 +10,7 @@ const (
 	dirName            = ".blamely"
 	dbFileName         = "db.sqlite"
 	portFileName       = "daemon.port"
+	socketFileName     = "daemon.sock"
 	stateFileName      = "state.json"
 	hooksDirName       = "git-hooks"
 	logFileName        = "daemon.log"
@@ -58,6 +59,14 @@ func PortFile() (string, error) {
 		return "", err
 	}
 	return filepath.Join(d, portFileName), nil
+}
+
+func SocketFile() (string, error) {
+	d, err := BlamelyDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, socketFileName), nil
 }
 
 func StateFile() (string, error) {

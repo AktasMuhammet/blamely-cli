@@ -6,22 +6,39 @@ import (
 	"time"
 )
 
-// WaitForReady blocks until the daemon's port file exists AND a /health
-// request returns 200, or `timeout` elapses. Used by `blamely install` to
-// confirm the launchd/systemd-managed daemon actually came up after the agent
-// was registered. Returns (port, nil) on success and (0, error) on timeout.
-func WaitForReady(timeout time.Duration) (int, error) {
+// healthClient returns an HTTP client and target URL for the daemon's /health
+// endpoint. It prefers the Unix domain socket (daemon.sock); if unavailable it
+// falls back to the TCP port (daemon.port). The second return value is the
+// human-readable address for status messages.
+func healthClient() (*http.Client, string, string, error) {
+	if sock, err := ReadSocket(); err == nil {
+		c := UnixHTTPClient(sock)
+		return c, "http://unix/health", sock, nil
+	}
+	port, err := ReadPort()
+	if err != nil {
+		return nil, "", "", err
+	}
+	url := fmt.Sprintf("http://127.0.0.1:%d/health", port)
+	c := &http.Client{Timeout: 2 * time.Second}
+	return c, url, fmt.Sprintf("127.0.0.1:%d", port), nil
+}
+
+// WaitForReady blocks until the daemon answers /health with 200, or timeout
+// elapses. Tries the Unix socket first, falls back to TCP port. Returns the
+// listening address string ("~/.blamely/daemon.sock" or "127.0.0.1:PORT").
+func WaitForReady(timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
-	client := &http.Client{Timeout: 500 * time.Millisecond}
 	var lastErr error
 	for time.Now().Before(deadline) {
-		port, err := ReadPort()
+		client, url, addr, err := healthClient()
 		if err != nil {
 			lastErr = err
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
-		resp, herr := client.Get(fmt.Sprintf("http://127.0.0.1:%d/health", port))
+		client.Timeout = 500 * time.Millisecond
+		resp, herr := client.Get(url)
 		if herr != nil {
 			lastErr = herr
 			time.Sleep(200 * time.Millisecond)
@@ -29,7 +46,7 @@ func WaitForReady(timeout time.Duration) (int, error) {
 		}
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusOK {
-			return port, nil
+			return addr, nil
 		}
 		lastErr = fmt.Errorf("health: status %d", resp.StatusCode)
 		time.Sleep(200 * time.Millisecond)
@@ -37,21 +54,19 @@ func WaitForReady(timeout time.Duration) (int, error) {
 	if lastErr == nil {
 		lastErr = fmt.Errorf("timeout after %s", timeout)
 	}
-	return 0, lastErr
+	return "", lastErr
 }
 
 func PrintStatus() error {
-	port, err := ReadPort()
+	client, url, addr, err := healthClient()
 	if err != nil {
 		fmt.Println("daemon: NOT RUNNING")
-		fmt.Printf("  (could not read port file: %v)\n", err)
+		fmt.Printf("  (could not read socket or port file: %v)\n", err)
 		return nil
 	}
-	url := fmt.Sprintf("http://127.0.0.1:%d/health", port)
-	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
-		fmt.Printf("daemon: PORT FILE PRESENT but health check failed: %v\n", err)
+		fmt.Printf("daemon: FILE PRESENT but health check failed: %v\n", err)
 		return nil
 	}
 	defer resp.Body.Close()
@@ -59,6 +74,6 @@ func PrintStatus() error {
 		fmt.Printf("daemon: UNHEALTHY (status %d)\n", resp.StatusCode)
 		return nil
 	}
-	fmt.Printf("daemon: HEALTHY on 127.0.0.1:%d\n", port)
+	fmt.Printf("daemon: HEALTHY on %s\n", addr)
 	return nil
 }

@@ -12,12 +12,12 @@ const configFileName = "config.json"
 
 // NoteConfig toggles which sections the post-commit git note includes.
 //
-// All fields default to true except ConversationAssistant (off by default), so
-// a missing config file — or one that lists only the toggles you want to flip —
-// preserves that baseline. The note is always built in full and disabled
-// sections are stripped just before it is written (see
-// gitnotes.AttributeAndWrite), so turning a section off never changes how
-// attribution itself is computed, only what is persisted.
+// All fields default to true except Conversation and ConversationAssistant
+// (both off by default), so a missing config file — or one that lists only
+// the toggles you want to flip — preserves that baseline. The note is always
+// built in full and disabled sections are stripped just before it is written
+// (see gitnotes.AttributeAndWrite), so turning a section off never changes
+// how attribution itself is computed, only what is persisted.
 type NoteConfig struct {
 	// FileLines includes the per-line attribution detail inside each file
 	// entry (the `lines` array). Turn off to keep only the per-file
@@ -25,7 +25,9 @@ type NoteConfig struct {
 	// largest part of a note, so disabling it shrinks notes dramatically.
 	FileLines bool `json:"file_lines"`
 	// Conversation is the master switch for including any AI transcript turns
-	// in the note. When false, no conversation is stored regardless of the
+	// in the note. Defaults to false — transcripts may contain sensitive
+	// prompt/response content the user hasn't opted to persist into git
+	// notes. When false, no conversation is stored regardless of the
 	// per-role toggles below.
 	Conversation bool `json:"conversation"`
 	// ConversationUser includes the USER (prompt) turns. Disable to keep the
@@ -48,12 +50,12 @@ type Config struct {
 	Note NoteConfig `json:"note"`
 }
 
-// DefaultConfig returns the all-enabled defaults, i.e. the historical behavior
-// before config.json existed.
+// DefaultConfig returns the default note settings: everything on except
+// Conversation and ConversationAssistant, which are opt-in.
 func DefaultConfig() Config {
 	return Config{Note: NoteConfig{
 		FileLines:             true,
-		Conversation:          true,
+		Conversation:          false,
 		ConversationUser:      true,
 		ConversationAssistant: false,
 		Message:               true,
@@ -190,7 +192,7 @@ func SaveConfig(c Config) (string, error) {
 	return path, nil
 }
 
-// EnsureDefaultConfigFile writes a default config.json (all sections on) if one
+// EnsureDefaultConfigFile writes a default config.json (DefaultConfig) if one
 // does not already exist, so the available toggles are discoverable after
 // install. It NEVER overwrites an existing file — users edit it to customise
 // note output, and a re-install must keep their edits intact.

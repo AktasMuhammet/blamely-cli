@@ -67,8 +67,71 @@ func TestRenderBar_AdditionsAndDeletions_NoteAppended(t *testing.T) {
 	if !strings.Contains(out, "AI 75%") {
 		t.Errorf("expected 'AI 75%%' in bar, got: %q", out)
 	}
-	if !strings.Contains(out, "Deleted: 2 lines") {
+	if !strings.Contains(out, "Deleted: 2 lines (treated as 100% human)") {
 		t.Errorf("expected deletion side-note, got: %q", out)
+	}
+}
+
+// TestRenderBar_AdditionsAndDeletions_AIDeletedNote verifies that when
+// ai_deleted_lines is set, the deletion side-note breaks the count down by
+// AI vs Human instead of always saying "treated as 100% human".
+func TestRenderBar_AdditionsAndDeletions_AIDeletedNote(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	var buf strings.Builder
+	note := &gitnotes.Note{
+		Totals: gitnotes.Totals{AILines: 3, HumanLines: 1, DeletedLines: 5, AIDeletedLines: 4},
+		ByTool: map[string]gitnotes.Tool{
+			"claude": {Lines: 3},
+			"human":  {Lines: 1},
+		},
+	}
+	RenderBar(&buf, note, 20)
+	out := buf.String()
+	if !strings.Contains(out, "Deleted: 5 lines (4 AI / 1 Human)") {
+		t.Errorf("expected AI/Human deletion breakdown, got: %q", out)
+	}
+}
+
+// TestRenderBar_DeletionOnly_AllAI covers the bug report where a commit
+// deleted 19 lines, all of them AI-attributed (ai_deleted_lines == deleted_lines),
+// but the bar still read "Human 100%". It should now read "AI 100%" with a
+// fully-filled bar.
+func TestRenderBar_DeletionOnly_AllAI(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	var buf strings.Builder
+	note := &gitnotes.Note{
+		Totals: gitnotes.Totals{AILines: 0, HumanLines: 0, DeletedLines: 19, AIDeletedLines: 19},
+		ByTool: map[string]gitnotes.Tool{},
+	}
+	RenderBar(&buf, note, 20)
+	out := buf.String()
+	if !strings.Contains(out, "AI 100% (19 deleted)") {
+		t.Errorf("expected 'AI 100%% (19 deleted)', got: %q", out)
+	}
+	if !strings.Contains(out, "Human 0% (0 deleted)") {
+		t.Errorf("expected 'Human 0%% (0 deleted)', got: %q", out)
+	}
+	if !strings.Contains(out, strings.Repeat("#", 20)) {
+		t.Errorf("deletion-only all-AI bar should be full-width AI, got: %q", out)
+	}
+}
+
+// TestRenderBar_DeletionOnly_PartialAI covers a deletion-only commit where
+// some but not all deleted lines are AI-attributed.
+func TestRenderBar_DeletionOnly_PartialAI(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	var buf strings.Builder
+	note := &gitnotes.Note{
+		Totals: gitnotes.Totals{AILines: 0, HumanLines: 0, DeletedLines: 10, AIDeletedLines: 7},
+		ByTool: map[string]gitnotes.Tool{},
+	}
+	RenderBar(&buf, note, 20)
+	out := buf.String()
+	if !strings.Contains(out, "AI 70% (7 deleted)") {
+		t.Errorf("expected 'AI 70%% (7 deleted)', got: %q", out)
+	}
+	if !strings.Contains(out, "Human 30% (3 deleted)") {
+		t.Errorf("expected 'Human 30%% (3 deleted)', got: %q", out)
 	}
 }
 

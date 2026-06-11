@@ -20,9 +20,12 @@ func fakeHomeConf(t *testing.T) string {
 
 func TestDefaultConfig_AllTrue(t *testing.T) {
 	cfg := DefaultConfig()
-	if !cfg.Note.FileLines || !cfg.Note.Conversation || !cfg.Note.ConversationUser ||
+	if !cfg.Note.FileLines || !cfg.Note.ConversationUser ||
 		!cfg.Note.Message || !cfg.Note.CodingTime || !cfg.Note.Tokens {
-		t.Error("DefaultConfig should have all note toggles = true except conversation_assistant")
+		t.Error("DefaultConfig should have all note toggles = true except conversation/conversation_assistant")
+	}
+	if cfg.Note.Conversation {
+		t.Error("DefaultConfig should have conversation = false")
 	}
 	if cfg.Note.ConversationAssistant {
 		t.Error("DefaultConfig should have conversation_assistant = false")
@@ -50,7 +53,7 @@ func TestGetBool_AllKeys(t *testing.T) {
 	}{
 		{"note.file_lines", true},
 		{"file_lines", true},            // bare suffix accepted
-		{"note.conversation", true},
+		{"note.conversation", false},
 		{"note.conversation_user", true},
 		{"note.conversation_assistant", false},
 		{"note.message", true},

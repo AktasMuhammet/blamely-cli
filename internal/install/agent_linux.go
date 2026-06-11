@@ -37,7 +37,8 @@ After=default.target
 
 [Service]
 ExecStart=%s daemon
-Restart=on-failure
+Restart=always
+RestartSec=2
 StandardOutput=append:%s
 StandardError=append:%s
 

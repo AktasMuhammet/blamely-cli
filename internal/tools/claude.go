@@ -100,7 +100,7 @@ func RecordClaudeFromStdin(r io.Reader) error {
 		p.TranscriptPath = claudeTranscriptPath(p.Cwd, p.SessionID)
 	}
 
-	filePath, ranges, suggested, err := extractClaudeRanges(p)
+	filePath, ranges, suggested, removed, newFullContent, err := extractClaudeRanges(p)
 	if err != nil {
 		return err
 	}
@@ -131,6 +131,15 @@ func RecordClaudeFromStdin(r io.Reader) error {
 	if wt != "" {
 		if r, err := filepath.Rel(wt, resolvedFile); err == nil && !strings.HasPrefix(r, "..") {
 			rel = r
+		}
+	}
+
+	// Write overwrites the whole file with no "before" content of its own —
+	// fetch the daemon's cached snapshot (the file's content as of its last
+	// recorded edit) so we can still detect lines this Write removed.
+	if newFullContent != nil {
+		if snapshot, ok := fetchSnapshot(repoPath, rel); ok {
+			removed = append(removed, RemovedLineHashes(snapshot, *newFullContent)...)
 		}
 	}
 
@@ -169,6 +178,7 @@ func RecordClaudeFromStdin(r io.Reader) error {
 		FilePath:       rel,
 		SuggestedLines: suggested,
 		Lines:          toDaemonRanges(ranges),
+		RemovedLines:   toDaemonRemovedLines(removed),
 		RawMeta: fmt.Sprintf(`{"session_id":%q,"tool":%q,"cursor_version":%q,"transcript_path":%q}`,
 			p.SessionID, p.ToolName, p.CursorVersion, p.TranscriptPath),
 	}
@@ -272,7 +282,7 @@ func perLineShaRanges(absPath string) []LineRange {
 			continue
 		}
 		n := i + 1
-		out = append(out, LineRange{Start: n, End: n, ContentSHA: sha256Hex([]byte(text))})
+		out = append(out, LineRange{Start: n, End: n, ContentSHA: sha256Hex([]byte(text)), ContentSHANorm: sha256HexNorm(text)})
 		if len(out) >= maxLines {
 			break
 		}
@@ -300,11 +310,13 @@ func perLineShaRangesFromContent(content string) []LineRange {
 	for i, ln := range lines {
 		text := strings.TrimRight(ln, "\r")
 		sha := ""
+		shaNorm := ""
 		if strings.TrimSpace(text) != "" {
 			sha = sha256Hex([]byte(text))
+			shaNorm = sha256HexNorm(text)
 		}
 		n := i + 1
-		out = append(out, LineRange{Start: n, End: n, ContentSHA: sha})
+		out = append(out, LineRange{Start: n, End: n, ContentSHA: sha, ContentSHANorm: shaNorm})
 		if len(out) >= maxLines {
 			break
 		}
@@ -360,16 +372,17 @@ func recentlyChangedFiles(root string, window time.Duration) []string {
 // count. The watcher records this on the edit row so a later attribution
 // pass can show "claude suggested 10, accepted 6" when the user overrode
 // some of the AI-produced lines.
-func extractClaudeRanges(p claudeHookPayload) (string, []LineRange, int64, error) {
+func extractClaudeRanges(p claudeHookPayload) (string, []LineRange, int64, []DeletedLineHash, *string, error) {
 	switch p.ToolName {
 	case "Edit":
 		var in editInput
 		if err := json.Unmarshal(p.ToolInput, &in); err != nil {
-			return "", nil, 0, fmt.Errorf("parse Edit input: %w", err)
+			return "", nil, 0, nil, nil, fmt.Errorf("parse Edit input: %w", err)
 		}
 		if in.FilePath == "" {
-			return "", nil, 0, nil
+			return "", nil, 0, nil, nil, nil
 		}
+		removed := RemovedLineHashes(in.OldString, in.NewString)
 		// Deletion case: new_string is empty (or whitespace-only) and
 		// old_string was non-empty. We can't locate the deleted text in the
 		// post-edit file (it's gone), but we still credit the AI with the
@@ -379,7 +392,7 @@ func extractClaudeRanges(p claudeHookPayload) (string, []LineRange, int64, error
 		// human-edit watcher's `recent AI activity` lookup suppresses any
 		// competing human-edit row for the same file.
 		if strings.TrimSpace(in.NewString) == "" && in.OldString != "" {
-			return in.FilePath, nil, int64(countLines(in.OldString)), nil
+			return in.FilePath, nil, int64(countLines(in.OldString)), removed, nil, nil
 		}
 		// Credit the AI only for the lines that are genuinely new — not for
 		// context lines that happen to be inside new_string for the match to
@@ -387,21 +400,21 @@ func extractClaudeRanges(p claudeHookPayload) (string, []LineRange, int64, error
 		// stays accurate even when we can't locate the text in the file.
 		fullRange, err := LocateNewString(in.FilePath, in.NewString)
 		if err != nil {
-			return in.FilePath, nil, CountAddedLines(in.OldString, in.NewString), err
+			return in.FilePath, nil, CountAddedLines(in.OldString, in.NewString), removed, nil, err
 		}
 		if fullRange == nil {
-			return in.FilePath, nil, CountAddedLines(in.OldString, in.NewString), nil
+			return in.FilePath, nil, CountAddedLines(in.OldString, in.NewString), removed, nil, nil
 		}
 		ranges, suggested := narrowToChangedLines(in.OldString, in.NewString, *fullRange)
-		return in.FilePath, ranges, suggested, nil
+		return in.FilePath, ranges, suggested, removed, nil, nil
 
 	case "Write":
 		var in writeInput
 		if err := json.Unmarshal(p.ToolInput, &in); err != nil {
-			return "", nil, 0, fmt.Errorf("parse Write input: %w", err)
+			return "", nil, 0, nil, nil, fmt.Errorf("parse Write input: %w", err)
 		}
 		if in.FilePath == "" {
-			return "", nil, 0, nil
+			return "", nil, 0, nil, nil, nil
 		}
 		suggested := int64(countLines(in.Content))
 		// Emit ONE range per line, each non-blank line carrying its own
@@ -417,21 +430,23 @@ func extractClaudeRanges(p claudeHookPayload) (string, []LineRange, int64, error
 		// falls outside and is mislabelled human. Per-line shas fix both.
 		ranges := perLineShaRangesFromContent(in.Content)
 		if len(ranges) == 0 {
-			return in.FilePath, nil, suggested, nil
+			return in.FilePath, nil, suggested, nil, &in.Content, nil
 		}
-		return in.FilePath, ranges, suggested, nil
+		return in.FilePath, ranges, suggested, nil, &in.Content, nil
 
 	case "MultiEdit":
 		var in multiEditInput
 		if err := json.Unmarshal(p.ToolInput, &in); err != nil {
-			return "", nil, 0, fmt.Errorf("parse MultiEdit input: %w", err)
+			return "", nil, 0, nil, nil, fmt.Errorf("parse MultiEdit input: %w", err)
 		}
 		if in.FilePath == "" {
-			return "", nil, 0, nil
+			return "", nil, 0, nil, nil, nil
 		}
 		var suggested int64
 		var out []LineRange
+		var removed []DeletedLineHash
 		for _, ed := range in.Edits {
+			removed = append(removed, RemovedLineHashes(ed.OldString, ed.NewString)...)
 			// Sub-edit deletion: empty NewString means this sub-edit removed
 			// old_string. Credit the AI for the number of lines deleted via
 			// suggested_lines, but don't try to locate the (now-missing) text.
@@ -449,21 +464,21 @@ func extractClaudeRanges(p claudeHookPayload) (string, []LineRange, int64, error
 			out = append(out, narrowed...)
 			suggested += narrowSuggest
 		}
-		return in.FilePath, out, suggested, nil
+		return in.FilePath, out, suggested, removed, nil, nil
 
 	case "NotebookEdit":
 		var in struct {
 			NotebookPath string `json:"notebook_path"`
 		}
 		if err := json.Unmarshal(p.ToolInput, &in); err != nil {
-			return "", nil, 0, fmt.Errorf("parse NotebookEdit input: %w", err)
+			return "", nil, 0, nil, nil, fmt.Errorf("parse NotebookEdit input: %w", err)
 		}
 		// We don't attempt line-range attribution inside notebook cells in v1.
 		// Recording a marker so we can attribute at least "the notebook was AI-edited".
-		return in.NotebookPath, nil, 0, nil
+		return in.NotebookPath, nil, 0, nil, nil, nil
 
 	default:
-		return "", nil, 0, nil
+		return "", nil, 0, nil, nil, nil
 	}
 }
 
@@ -483,7 +498,15 @@ func countLines(s string) int {
 func toDaemonRanges(rs []LineRange) []daemon.Range {
 	out := make([]daemon.Range, 0, len(rs))
 	for _, r := range rs {
-		out = append(out, daemon.Range{Start: r.Start, End: r.End, ContentSHA: r.ContentSHA})
+		out = append(out, daemon.Range{Start: r.Start, End: r.End, ContentSHA: r.ContentSHA, ContentSHANorm: r.ContentSHANorm})
+	}
+	return out
+}
+
+func toDaemonRemovedLines(rs []DeletedLineHash) []daemon.RemovedLineHash {
+	out := make([]daemon.RemovedLineHash, 0, len(rs))
+	for _, r := range rs {
+		out = append(out, daemon.RemovedLineHash{ContentSHA: r.ContentSHA, ContentSHANorm: r.ContentSHANorm})
 	}
 	return out
 }
@@ -560,17 +583,26 @@ func gitToplevel(dir string) (string, bool) {
 }
 
 func postToDaemon(payload daemon.EditPayload) error {
-	port, err := daemon.ReadPort()
-	if err != nil {
-		// Daemon not running. The hook is best-effort — don't break Claude's flow.
-		return nil
-	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	client := &http.Client{Timeout: 2 * time.Second}
-	url := fmt.Sprintf("http://127.0.0.1:%d/edit", port)
+
+	// Prefer Unix socket (bypasses network security tools like Trend Micro).
+	// Fall back to TCP port on systems where AF_UNIX is unavailable (older Windows).
+	var client *http.Client
+	var url string
+	if sock, serr := daemon.ReadSocket(); serr == nil {
+		client = daemon.UnixHTTPClient(sock)
+		url = "http://unix/edit"
+	} else if port, perr := daemon.ReadPort(); perr == nil {
+		client = &http.Client{Timeout: 2 * time.Second}
+		url = fmt.Sprintf("http://127.0.0.1:%d/edit", port)
+	} else {
+		_ = perr
+		return nil // daemon not running; best-effort, don't break Claude's flow
+	}
+
 	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return nil

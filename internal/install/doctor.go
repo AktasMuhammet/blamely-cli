@@ -68,13 +68,13 @@ func (d *doctor) section(name string) {
 
 func (d *doctor) daemon() {
 	d.section("Daemon")
-	port, err := daemon.WaitForReady(1500 * time.Millisecond)
+	sock, err := daemon.WaitForReady(1500 * time.Millisecond)
 	if err != nil {
 		d.bad("blamely daemon", fmt.Sprintf("not responding (%v)", err),
 			"`blamely install` to re-register, or check ~/.blamely/daemon.log")
 		return
 	}
-	d.ok("blamely daemon", fmt.Sprintf("listening on 127.0.0.1:%d", port))
+	d.ok("blamely daemon", fmt.Sprintf("listening on %s", sock))
 }
 
 func (d *doctor) binary() {

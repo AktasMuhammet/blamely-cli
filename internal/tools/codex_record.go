@@ -34,7 +34,7 @@ func RecordCodexFromStdin(r io.Reader) error {
 		return nil
 	}
 
-	filePath, ranges, suggested := extractCodexHookRanges(p)
+	filePath, ranges, suggested, removed, newFullContent := extractCodexHookRanges(p)
 	if filePath == "" {
 		return nil
 	}
@@ -52,6 +52,15 @@ func RecordCodexFromStdin(r io.Reader) error {
 		}
 	}
 
+	// Claude-compatible Write shape overwrites the whole file with no
+	// "before" content of its own — fetch the daemon's cached snapshot so we
+	// can still detect lines this write removed.
+	if newFullContent != nil {
+		if snapshot, ok := fetchSnapshot(repoPath, rel); ok {
+			removed = append(removed, RemovedLineHashes(snapshot, *newFullContent)...)
+		}
+	}
+
 	payload := daemon.EditPayload{
 		Tool:           "codex",
 		Confidence:     "high",
@@ -61,6 +70,7 @@ func RecordCodexFromStdin(r io.Reader) error {
 		Model:          p.Model,
 		SuggestedLines: suggested,
 		Lines:          toDaemonRanges(ranges),
+		RemovedLines:   toDaemonRemovedLines(removed),
 		RawMeta: fmt.Sprintf(`{"session_id":%q,"tool":%q,"transcript_path":%q,"source":"codex_hook"}`,
 			p.SessionID, p.ToolName, p.TranscriptPath),
 	}
@@ -72,7 +82,7 @@ func RecordCodexFromStdin(r io.Reader) error {
 	return postToDaemon(payload)
 }
 
-func extractCodexHookRanges(p codexHookPayload) (string, []LineRange, int64) {
+func extractCodexHookRanges(p codexHookPayload) (string, []LineRange, int64, []DeletedLineHash, *string) {
 	name := strings.ToLower(p.ToolName)
 	if looksLikePatch(name) {
 		var suggested int64
@@ -82,22 +92,22 @@ func extractCodexHookRanges(p codexHookPayload) (string, []LineRange, int64) {
 			if primary == "" {
 				primary = f.Path
 			}
-			out = append(out, LineRange{Start: f.StartLine, End: f.EndLine, ContentSHA: f.ContentSHA})
+			out = append(out, LineRange{Start: f.StartLine, End: f.EndLine, ContentSHA: f.ContentSHA, ContentSHANorm: f.ContentSHANorm})
 			if f.EndLine >= f.StartLine {
 				suggested += int64(f.EndLine - f.StartLine + 1)
 			}
 		}
 		if primary == "" {
-			return "", nil, 0
+			return "", nil, 0, nil, nil
 		}
-		return primary, out, suggested
+		return primary, out, suggested, nil, nil
 	}
 
 	// Claude-compatible Edit/Write/MultiEdit shapes (some Codex versions).
 	cl := claudeHookPayload{ToolName: p.ToolName, ToolInput: p.ToolInput}
-	fp, ranges, suggested, err := extractClaudeRanges(cl)
+	fp, ranges, suggested, removed, newFullContent, err := extractClaudeRanges(cl)
 	if err != nil {
-		return "", nil, 0
+		return "", nil, 0, nil, nil
 	}
-	return fp, ranges, suggested
+	return fp, ranges, suggested, removed, newFullContent
 }

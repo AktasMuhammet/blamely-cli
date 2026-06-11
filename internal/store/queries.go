@@ -79,6 +79,11 @@ type Edit struct {
 	// work session row in sessions (distinct from AI-tool session_id in raw_meta).
 	Branch    string
 	SessionID sql.NullString
+	// RemovedLines holds content hashes of lines this edit DELETED (from
+	// old_string / unified-diff "-" lines), used to attribute committed
+	// `type:"delete"` ranges back to this edit. Unlike Lines, these carry no
+	// position — deleted lines have no stable post-edit location.
+	RemovedLines []RemovedLineHash
 }
 
 // AcceptedLines returns the total number of lines covered by this edit's
@@ -95,9 +100,19 @@ func (e *Edit) AcceptedLines() int64 {
 }
 
 type EditLine struct {
-	StartLine  int
-	EndLine    int
-	ContentSHA string
+	StartLine      int
+	EndLine        int
+	ContentSHA     string
+	ContentSHANorm string
+}
+
+// RemovedLineHash is the content hash of a single line an edit deleted.
+// ContentSHANorm mirrors EditLine's drift fallback: the whitespace-normalized
+// hash, used when an autoformatter reflows a line before/around the deletion.
+// Both are "" for blank/whitespace-only lines (never matched).
+type RemovedLineHash struct {
+	ContentSHA     string
+	ContentSHANorm string
 }
 
 func (db *DB) InsertEdit(e Edit) (int64, error) {
@@ -131,11 +146,23 @@ func (db *DB) InsertEdit(e Edit) (int64, error) {
 	}
 	for _, ln := range e.Lines {
 		if _, err := tx.Exec(`
-			INSERT INTO edit_lines(edit_id, start_line, end_line, content_sha)
-			VALUES (?, ?, ?, ?)`,
-			id, ln.StartLine, ln.EndLine, ln.ContentSHA,
+			INSERT INTO edit_lines(edit_id, start_line, end_line, content_sha, content_sha_norm)
+			VALUES (?, ?, ?, ?, ?)`,
+			id, ln.StartLine, ln.EndLine, ln.ContentSHA, nullableNonEmpty(ln.ContentSHANorm),
 		); err != nil {
 			return 0, fmt.Errorf("insert edit_line: %w", err)
+		}
+	}
+	for _, rl := range e.RemovedLines {
+		if rl.ContentSHA == "" {
+			continue
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO edit_removed_lines(edit_id, content_sha, content_sha_norm)
+			VALUES (?, ?, ?)`,
+			id, rl.ContentSHA, nullableNonEmpty(rl.ContentSHANorm),
+		); err != nil {
+			return 0, fmt.Errorf("insert edit_removed_line: %w", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -203,12 +230,35 @@ func (db *DB) editsForFileWhere(where string, args ...any) ([]Edit, error) {
 			return nil, err
 		}
 		out[i].Lines = lines
+		removed, err := db.removedLinesForEdit(out[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		out[i].RemovedLines = removed
 	}
 	return out, nil
 }
 
+func (db *DB) removedLinesForEdit(editID int64) ([]RemovedLineHash, error) {
+	rows, err := db.Query(`SELECT content_sha, COALESCE(content_sha_norm, '')
+		FROM edit_removed_lines WHERE edit_id = ?`, editID)
+	if err != nil {
+		return nil, fmt.Errorf("query edit_removed_lines: %w", err)
+	}
+	defer rows.Close()
+	var out []RemovedLineHash
+	for rows.Next() {
+		var rl RemovedLineHash
+		if err := rows.Scan(&rl.ContentSHA, &rl.ContentSHANorm); err != nil {
+			return nil, fmt.Errorf("scan edit_removed_line: %w", err)
+		}
+		out = append(out, rl)
+	}
+	return out, rows.Err()
+}
+
 func (db *DB) linesForEdit(editID int64) ([]EditLine, error) {
-	rows, err := db.Query(`SELECT start_line, end_line, COALESCE(content_sha, '')
+	rows, err := db.Query(`SELECT start_line, end_line, COALESCE(content_sha, ''), COALESCE(content_sha_norm, '')
 		FROM edit_lines WHERE edit_id = ? ORDER BY start_line`, editID)
 	if err != nil {
 		return nil, fmt.Errorf("query edit_lines: %w", err)
@@ -217,7 +267,7 @@ func (db *DB) linesForEdit(editID int64) ([]EditLine, error) {
 	var out []EditLine
 	for rows.Next() {
 		var ln EditLine
-		if err := rows.Scan(&ln.StartLine, &ln.EndLine, &ln.ContentSHA); err != nil {
+		if err := rows.Scan(&ln.StartLine, &ln.EndLine, &ln.ContentSHA, &ln.ContentSHANorm); err != nil {
 			return nil, fmt.Errorf("scan edit_line: %w", err)
 		}
 		out = append(out, ln)
@@ -836,4 +886,38 @@ func (db *DB) EditsForFileInSession(repo, file string, sessionID string) ([]Edit
 // preserves AI authorship that a session/time-scoped query would miss.
 func (db *DB) EditsForFileAny(repo, file string) ([]Edit, error) {
 	return db.editsForFileWhere(`repo_path = ? AND file_path = ?`, repo, file)
+}
+
+// GetFileSnapshot returns the cached full content of repo/file as of the last
+// recorded edit. ok=false if no snapshot has been cached yet (e.g. this file
+// has never been edited while the daemon was running).
+func (db *DB) GetFileSnapshot(repoPath, filePath string) (content string, ok bool, err error) {
+	err = db.QueryRow(
+		`SELECT content FROM file_snapshots WHERE repo_path = ? AND file_path = ?`,
+		repoPath, filePath,
+	).Scan(&content)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("query file_snapshots: %w", err)
+	}
+	return content, true, nil
+}
+
+// SetFileSnapshot caches repo/file's full content, used as the "before"
+// baseline the next time this file is edited. Called after every recorded
+// edit so the cache always reflects the file as of the last known edit.
+func (db *DB) SetFileSnapshot(repoPath, filePath, content string, tsNanos int64) error {
+	_, err := db.Exec(`
+		INSERT INTO file_snapshots (repo_path, file_path, content, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(repo_path, file_path) DO UPDATE SET
+			content = excluded.content, updated_at = excluded.updated_at`,
+		repoPath, filePath, content, tsNanos,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert file_snapshots: %w", err)
+	}
+	return nil
 }

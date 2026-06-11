@@ -250,8 +250,8 @@ func TestBuildNote_PerLineShape_NoCollapse_GenType_Deletions(t *testing.T) {
 		{File: "foo.go", LineNum: 4},
 		{File: "foo.go", LineNum: 5},
 	}
-	deleted := map[string][]int{
-		"foo.go": {10, 11}, // two deleted lines in the pre-image
+	deleted := map[string][]DeletedLine{
+		"foo.go": {{LineNum: 10, Content: "old line 10"}, {LineNum: 11, Content: "old line 11"}}, // two deleted lines in the pre-image, not recorded by any edit
 	}
 
 	note, err := buildNote(db, repo, "deadbeef", commitNanos, added, deleted, nil, nil)
@@ -571,6 +571,180 @@ func TestBuildNote_ContentShaSurvivesUserInsert(t *testing.T) {
 	}
 }
 
+// TestBuildNote_CopyPasteOfAIBlockIsHuman reproduces the copy-paste false
+// positive: AI generates a 3-line block at lines 1-3 (content_sha recorded at
+// those exact lines). In the SAME commit, the user copies that block and pastes
+// a duplicate at lines 5-7. The original lines must stay AI; the pasted
+// duplicate — same content, different lines — must attribute as Human even
+// though its content_sha matches a recorded AI edit.
+func TestBuildNote_CopyPasteOfAIBlockIsHuman(t *testing.T) {
+	db := openTestDB(t)
+	repo := "/r"
+	commitNanos := time.Now().UnixNano()
+
+	_, err := db.InsertEdit(store.Edit{
+		TimestampNanos: commitNanos - int64(5*time.Second),
+		RepoPath:       repo,
+		FilePath:       "app.go",
+		Tool:           store.ToolClaude,
+		Confidence:     store.ConfidenceHigh,
+		GenType:        store.GenTypeChat,
+		Lines: []store.EditLine{
+			{StartLine: 1, EndLine: 1, ContentSHA: sha256HexStr([]byte("a"))},
+			{StartLine: 2, EndLine: 2, ContentSHA: sha256HexStr([]byte("b"))},
+			{StartLine: 3, EndLine: 3, ContentSHA: sha256HexStr([]byte("c"))},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Lines 1-3 are the original AI block; lines 5-7 are a human copy-paste of
+	// the same content at different positions (line 4 is an unrelated blank/sep).
+	added := []AddedLine{
+		{File: "app.go", LineNum: 1, Content: "a"},
+		{File: "app.go", LineNum: 2, Content: "b"},
+		{File: "app.go", LineNum: 3, Content: "c"},
+		{File: "app.go", LineNum: 5, Content: "a"},
+		{File: "app.go", LineNum: 6, Content: "b"},
+		{File: "app.go", LineNum: 7, Content: "c"},
+	}
+
+	note, err := buildNote(db, repo, "abc123", commitNanos, added, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("buildNote: %v", err)
+	}
+
+	got := map[int]string{}
+	for _, l := range expandLines(note.Files[0]) {
+		if l.Type == "add" {
+			got[l.Line] = l.AuthorType
+		}
+	}
+	want := map[int]string{1: "AI", 2: "AI", 3: "AI", 5: "Human", 6: "Human", 7: "Human"}
+	for ln, exp := range want {
+		if got[ln] != exp {
+			t.Errorf("line %d: AuthorType want %s, got %s", ln, exp, got[ln])
+		}
+	}
+	if note.Totals.AILines != 3 || note.Totals.HumanLines != 3 {
+		t.Errorf("totals: want AI=3 Human=3, got AI=%d Human=%d", note.Totals.AILines, note.Totals.HumanLines)
+	}
+}
+
+// TestBuildNote_AutoformatterDriftNormalizedFallback reproduces the
+// "AI generates code, then an autoformatter reflows it" bug: the AI's edit was
+// recorded with content_sha for "\treturn 1" (tab indent), but an
+// autoformatter rewrote the committed line as "    return 1" (space indent).
+// The exact content_sha no longer matches, but content_sha_norm — computed
+// from the whitespace-collapsed text — does, so the line must still
+// attribute as AI rather than falling through to Human.
+func TestBuildNote_AutoformatterDriftNormalizedFallback(t *testing.T) {
+	db := openTestDB(t)
+	repo := "/r"
+	commitNanos := time.Now().UnixNano()
+
+	_, err := db.InsertEdit(store.Edit{
+		TimestampNanos: commitNanos - int64(5*time.Second),
+		RepoPath:       repo,
+		FilePath:       "app.go",
+		Tool:           store.ToolClaude,
+		Confidence:     store.ConfidenceHigh,
+		GenType:        store.GenTypeChat,
+		Lines: []store.EditLine{
+			{StartLine: 1, EndLine: 1, ContentSHA: sha256HexStr([]byte("func foo() {")), ContentSHANorm: sha256HexNormStr("func foo() {")},
+			{StartLine: 2, EndLine: 2, ContentSHA: sha256HexStr([]byte("\treturn 1")), ContentSHANorm: sha256HexNormStr("\treturn 1")},
+			{StartLine: 3, EndLine: 3, ContentSHA: sha256HexStr([]byte("}")), ContentSHANorm: sha256HexNormStr("}")},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Committed content: line 2 was reindented (tab -> spaces) by an
+	// autoformatter after the AI wrote it.
+	added := []AddedLine{
+		{File: "app.go", LineNum: 1, Content: "func foo() {"},
+		{File: "app.go", LineNum: 2, Content: "    return 1"},
+		{File: "app.go", LineNum: 3, Content: "}"},
+	}
+
+	note, err := buildNote(db, repo, "abc123", commitNanos, added, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("buildNote: %v", err)
+	}
+
+	got := map[int]string{}
+	for _, l := range expandLines(note.Files[0]) {
+		if l.Type == "add" {
+			got[l.Line] = l.AuthorType
+		}
+	}
+	want := map[int]string{1: "AI", 2: "AI", 3: "AI"}
+	for ln, exp := range want {
+		if got[ln] != exp {
+			t.Errorf("line %d: AuthorType want %s, got %s", ln, exp, got[ln])
+		}
+	}
+	if note.Totals.AILines != 3 || note.Totals.HumanLines != 0 {
+		t.Errorf("totals: want AI=3 Human=0, got AI=%d Human=%d", note.Totals.AILines, note.Totals.HumanLines)
+	}
+}
+
+// TestBuildNote_NormalizedFallbackCopyPasteIsHuman is the
+// content_sha_norm counterpart of TestBuildNote_CopyPasteOfAIBlockIsHuman: the
+// AI's "\treturn 1" was reformatted to "    return 1" at line 1 (matches via
+// content_sha_norm), and a human separately typed "        return 1" (a
+// different indent, same normalized text) at line 3. The reformatted AI line
+// must stay AI; the human's same-shape line must not also match via the
+// normalized drift fallback.
+func TestBuildNote_NormalizedFallbackCopyPasteIsHuman(t *testing.T) {
+	db := openTestDB(t)
+	repo := "/r"
+	commitNanos := time.Now().UnixNano()
+
+	_, err := db.InsertEdit(store.Edit{
+		TimestampNanos: commitNanos - int64(5*time.Second),
+		RepoPath:       repo,
+		FilePath:       "app.go",
+		Tool:           store.ToolClaude,
+		Confidence:     store.ConfidenceHigh,
+		GenType:        store.GenTypeChat,
+		Lines: []store.EditLine{
+			{StartLine: 1, EndLine: 1, ContentSHA: sha256HexStr([]byte("\treturn 1")), ContentSHANorm: sha256HexNormStr("\treturn 1")},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	added := []AddedLine{
+		{File: "app.go", LineNum: 1, Content: "    return 1"},     // autoformatted AI line
+		{File: "app.go", LineNum: 3, Content: "        return 1"}, // human-typed, same normalized shape
+	}
+
+	note, err := buildNote(db, repo, "abc123", commitNanos, added, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("buildNote: %v", err)
+	}
+
+	got := map[int]string{}
+	for _, l := range expandLines(note.Files[0]) {
+		if l.Type == "add" {
+			got[l.Line] = l.AuthorType
+		}
+	}
+	want := map[int]string{1: "AI", 3: "Human"}
+	for ln, exp := range want {
+		if got[ln] != exp {
+			t.Errorf("line %d: AuthorType want %s, got %s", ln, exp, got[ln])
+		}
+	}
+	if note.Totals.AILines != 1 || note.Totals.HumanLines != 1 {
+		t.Errorf("totals: want AI=1 Human=1, got AI=%d Human=%d", note.Totals.AILines, note.Totals.HumanLines)
+	}
+}
+
 // TestBuildNote_BlankLineInheritsAIBlock reproduces the "blank lines flip to
 // Human after the user edits" bug: the AI wrote a block whose blank lines have
 // no (unique) content_sha, so after the file drifts they can't be content-
@@ -729,8 +903,8 @@ func TestBuildNote_DeletionOnlyCommit(t *testing.T) {
 
 	// No added lines at all; only deletions on foo.go.
 	added := []AddedLine{}
-	deleted := map[string][]int{
-		"foo.go": {2, 4},
+	deleted := map[string][]DeletedLine{
+		"foo.go": {{LineNum: 2, Content: "old line 2"}, {LineNum: 4, Content: "old line 4"}},
 	}
 
 	note, err := buildNote(db, "/r", "deadbeef", commitNanos, added, deleted, nil, nil)
@@ -769,5 +943,287 @@ func TestBuildNote_DeletionOnlyCommit(t *testing.T) {
 	if note.Totals.AILines != 0 || note.Totals.HumanLines != 0 {
 		t.Errorf("ai/human totals: want 0/0 for deletion-only, got %d/%d",
 			note.Totals.AILines, note.Totals.HumanLines)
+	}
+}
+
+// TestBuildNote_AIDeletedLine_MatchedByContentSHA covers the core
+// AI-deletion-attribution case: a Claude CLI edit recorded both an added line
+// (line 1, via content_sha) and a removed line's content_sha
+// (edit_removed_lines). The committed diff has two deletions: one whose
+// content matches the recorded removed-line hash (→ AuthorType "AI",
+// Tool "claude", gen_type "cli") and one that doesn't (→ stays "Human", no
+// regression).
+func TestBuildNote_AIDeletedLine_MatchedByContentSHA(t *testing.T) {
+	db := openTestDB(t)
+	repo := "/r"
+	commitNanos := time.Now().UnixNano()
+
+	const removedContent = "func oldHelper() {}"
+	const addedContent = "func newHelper() {}"
+
+	_, err := db.InsertEdit(store.Edit{
+		TimestampNanos: commitNanos - int64(10*time.Second),
+		RepoPath:       repo,
+		FilePath:       "foo.go",
+		Tool:           store.ToolClaude,
+		Confidence:     store.ConfidenceHigh,
+		GenType:        store.GenTypeCLI,
+		Lines:          []store.EditLine{{StartLine: 1, EndLine: 1, ContentSHA: sha256HexStr([]byte(addedContent))}},
+		RemovedLines: []store.RemovedLineHash{
+			{ContentSHA: sha256HexStr([]byte(removedContent))},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	added := []AddedLine{
+		{File: "foo.go", LineNum: 1, Content: addedContent},
+	}
+	deleted := map[string][]DeletedLine{
+		"foo.go": {
+			{LineNum: 10, Content: removedContent},     // matches the AI edit's removed-line hash
+			{LineNum: 11, Content: "manually removed"}, // no recorded match -> stays Human
+		},
+	}
+
+	note, err := buildNote(db, repo, "deadbeef", commitNanos, added, deleted, nil, nil)
+	if err != nil {
+		t.Fatalf("buildNote: %v", err)
+	}
+
+	if len(note.Files) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(note.Files))
+	}
+	lines := expandLines(note.Files[0])
+
+	var aiDel, humanDel *LineEntry
+	for i := range lines {
+		if lines[i].Type != "delete" {
+			continue
+		}
+		switch lines[i].Line {
+		case 10:
+			aiDel = &lines[i]
+		case 11:
+			humanDel = &lines[i]
+		}
+	}
+	if aiDel == nil {
+		t.Fatal("no delete entry for line 10")
+	}
+	if aiDel.AuthorType != "AI" || aiDel.Tool != "claude" {
+		t.Errorf("line 10: want AI/claude, got AuthorType=%q Tool=%q", aiDel.AuthorType, aiDel.Tool)
+	}
+	if aiDel.GenType == nil || *aiDel.GenType != "cli" {
+		t.Errorf("line 10: want gen_type=cli, got %v", aiDel.GenType)
+	}
+	if humanDel == nil {
+		t.Fatal("no delete entry for line 11")
+	}
+	if humanDel.AuthorType != "Human" || humanDel.Tool != "" {
+		t.Errorf("line 11: want Human/'', got AuthorType=%q Tool=%q", humanDel.AuthorType, humanDel.Tool)
+	}
+	if humanDel.GenType != nil {
+		t.Errorf("line 11: want gen_type unset, got %v", *humanDel.GenType)
+	}
+
+	if note.Totals.AIDeletedLines != 1 {
+		t.Errorf("ai_deleted_lines: want 1, got %d", note.Totals.AIDeletedLines)
+	}
+	if note.Totals.DeletedLines != 2 {
+		t.Errorf("deleted_lines: want 2, got %d", note.Totals.DeletedLines)
+	}
+	// by_gen_type.cli: 1 from the added line + 1 from the AI-attributed delete.
+	if note.ByGenType.CLI != 2 {
+		t.Errorf("by_gen_type.cli: want 2, got %d", note.ByGenType.CLI)
+	}
+	if note.ByGenType.Human != 1 {
+		t.Errorf("by_gen_type.human: want 1, got %d", note.ByGenType.Human)
+	}
+}
+
+// TestBuildNote_AIDeletedLine_PureDeletionFile covers the same matching for a
+// file with ONLY deletions (no added lines), exercised via the pure-deletion
+// FileEntry path rather than flushFile.
+func TestBuildNote_AIDeletedLine_PureDeletionFile(t *testing.T) {
+	db := openTestDB(t)
+	repo := "/r"
+	commitNanos := time.Now().UnixNano()
+
+	const removedContent = "deprecated.Call()"
+
+	_, err := db.InsertEdit(store.Edit{
+		TimestampNanos: commitNanos - int64(10*time.Second),
+		RepoPath:       repo,
+		FilePath:       "foo.go",
+		Tool:           store.ToolCodex,
+		Confidence:     store.ConfidenceHigh,
+		GenType:        store.GenTypeCLI,
+		RemovedLines: []store.RemovedLineHash{
+			{ContentSHA: sha256HexStr([]byte(removedContent))},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deleted := map[string][]DeletedLine{
+		"foo.go": {{LineNum: 5, Content: removedContent}},
+	}
+
+	note, err := buildNote(db, repo, "deadbeef", commitNanos, nil, deleted, nil, nil)
+	if err != nil {
+		t.Fatalf("buildNote: %v", err)
+	}
+
+	if len(note.Files) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(note.Files))
+	}
+	lines := expandLines(note.Files[0])
+	if len(lines) != 1 || lines[0].Type != "delete" {
+		t.Fatalf("expected 1 delete line, got %+v", lines)
+	}
+	if lines[0].AuthorType != "AI" || lines[0].Tool != "codex" {
+		t.Errorf("want AI/codex, got AuthorType=%q Tool=%q", lines[0].AuthorType, lines[0].Tool)
+	}
+	if note.Totals.AIDeletedLines != 1 {
+		t.Errorf("ai_deleted_lines: want 1, got %d", note.Totals.AIDeletedLines)
+	}
+	if note.ByGenType.CLI != 1 {
+		t.Errorf("by_gen_type.cli: want 1, got %d", note.ByGenType.CLI)
+	}
+}
+
+// TestBuildNote_AIDeletedBlankLine_InheritsNeighborAttribution covers the
+// "kerim" commit bug report: an AI removed a contiguous block of lines that
+// included blank lines. tools.RemovedLineHashes never records a content_sha
+// for blank lines, so pickEditForRemovedLine can never match the blank
+// deleted lines directly — without inheritBlankDeletedLineAttribution they'd
+// stay "Human" even though the whole block came from one AI edit.
+func TestBuildNote_AIDeletedBlankLine_InheritsNeighborAttribution(t *testing.T) {
+	db := openTestDB(t)
+	repo := "/r"
+	commitNanos := time.Now().UnixNano()
+
+	const lineA = "func A() {}"
+	const lineB = "func B() {}"
+
+	_, err := db.InsertEdit(store.Edit{
+		TimestampNanos: commitNanos - int64(10*time.Second),
+		RepoPath:       repo,
+		FilePath:       "foo.go",
+		Tool:           store.ToolClaude,
+		Confidence:     store.ConfidenceHigh,
+		GenType:        store.GenTypeChat,
+		RemovedLines: []store.RemovedLineHash{
+			{ContentSHA: sha256HexStr([]byte(lineA))},
+			{ContentSHA: sha256HexStr([]byte(lineB))},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deleted := map[string][]DeletedLine{
+		"foo.go": {
+			{LineNum: 10, Content: lineA},
+			{LineNum: 11, Content: ""}, // blank line in the middle of the AI's removal
+			{LineNum: 12, Content: lineB},
+		},
+	}
+
+	note, err := buildNote(db, repo, "deadbeef", commitNanos, nil, deleted, nil, nil)
+	if err != nil {
+		t.Fatalf("buildNote: %v", err)
+	}
+
+	if len(note.Files) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(note.Files))
+	}
+	lines := expandLines(note.Files[0])
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 delete lines, got %+v", lines)
+	}
+	for _, l := range lines {
+		if l.AuthorType != "AI" || l.Tool != "claude" {
+			t.Errorf("line %d: want AI/claude, got AuthorType=%q Tool=%q", l.Line, l.AuthorType, l.Tool)
+		}
+		if l.GenType == nil || *l.GenType != "chat" {
+			t.Errorf("line %d: want gen_type=chat, got %v", l.Line, l.GenType)
+		}
+	}
+	if note.Totals.AIDeletedLines != 3 {
+		t.Errorf("ai_deleted_lines: want 3 (blank line inherits), got %d", note.Totals.AIDeletedLines)
+	}
+	if note.Totals.DeletedLines != 3 {
+		t.Errorf("deleted_lines: want 3, got %d", note.Totals.DeletedLines)
+	}
+	if note.ByGenType.Chat != 3 {
+		t.Errorf("by_gen_type.chat: want 3, got %d", note.ByGenType.Chat)
+	}
+	if note.ByGenType.Human != 0 {
+		t.Errorf("by_gen_type.human: want 0, got %d", note.ByGenType.Human)
+	}
+}
+
+// TestBuildNote_DeletedBlankLine_HumanNeighborStaysHuman ensures the
+// inheritance pass mirrors inheritBlankLineAttribution's "look backward
+// first" rule: a blank deleted line whose nearest non-blank neighbour is a
+// Human deletion stays "Human", even when an AI-attributed deletion sits
+// further away on the other side.
+func TestBuildNote_DeletedBlankLine_HumanNeighborStaysHuman(t *testing.T) {
+	db := openTestDB(t)
+	repo := "/r"
+	commitNanos := time.Now().UnixNano()
+
+	const lineB = "func B() {}"
+
+	_, err := db.InsertEdit(store.Edit{
+		TimestampNanos: commitNanos - int64(10*time.Second),
+		RepoPath:       repo,
+		FilePath:       "foo.go",
+		Tool:           store.ToolClaude,
+		Confidence:     store.ConfidenceHigh,
+		GenType:        store.GenTypeChat,
+		RemovedLines: []store.RemovedLineHash{
+			{ContentSHA: sha256HexStr([]byte(lineB))},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deleted := map[string][]DeletedLine{
+		"foo.go": {
+			{LineNum: 10, Content: "manually removed"}, // no recorded match -> Human
+			{LineNum: 11, Content: ""},                 // blank: backward neighbor (10) is Human
+			{LineNum: 12, Content: lineB},              // AI-attributed
+		},
+	}
+
+	note, err := buildNote(db, repo, "deadbeef", commitNanos, nil, deleted, nil, nil)
+	if err != nil {
+		t.Fatalf("buildNote: %v", err)
+	}
+
+	lines := expandLines(note.Files[0])
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 delete lines, got %+v", lines)
+	}
+	for _, l := range lines {
+		switch l.Line {
+		case 10, 11:
+			if l.AuthorType != "Human" || l.Tool != "" {
+				t.Errorf("line %d: want Human/'', got AuthorType=%q Tool=%q", l.Line, l.AuthorType, l.Tool)
+			}
+		case 12:
+			if l.AuthorType != "AI" || l.Tool != "claude" {
+				t.Errorf("line %d: want AI/claude, got AuthorType=%q Tool=%q", l.Line, l.AuthorType, l.Tool)
+			}
+		}
+	}
+	if note.Totals.AIDeletedLines != 1 {
+		t.Errorf("ai_deleted_lines: want 1, got %d", note.Totals.AIDeletedLines)
 	}
 }

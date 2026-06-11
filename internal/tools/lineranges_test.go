@@ -408,4 +408,74 @@ func TestNarrowToChangedLines_BlankLineNoSha(t *testing.T) {
 	if ranges[0].ContentSHA == "" || ranges[2].ContentSHA == "" {
 		t.Errorf("non-blank lines must carry a sha: %+v", ranges)
 	}
+	if ranges[1].ContentSHANorm != "" {
+		t.Errorf("blank line should have empty content_sha_norm, got %+v", ranges[1])
+	}
+	if ranges[0].ContentSHANorm == "" || ranges[2].ContentSHANorm == "" {
+		t.Errorf("non-blank lines must carry a content_sha_norm: %+v", ranges)
+	}
+}
+
+// ---- NormalizeLineText / content_sha_norm ----
+
+func TestNormalizeLineText(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"  foo(a, b)  ", "foo(a, b)"},
+		{"\tfoo(a,  b)", "foo(a, b)"},
+		{"a    b\tc", "a b c"},
+		{"", ""},
+		{"   ", ""},
+		{"already normal", "already normal"},
+	}
+	for _, c := range cases {
+		if got := NormalizeLineText(c.in); got != c.want {
+			t.Errorf("NormalizeLineText(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestLineRangeForWholeFile_NormalizedHashSurvivesReindent reproduces the
+// autoformatter-drift scenario: the same logical line, indented differently,
+// must produce the same content_sha_norm even though content_sha differs.
+func TestLineRangeForWholeFile_NormalizedHashSurvivesReindent(t *testing.T) {
+	dir := t.TempDir()
+	tabFile := writeFile(t, dir, "tabs.go", "\treturn 1\n")
+	spaceFile := writeFile(t, dir, "spaces.go", "    return 1\n")
+
+	tabLR, err := LineRangeForWholeFile(tabFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spaceLR, err := LineRangeForWholeFile(spaceFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if tabLR[0].ContentSHA == spaceLR[0].ContentSHA {
+		t.Fatalf("content_sha should differ across reindent (tab vs spaces)")
+	}
+	if tabLR[0].ContentSHANorm == "" || tabLR[0].ContentSHANorm != spaceLR[0].ContentSHANorm {
+		t.Errorf("content_sha_norm should match across reindent: tab=%q space=%q",
+			tabLR[0].ContentSHANorm, spaceLR[0].ContentSHANorm)
+	}
+}
+
+// TestLineRangeForWholeFile_BlankLineNoNormSha mirrors the blank-line
+// content_sha convention for content_sha_norm.
+func TestLineRangeForWholeFile_BlankLineNoNormSha(t *testing.T) {
+	dir := t.TempDir()
+	p := writeFile(t, dir, "blank.go", "a\n   \nb\n")
+	lr, err := LineRangeForWholeFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lr) != 3 {
+		t.Fatalf("want 3 ranges, got %+v", lr)
+	}
+	if lr[1].ContentSHANorm != "" {
+		t.Errorf("whitespace-only line should have empty content_sha_norm, got %q", lr[1].ContentSHANorm)
+	}
+	if lr[0].ContentSHANorm == "" || lr[2].ContentSHANorm == "" {
+		t.Errorf("non-blank lines must carry a content_sha_norm: %+v", lr)
+	}
 }

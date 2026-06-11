@@ -618,3 +618,79 @@ func TestNullableInt(t *testing.T) {
 		t.Error("invalid NullInt64 should return nil")
 	}
 }
+
+// ── GetFileSnapshot / SetFileSnapshot ──────────────────────────────────────────
+
+func TestFileSnapshot_MissReturnsOkFalse(t *testing.T) {
+	db := openTestDB(t)
+	content, ok, err := db.GetFileSnapshot("/repo", "main.go")
+	if err != nil {
+		t.Fatalf("GetFileSnapshot: %v", err)
+	}
+	if ok {
+		t.Error("want ok=false for a file with no cached snapshot")
+	}
+	if content != "" {
+		t.Errorf("want empty content, got %q", content)
+	}
+}
+
+func TestFileSnapshot_RoundTrip(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.SetFileSnapshot("/repo", "main.go", "package main\n", 1000); err != nil {
+		t.Fatalf("SetFileSnapshot: %v", err)
+	}
+	content, ok, err := db.GetFileSnapshot("/repo", "main.go")
+	if err != nil {
+		t.Fatalf("GetFileSnapshot: %v", err)
+	}
+	if !ok {
+		t.Fatal("want ok=true after SetFileSnapshot")
+	}
+	if content != "package main\n" {
+		t.Errorf("content: want %q, got %q", "package main\n", content)
+	}
+}
+
+func TestFileSnapshot_UpsertOverwrites(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.SetFileSnapshot("/repo", "main.go", "v1", 1000); err != nil {
+		t.Fatalf("SetFileSnapshot v1: %v", err)
+	}
+	if err := db.SetFileSnapshot("/repo", "main.go", "v2", 2000); err != nil {
+		t.Fatalf("SetFileSnapshot v2: %v", err)
+	}
+	content, ok, err := db.GetFileSnapshot("/repo", "main.go")
+	if err != nil {
+		t.Fatalf("GetFileSnapshot: %v", err)
+	}
+	if !ok || content != "v2" {
+		t.Errorf("want ok=true, content=%q; got ok=%v, content=%q", "v2", ok, content)
+	}
+}
+
+func TestFileSnapshot_KeyedByRepoAndFile(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.SetFileSnapshot("/repo-a", "main.go", "a", 1000); err != nil {
+		t.Fatalf("SetFileSnapshot a: %v", err)
+	}
+	if err := db.SetFileSnapshot("/repo-b", "main.go", "b", 1000); err != nil {
+		t.Fatalf("SetFileSnapshot b: %v", err)
+	}
+	if err := db.SetFileSnapshot("/repo-a", "other.go", "c", 1000); err != nil {
+		t.Fatalf("SetFileSnapshot c: %v", err)
+	}
+
+	content, _, _ := db.GetFileSnapshot("/repo-a", "main.go")
+	if content != "a" {
+		t.Errorf("/repo-a main.go: want %q, got %q", "a", content)
+	}
+	content, _, _ = db.GetFileSnapshot("/repo-b", "main.go")
+	if content != "b" {
+		t.Errorf("/repo-b main.go: want %q, got %q", "b", content)
+	}
+	content, _, _ = db.GetFileSnapshot("/repo-a", "other.go")
+	if content != "c" {
+		t.Errorf("/repo-a other.go: want %q, got %q", "c", content)
+	}
+}
