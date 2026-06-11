@@ -3,7 +3,6 @@ package install
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -367,10 +366,11 @@ func Uninstall() error {
 		report(fmt.Sprintf("removed PATH entry from %s", rcPath), err)
 	}
 
-	// Remove the stable binary copy.
+	// Remove the stable binary copy. On Windows the running blamely.exe can't
+	// delete itself (the image is locked), so removeInstalledBinary schedules a
+	// detached cleanup that runs once this process exits.
 	if p, err := InstalledBinaryPath(); err == nil {
-		_ = os.Remove(p)
-		_ = os.Remove(filepath.Dir(p)) // empty bin/ dir
+		report("removed binary "+p, removeInstalledBinary(p))
 	}
 	// Wipe state.json last.
 	if statePath, err := config.StateFile(); err == nil {
