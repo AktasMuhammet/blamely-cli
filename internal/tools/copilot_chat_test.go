@@ -234,8 +234,16 @@ func TestScanTextEdits_FullFile(t *testing.T) {
 	st := &sessionState{}
 	sink := &captureSink{}
 
+	sizeOf := func(p string) int64 {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fi.Size()
+	}
+
 	// Fresh file (mtime now) → emit even on first scan.
-	w.scanTextEdits(sess, st, &mu, sink, time.Now())
+	w.scanTextEdits(sess, st, &mu, sink, time.Now(), sizeOf(sess))
 	if len(sink.events) != 1 {
 		t.Fatalf("first scan: want 1 event, got %d", len(sink.events))
 	}
@@ -244,7 +252,7 @@ func TestScanTextEdits_FullFile(t *testing.T) {
 	}
 
 	// Same mtime → no re-scan, no duplicate.
-	w.scanTextEdits(sess, st, &mu, sink, st.tegMtime)
+	w.scanTextEdits(sess, st, &mu, sink, st.tegMtime, sizeOf(sess))
 	if len(sink.events) != 1 {
 		t.Errorf("unchanged mtime: want 1 event, got %d", len(sink.events))
 	}
@@ -255,7 +263,7 @@ func TestScanTextEdits_FullFile(t *testing.T) {
 	fh, _ := os.OpenFile(sess, os.O_APPEND|os.O_WRONLY, 0o644)
 	fh.WriteString(teg2)
 	fh.Close()
-	w.scanTextEdits(sess, st, &mu, sink, time.Now().Add(time.Second))
+	w.scanTextEdits(sess, st, &mu, sink, time.Now().Add(time.Second), sizeOf(sess))
 	if len(sink.events) != 2 {
 		t.Fatalf("after append: want 2 events total, got %d", len(sink.events))
 	}

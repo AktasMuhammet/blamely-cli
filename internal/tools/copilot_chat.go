@@ -147,8 +147,11 @@ type sessionState struct {
 	model     string    // last-known display model (provider prefix stripped)
 	lastTouch time.Time // for stale eviction
 
-	// textEditGroup detection uses its own full-file re-scan, deduped by edit key.
+	// textEditGroup detection scans incrementally from tegOffset (its own
+	// cursor, independent of offset above) and is deduped by edit key in
+	// seenEdits. tegMtime gates re-scans so an unchanged file costs nothing.
 	tegMtime  time.Time
+	tegOffset int64
 	seenEdits map[string]bool
 }
 
@@ -219,7 +222,7 @@ func (w *chatSessionWatcher) handleSessionFile(path string, state map[string]*se
 	// textEditGroup detection runs on every scan via its own mtime gate —
 	// independent of the append-offset so it survives snapshot rewrites.
 	// Must run BEFORE the no-new-bytes return below.
-	w.scanTextEdits(path, st, mu, sink, info.ModTime())
+	w.scanTextEdits(path, st, mu, sink, info.ModTime(), info.Size())
 
 	if info.Size() <= startOffset {
 		return
@@ -251,9 +254,16 @@ func (w *chatSessionWatcher) handleSessionFile(path string, state map[string]*se
 	mu.Unlock()
 }
 
-// scanTextEdits re-reads the session file (only when its mtime advanced) and
-// records a chat edit for every textEditGroup it hasn't emitted before.
-func (w *chatSessionWatcher) scanTextEdits(path string, st *sessionState, mu *sync.Mutex, sink daemon.Sink, mtime time.Time) {
+// scanTextEdits incrementally scans the bytes appended to the session file
+// since the last call (gated by mtime, so an unchanged file is a no-op) and
+// records a chat edit for every new textEditGroup it hasn't emitted before.
+//
+// Scanning incrementally — rather than re-reading the whole file from byte 0
+// on every poll — matters for long-running chat sessions: a session's JSONL
+// can grow to several MB over many turns, and re-parsing plus re-hashing that
+// entire history every 3s would make detection latency grow with session
+// size (fast for new sessions, increasingly slow for long ones).
+func (w *chatSessionWatcher) scanTextEdits(path string, st *sessionState, mu *sync.Mutex, sink daemon.Sink, mtime time.Time, size int64) {
 	mu.Lock()
 	if st.seenEdits == nil {
 		st.seenEdits = map[string]bool{}
@@ -265,6 +275,15 @@ func (w *chatSessionWatcher) scanTextEdits(path string, st *sessionState, mu *sy
 	}
 	st.tegMtime = mtime
 	model := st.model
+	startOffset := st.tegOffset
+	// VS Code occasionally rewrites a session as a fresh, smaller snapshot —
+	// re-scan from the start when that happens (rare); seenEdits is cleared
+	// too since the rewritten file may renumber requests.
+	if size < startOffset {
+		startOffset = 0
+		st.seenEdits = map[string]bool{}
+		firstScan = true
+	}
 	mu.Unlock()
 
 	// Suppress emitting on the very first scan of an OLD file (historical edits);
@@ -276,59 +295,69 @@ func (w *chatSessionWatcher) scanTextEdits(path string, st *sessionState, mu *sy
 		return
 	}
 	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 1<<16), 1<<24)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 || line[0] != '{' {
-			continue
-		}
-		var cl chatLine
-		if json.Unmarshal(line, &cl) != nil {
-			continue
-		}
-		// Keep the display model fresh as we scan (used when recording edits).
-		if m := findSelectedModel(cl); m != "" {
-			model = displayModel(m)
-		}
-		// textEditGroups are tagged with the chat request index they belong to
-		// (requests[N].response[...]) so that edits from different turns never
-		// collide in recordTextEditGroup's dedup key, even when both happen to
-		// start at the same line (e.g. the model rewrites the whole file again
-		// in a follow-up turn).
-		switch cl.Kind {
-		case 0:
-			var snap struct {
-				Requests []struct {
-					Response []json.RawMessage `json:"response"`
-				} `json:"requests"`
-			}
-			if json.Unmarshal(cl.V, &snap) == nil {
-				for reqIdx, r := range snap.Requests {
-					for _, part := range r.Response {
-						var groups []textEditGroupPart
-						findTextEditGroups(part, &groups)
-						for i := range groups {
-							w.recordTextEditGroup(&groups[i], model, path, st, mu, sink, emit, reqIdx)
-						}
-					}
-				}
-			}
-		case 2:
-			if reqIdx, ok := requestIndex(cl.K, "response"); ok {
-				var parts []json.RawMessage
-				if json.Unmarshal(cl.V, &parts) == nil {
-					for _, part := range parts {
-						var groups []textEditGroupPart
-						findTextEditGroups(part, &groups)
-						for i := range groups {
-							w.recordTextEditGroup(&groups[i], model, path, st, mu, sink, emit, reqIdx)
-						}
-					}
-				}
-			}
+	if startOffset > 0 {
+		if _, err := f.Seek(startOffset, 0); err != nil {
+			return
 		}
 	}
+	br := bufio.NewReaderSize(f, 1<<16)
+	for {
+		line, rerr := br.ReadString('\n')
+		trimmed := strings.TrimRight(line, "\r\n")
+		if len(trimmed) > 0 && trimmed[0] == '{' {
+			var cl chatLine
+			if json.Unmarshal([]byte(trimmed), &cl) == nil {
+				// Keep the display model fresh as we scan (used when recording edits).
+				if m := findSelectedModel(cl); m != "" {
+					model = displayModel(m)
+				}
+				// textEditGroups are tagged with the chat request index they belong to
+				// (requests[N].response[...]) so that edits from different turns never
+				// collide in recordTextEditGroup's dedup key, even when both happen to
+				// start at the same line (e.g. the model rewrites the whole file again
+				// in a follow-up turn).
+				switch cl.Kind {
+				case 0:
+					var snap struct {
+						Requests []struct {
+							Response []json.RawMessage `json:"response"`
+						} `json:"requests"`
+					}
+					if json.Unmarshal(cl.V, &snap) == nil {
+						for reqIdx, r := range snap.Requests {
+							for _, part := range r.Response {
+								var groups []textEditGroupPart
+								findTextEditGroups(part, &groups)
+								for i := range groups {
+									w.recordTextEditGroup(&groups[i], model, path, st, mu, sink, emit, reqIdx)
+								}
+							}
+						}
+					}
+				case 2:
+					if reqIdx, ok := requestIndex(cl.K, "response"); ok {
+						var parts []json.RawMessage
+						if json.Unmarshal(cl.V, &parts) == nil {
+							for _, part := range parts {
+								var groups []textEditGroupPart
+								findTextEditGroups(part, &groups)
+								for i := range groups {
+									w.recordTextEditGroup(&groups[i], model, path, st, mu, sink, emit, reqIdx)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		if rerr != nil {
+			break
+		}
+	}
+	newOffset, _ := f.Seek(0, 1)
+	mu.Lock()
+	st.tegOffset = newOffset
+	mu.Unlock()
 }
 
 func (w *chatSessionWatcher) handleLine(path, line string, st *sessionState, sink daemon.Sink, prime bool, scanTime, fileMTime time.Time) {
