@@ -180,7 +180,10 @@ func Run(installPlugins bool) error {
 				ok(r.Label, "extension installed from marketplace · "+blamelyExtensionID)
 				editorLabelsInstalled = append(editorLabelsInstalled, r.Label)
 			case r.Updated:
-				ok(r.Label, "extension updated to latest · "+blamelyExtensionID)
+				ok(r.Label, "extension reinstalled to latest · "+blamelyExtensionID)
+				// Track it too: uninstall must be able to remove an extension we
+				// force-reinstalled, not just one we first-installed.
+				editorLabelsInstalled = append(editorLabelsInstalled, r.Label)
 			default:
 				info(r.Label, "extension already installed · "+blamelyExtensionID)
 			}
@@ -203,6 +206,10 @@ func Run(installPlugins bool) error {
 					fail(r.Label, r.Err.Error())
 				case r.Installed:
 					ok(r.Label, "plugin installed from marketplace · ai.blamely")
+					jetbrainsDirsInstalled = append(jetbrainsDirsInstalled, r.PluginsDir)
+					jetbrainsRestartNeeded = true
+				case r.Updated:
+					ok(r.Label, "plugin reinstalled to latest · ai.blamely")
 					jetbrainsDirsInstalled = append(jetbrainsDirsInstalled, r.PluginsDir)
 					jetbrainsRestartNeeded = true
 				default:
@@ -335,9 +342,15 @@ func Uninstall() error {
 		_, err := UninstallGeminiHook()
 		report("removed Gemini record hook from ~/.gemini/settings.json", err)
 	}
-	if len(s.EditorExtensionsInstalled) > 0 {
-		report(fmt.Sprintf("removed Blamely extension from %s", strings.Join(s.EditorExtensionsInstalled, ", ")),
-			UninstallEditorExtensions(s.EditorExtensionsInstalled))
+	// Don't rely solely on state: the extension may have been already present
+	// when install ran (tracked as "Updated", not "Installed"), installed by the
+	// user from the marketplace, or predate state tracking. Discover every
+	// detected editor that actually has it and remove from all of them — the
+	// same self-sufficient approach the JetBrains block below uses.
+	editorLabels := mergeLabels(s.EditorExtensionsInstalled, DiscoverInstalledEditorExtensions())
+	if len(editorLabels) > 0 {
+		report(fmt.Sprintf("removed Blamely extension from %s", strings.Join(editorLabels, ", ")),
+			UninstallEditorExtensions(editorLabels))
 	}
 	// Don't rely solely on state: the plugin may have been sideloaded for
 	// development, installed manually, or predate state tracking, so it was

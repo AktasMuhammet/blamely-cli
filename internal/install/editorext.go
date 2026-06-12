@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // blamelyExtensionID is the marketplace/registry identifier for the Blamely
@@ -93,10 +94,7 @@ func InstallEditorExtensions() []EditorExtensionResult {
 		// installs it the first time and updates it to latest on every
 		// subsequent run, so users never get stuck on a stale version.
 		wasPresent := extensionInstalled(cliPath, blamelyExtensionID)
-		out, err := exec.Command(cliPath, "--install-extension", blamelyExtensionID, "--force").CombinedOutput()
-		if err != nil && strings.Contains(string(out), signatureVerificationError) {
-			out, err = exec.Command(cliPath, "--install-extension", blamelyExtensionID, "--force").CombinedOutput()
-		}
+		out, err := installExtensionWithRetry(cliPath)
 		if err != nil {
 			r.Err = fmt.Errorf("%s --install-extension %s --force: %w: %s",
 				filepath.Base(cliPath), blamelyExtensionID, err, strings.TrimSpace(string(out)))
@@ -108,6 +106,51 @@ func InstallEditorExtensions() []EditorExtensionResult {
 		results = append(results, r)
 	}
 	return results
+}
+
+// signatureVerificationRetries is how many extra attempts we make when an
+// install fails with signatureVerificationError. The failure is transient and
+// environment-dependent — the bundled vsce-sign helper intermittently doesn't
+// run when the editor CLI is spawned non-interactively (as blamely install
+// does). A retry of the identical command usually succeeds; a few attempts with
+// a short backoff makes it reliable across VS Code and Cursor.
+const signatureVerificationRetries = 3
+
+// installExtensionWithRetry runs `<cli> --install-extension <id> --force`,
+// retrying only the signature-verification flake (never other errors). Returns
+// the combined output and error of the last attempt.
+func installExtensionWithRetry(cliPath string) ([]byte, error) {
+	out, err := exec.Command(cliPath, "--install-extension", blamelyExtensionID, "--force").CombinedOutput()
+	for attempt := 0; attempt < signatureVerificationRetries; attempt++ {
+		if err == nil || !strings.Contains(string(out), signatureVerificationError) {
+			break
+		}
+		time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+		out, err = exec.Command(cliPath, "--install-extension", blamelyExtensionID, "--force").CombinedOutput()
+	}
+	return out, err
+}
+
+// DiscoverInstalledEditorExtensions returns the label of every detected
+// VS Code-family editor that currently has the Blamely extension installed.
+//
+// Uninstall uses this so it removes the extension from editors even when the
+// install was never state-tracked — the extension was already present when
+// `blamely install` ran (recorded as "Updated", not "Installed"), the user
+// installed it from the marketplace themselves, or the install predates state
+// tracking. Mirrors the JetBrains discovery path in Uninstall().
+func DiscoverInstalledEditorExtensions() []string {
+	var labels []string
+	for _, t := range editorExtensionTargets {
+		cliPath, ok := findEditorCLI(t)
+		if !ok {
+			continue
+		}
+		if extensionInstalled(cliPath, blamelyExtensionID) {
+			labels = append(labels, t.Label)
+		}
+	}
+	return labels
 }
 
 // UninstallEditorExtensions removes the Blamely extension from every editor

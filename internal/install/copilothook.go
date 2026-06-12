@@ -57,10 +57,13 @@ func InstallCopilotHook(binaryPath string) (added bool, hookPath string, err err
 		if copilotAlreadyPresent(entries) {
 			continue
 		}
-		entries = append(entries, map[string]any{
+		// Prepend so blamely runs first — see prependIntoMatcherGroup: a failing
+		// third-party hook ordered ahead of us must not abort the chain before
+		// blamely records the edit.
+		entries = append([]any{map[string]any{
 			"command": command,
 			"type":    "command",
-		})
+		}}, entries...)
 		hooks[event] = entries
 		added = true
 	}

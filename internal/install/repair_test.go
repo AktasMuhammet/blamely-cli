@@ -67,7 +67,12 @@ func TestRepair_ConfiguresMissingToolHooks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read gemini settings: %v", err)
 	}
-	if !strings.Contains(string(data), "blamely record gemini") {
+	// Use the production marker (geminiBlamelyMarker = "record gemini"). The
+	// "blamely" prefix must NOT be assumed: on Windows the command is
+	// `...\blamely.exe record gemini`, so a "blamely record gemini" needle would
+	// never match — which is exactly why the hook code keys off the .exe-agnostic
+	// tail.
+	if !strings.Contains(string(data), geminiBlamelyMarker) {
 		t.Errorf("gemini settings missing blamely hook: %s", data)
 	}
 

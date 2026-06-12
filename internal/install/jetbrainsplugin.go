@@ -70,7 +70,8 @@ type productInfo struct {
 type JetBrainsPluginResult struct {
 	Label      string
 	PluginsDir string
-	Installed  bool // true only when THIS run installed the plugin (drives uninstall tracking)
+	Installed  bool // true when THIS run did the initial install
+	Updated    bool // true when the plugin was already present and we re-extracted the latest build
 	Err        error
 }
 
@@ -107,10 +108,12 @@ func InstallJetBrainsPlugins() []JetBrainsPluginResult {
 			continue
 		}
 		r := JetBrainsPluginResult{Label: ide.Label, PluginsDir: ide.PluginsDir}
-		if hasJetBrainsPlugin(ide.PluginsDir) {
-			results = append(results, r)
-			continue
-		}
+		// Reinstall on every run (don't skip when already present): this both
+		// installs the plugin the first time and refreshes it to the latest
+		// build-compatible version, matching the VS Code-family `--force` path
+		// so a stale plugin never lingers. Only reached when installPlugins=true
+		// (end-user installers), so a sideloaded dev build is never clobbered.
+		alreadyPresent := hasJetBrainsPlugin(ide.PluginsDir)
 
 		file, ferr := compatiblePluginFile(ide.BuildNumber)
 		if ferr != nil {
@@ -131,8 +134,15 @@ func InstallJetBrainsPlugins() []JetBrainsPluginResult {
 			}
 			cachedFile, cachedZipPath = file, zipPath
 		}
+		// Remove the existing plugin dir(s) before extracting so a renamed or
+		// older-versioned directory can't sit alongside the fresh one.
+		if alreadyPresent {
+			_ = removeJetBrainsPlugin(ide.PluginsDir)
+		}
 		if eerr := extractPluginZip(cachedZipPath, ide.PluginsDir); eerr != nil {
 			r.Err = eerr
+		} else if alreadyPresent {
+			r.Updated = true
 		} else {
 			r.Installed = true
 		}
@@ -148,11 +158,22 @@ func InstallJetBrainsPlugins() []JetBrainsPluginResult {
 func UninstallJetBrainsPlugins(pluginsDirs []string) error {
 	var firstErr error
 	for _, dir := range pluginsDirs {
-		matches, _ := filepath.Glob(filepath.Join(dir, blamelyJetBrainsDirGlob))
-		for _, m := range matches {
-			if err := os.RemoveAll(m); err != nil && firstErr == nil {
-				firstErr = err
-			}
+		if err := removeJetBrainsPlugin(dir); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// removeJetBrainsPlugin deletes every Blamely plugin directory under one IDE's
+// plugins dir (there should be at most one, but a botched prior install could
+// leave a renamed duplicate). Returns the first removal error, if any.
+func removeJetBrainsPlugin(pluginsDir string) error {
+	matches, _ := filepath.Glob(filepath.Join(pluginsDir, blamelyJetBrainsDirGlob))
+	var firstErr error
+	for _, m := range matches {
+		if err := os.RemoveAll(m); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 	return firstErr

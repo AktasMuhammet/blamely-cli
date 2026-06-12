@@ -21,6 +21,43 @@ func setupFakeCodexHome(t *testing.T, content string) string {
 	return home
 }
 
+// TestInstallCodexHook_RunsFirst: with a third-party hook already present for
+// PostToolUse, blamely's group must be installed first so a failing earlier
+// hook can't abort the chain before blamely records the edit.
+func TestInstallCodexHook_RunsFirst(t *testing.T) {
+	existing := `[features]
+hooks = true
+
+[[hooks.PostToolUse]]
+
+[[hooks.PostToolUse.hooks]]
+command = "/some/other-tool hook"
+type = "command"
+`
+	setupFakeCodexHome(t, existing)
+	_, configPath, err := InstallCodexHook("/bin/blamely")
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	root, err := readTOML(configPath)
+	if err != nil {
+		t.Fatalf("re-parse: %v", err)
+	}
+	post := getSlice(getMap(root, "hooks", false), "PostToolUse")
+	if len(post) != 2 {
+		t.Fatalf("expected 2 groups, got %d", len(post))
+	}
+	first, _ := post[0].(map[string]any)
+	inner := getSlice(first, "hooks")
+	if len(inner) == 0 {
+		t.Fatal("first group has no hooks")
+	}
+	hm, _ := inner[0].(map[string]any)
+	if cmd, _ := hm["command"].(string); !containsSubstr(cmd, codexBlamelyMarker) {
+		t.Errorf("expected blamely hook first, got %q", cmd)
+	}
+}
+
 func TestInstallCodexHook_EmptyFile(t *testing.T) {
 	setupFakeCodexHome(t, "")
 	added, configPath, err := InstallCodexHook("/usr/local/bin/blamely")

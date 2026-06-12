@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime/debug"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -17,10 +18,51 @@ import (
 	"github.com/blamely/blamely/internal/tools"
 )
 
-// version is overridable at link time via `-ldflags "-X main.version=<tag>"`.
-// The release workflow injects the git tag here; local dev builds use the
-// fallback value below.
-var version = "0.1.0-dev"
+// version is the release tag, injected at link time by the release workflow via
+// `-ldflags "-X main.version=<tag>"`. When it's left at the sentinel below
+// (any plain `go build`/`go install`), resolveVersion derives a real version
+// from the build metadata Go embeds automatically — so nothing is hardcoded.
+var version = "dev"
+
+// resolveVersion returns the effective CLI version. Precedence:
+//  1. an explicit -ldflags override (release builds);
+//  2. the module version Go records for `go install <module>@vX.Y.Z`;
+//  3. a `dev+<short-commit>[-dirty]` stamp from the embedded VCS info that
+//     `go build` adds for builds inside a git checkout;
+//  4. the bare "dev" sentinel when no build metadata is available.
+func resolveVersion() string {
+	if version != "dev" {
+		return version
+	}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return version
+	}
+	if v := info.Main.Version; v != "" && v != "(devel)" {
+		return v
+	}
+	var rev string
+	var dirty bool
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			dirty = s.Value == "true"
+		}
+	}
+	if rev == "" {
+		return version
+	}
+	if len(rev) > 12 {
+		rev = rev[:12]
+	}
+	out := "dev+" + rev
+	if dirty {
+		out += "-dirty"
+	}
+	return out
+}
 
 func main() {
 	root := &cobra.Command{
@@ -28,7 +70,7 @@ func main() {
 		Short: "Trace code changes and attribute them to AI tools or humans",
 		Long: "Blamely watches your filesystem and AI-tool logs, then writes a per-line\n" +
 			"AI-vs-human attribution report as a git note on every commit.",
-		Version: version,
+		Version: resolveVersion(),
 	}
 	// Suppress Cobra's auto-generated `completion` command from the menu;
 	// it's framework boilerplate and not a blamely feature.
@@ -213,20 +255,31 @@ func cmdRecord() *cobra.Command {
 		Short:  "Internal: ingest an AI-tool edit event from stdin",
 		Args:   cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Always exit 0. This command IS a hook, and blamely deliberately
+			// runs first in each tool's hook chain (see the install hooks). A
+			// non-zero exit here could abort the rest of that chain — i.e. break
+			// the very tools blamely sits in front of. So we record best-effort
+			// and swallow errors (surfaced on stderr for debugging only); a
+			// failed recording must never block the host tool.
+			var recErr error
 			switch args[0] {
 			case "claude", "cursor":
 				// Claude Code and Cursor share the PostToolUse payload shape;
 				// the handler distinguishes them via `cursor_version`.
-				return tools.RecordClaudeFromStdin(os.Stdin)
+				recErr = tools.RecordClaudeFromStdin(os.Stdin)
 			case "codex":
-				return tools.RecordCodexFromStdin(os.Stdin)
+				recErr = tools.RecordCodexFromStdin(os.Stdin)
 			case "copilot":
-				return tools.RecordCopilotFromStdin(os.Stdin)
+				recErr = tools.RecordCopilotFromStdin(os.Stdin)
 			case "gemini":
-				return tools.RecordGeminiFromStdin(os.Stdin)
+				recErr = tools.RecordGeminiFromStdin(os.Stdin)
 			default:
-				return fmt.Errorf("unknown tool %q (supported: claude, cursor, codex, copilot, gemini)", args[0])
+				recErr = fmt.Errorf("unknown tool %q (supported: claude, cursor, codex, copilot, gemini)", args[0])
 			}
+			if recErr != nil {
+				fmt.Fprintf(os.Stderr, "blamely record %s: %v\n", args[0], recErr)
+			}
+			return nil
 		},
 	}
 	return c

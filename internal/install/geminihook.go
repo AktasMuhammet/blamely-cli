@@ -69,7 +69,7 @@ func InstallGeminiHook(binaryPath string) (added bool, settingsPath string, err 
 		if geminiAlreadyPresent(groups) {
 			continue
 		}
-		groups = appendIntoMatcherGroup(groups, geminiHookMatcher, command)
+		groups = prependIntoMatcherGroup(groups, geminiHookMatcher, command)
 		hooks[event] = groups
 		added = true
 	}

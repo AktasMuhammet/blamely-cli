@@ -64,11 +64,15 @@ func InstallCodexHook(binaryPath string) (added bool, configPath string, err err
 		if codexAlreadyPresent(groups) {
 			continue
 		}
-		groups = append(groups, map[string]any{
+		// Prepend so blamely runs first — a third-party hook ordered ahead of us
+		// that errors out can abort the rest of the chain, which would stop
+		// blamely from ever recording the edit. See prependIntoMatcherGroup.
+		blamelyGroup := map[string]any{
 			"hooks": []any{
 				map[string]any{"command": command, "type": "command"},
 			},
-		})
+		}
+		groups = append([]any{blamelyGroup}, groups...)
 		hooks[event] = groups
 		added = true
 	}

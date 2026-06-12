@@ -66,7 +66,10 @@ func InstallCursorHook(binaryPath string) (added bool, hooksPath string, err err
 		if cursorAlreadyPresent(entries) {
 			continue
 		}
-		entries = append(entries, map[string]any{"command": command})
+		// Prepend so blamely runs first — see prependIntoMatcherGroup: a failing
+		// third-party hook ordered ahead of us must not abort the chain before
+		// blamely records the edit.
+		entries = append([]any{map[string]any{"command": command}}, entries...)
 		hooks[event] = entries
 		added = true
 	}

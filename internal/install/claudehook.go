@@ -65,7 +65,7 @@ func InstallClaudeHook(binaryPath string) (added bool, settingsPath string, err 
 		if alreadyPresent(entries) {
 			continue
 		}
-		entries = appendIntoMatcherGroup(entries, claudeHookMatcher, command)
+		entries = prependIntoMatcherGroup(entries, claudeHookMatcher, command)
 		hooks[event] = entries
 		added = true
 	}
@@ -112,9 +112,19 @@ func migrateClaudeMatcher(groups []any, matcher string) bool {
 	return changed
 }
 
-// appendIntoMatcherGroup adds {type:command, command} to the matcher group
-// whose `matcher` equals `matcher`; creates the group if none exists.
-func appendIntoMatcherGroup(groups []any, matcher, command string) []any {
+// prependIntoMatcherGroup adds {type:command, command} as the FIRST hook of the
+// matcher group whose `matcher` equals `matcher`; creates the group (as the
+// first group) if none exists.
+//
+// Blamely runs first on purpose: hosts (Claude Code, Codex, …) execute an
+// event's hooks in order and a hook that errors can abort the rest of the
+// chain. If blamely were appended last, a failing third-party hook installed
+// ahead of it would silently prevent blamely from ever recording the edit.
+// Running first means blamely captures the change before anyone else can break
+// the chain — and `blamely record` always exits 0 (see cmdRecord) so it never
+// becomes that blocker for the tools that follow it.
+func prependIntoMatcherGroup(groups []any, matcher, command string) []any {
+	newHook := map[string]any{"type": "command", "command": command}
 	for i, g := range groups {
 		grp, ok := g.(map[string]any)
 		if !ok {
@@ -124,20 +134,16 @@ func appendIntoMatcherGroup(groups []any, matcher, command string) []any {
 			continue
 		}
 		inner := getSlice(grp, "hooks")
-		inner = append(inner, map[string]any{
-			"type":    "command",
-			"command": command,
-		})
+		inner = append([]any{newHook}, inner...)
 		grp["hooks"] = inner
 		groups[i] = grp
 		return groups
 	}
-	return append(groups, map[string]any{
+	newGroup := map[string]any{
 		"matcher": matcher,
-		"hooks": []any{
-			map[string]any{"type": "command", "command": command},
-		},
-	})
+		"hooks":   []any{newHook},
+	}
+	return append([]any{newGroup}, groups...)
 }
 
 // UninstallClaudeHook removes ANY hook entry whose command contains

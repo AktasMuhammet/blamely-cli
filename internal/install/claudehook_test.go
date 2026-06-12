@@ -150,6 +150,79 @@ func TestInstallClaudeHook_MergesIntoExistingMatcher(t *testing.T) {
 	}
 }
 
+// TestInstallClaudeHook_RunsFirst reproduces the reported bug: a third-party
+// tool's hook is already configured for PostToolUse. blamely must install its
+// hook FIRST in the chain so that a failing earlier hook can't abort the chain
+// before blamely records the edit.
+func TestInstallClaudeHook_RunsFirst(t *testing.T) {
+	existing := `{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write",
+        "hooks": [{"type":"command","command":"/some/other-tool hook"}]
+      }
+    ]
+  }
+}`
+	setupFakeHome(t, existing)
+	_, settingsPath, err := InstallClaudeHook("/bin/blamely")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := claudeSettingsAt(t, settingsPath)
+	groups := getSlice(getMap(m, "hooks", false), "PostToolUse")
+	if len(groups) != 2 {
+		t.Fatalf("expected 2 groups (blamely + other), got %d", len(groups))
+	}
+	// blamely's group must be first.
+	first, _ := groups[0].(map[string]any)
+	inner := getSlice(first, "hooks")
+	if len(inner) == 0 {
+		t.Fatal("first group has no hooks")
+	}
+	hm, _ := inner[0].(map[string]any)
+	cmd, _ := hm["command"].(string)
+	if !containsBlamelyHook(cmd) {
+		t.Errorf("expected blamely hook first, got %q (full groups: %v)", cmd, groups)
+	}
+}
+
+// TestInstallClaudeHook_RunsFirst_SharedMatcher: when a foreign hook already
+// occupies blamely's exact matcher group, blamely's command must be prepended
+// inside that group (runs before the foreign command), not appended after it.
+func TestInstallClaudeHook_RunsFirst_SharedMatcher(t *testing.T) {
+	existing := `{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
+        "hooks": [{"type":"command","command":"/some/other-tool hook"}]
+      }
+    ]
+  }
+}`
+	setupFakeHome(t, existing)
+	_, settingsPath, err := InstallClaudeHook("/bin/blamely")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := claudeSettingsAt(t, settingsPath)
+	groups := getSlice(getMap(m, "hooks", false), "PostToolUse")
+	if len(groups) != 1 {
+		t.Fatalf("expected 1 merged group, got %d", len(groups))
+	}
+	grp, _ := groups[0].(map[string]any)
+	inner := getSlice(grp, "hooks")
+	if len(inner) != 2 {
+		t.Fatalf("expected 2 hooks in merged group, got %d", len(inner))
+	}
+	hm, _ := inner[0].(map[string]any)
+	if cmd, _ := hm["command"].(string); !containsBlamelyHook(cmd) {
+		t.Errorf("expected blamely hook first inside shared matcher, got %q", cmd)
+	}
+}
+
 func TestInstallClaudeHook_MigratesLegacyMatcher(t *testing.T) {
 	// A blamely hook installed by an older version used a matcher without Bash.
 	// Re-running install must upgrade that group's matcher in place (not add a
