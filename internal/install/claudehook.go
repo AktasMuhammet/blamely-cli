@@ -33,10 +33,13 @@ const (
 // human-typed lines and making them appear as AI in subsequent commits.
 var claudeHookEvents = []string{"PostToolUse"}
 
-// InstallClaudeHook merges blamely's record-hook into every event we care
-// about under ~/.claude/settings.json (PostToolUse today).
-// Idempotent. Preserves all unrelated keys (other matchers, user hooks,
-// settings unrelated to hooks). Returns true if anything new was added.
+// InstallClaudeHook ensures exactly ONE blamely record-hook is the FIRST hook
+// of every event we care about under ~/.claude/settings.json (PostToolUse
+// today). It strips any existing blamely hooks (deduping repeats and removing a
+// stale binary path / older matcher) and prepends a single fresh one, so
+// re-running `blamely install` never stacks duplicates and always pins blamely
+// first. Idempotent — it only writes when the file actually changes. Preserves
+// all unrelated keys (other matchers, user hooks, non-hook settings).
 func InstallClaudeHook(binaryPath string) (added bool, settingsPath string, err error) {
 	settingsPath, err = config.ClaudeSettingsPath()
 	if err != nil {
@@ -50,31 +53,22 @@ func InstallClaudeHook(binaryPath string) (added bool, settingsPath string, err 
 	if err != nil {
 		return false, settingsPath, err
 	}
+	before := canonJSON(root)
 
 	hooks := getMap(root, "hooks", true)
 	command := binaryPath + " record claude"
 
 	for _, event := range claudeHookEvents {
 		entries := getSlice(hooks, event)
-		// Migrate older installs whose blamely group used a narrower matcher
-		// (e.g. one without Bash) up to the current matcher.
-		if migrateClaudeMatcher(entries, claudeHookMatcher) {
-			hooks[event] = entries
-			added = true
-		}
-		if alreadyPresent(entries) {
-			continue
-		}
+		entries = stripBlamelyMatcherGroups(entries, blamelyHookMarker)
 		entries = prependIntoMatcherGroup(entries, claudeHookMatcher, command)
 		hooks[event] = entries
-		added = true
 	}
 	root["hooks"] = hooks
 
-	if !added {
+	if canonJSON(root) == before {
 		return false, settingsPath, nil
 	}
-
 	data, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
 		return false, settingsPath, fmt.Errorf("marshal settings: %w", err)
@@ -83,33 +77,6 @@ func InstallClaudeHook(binaryPath string) (added bool, settingsPath string, err 
 		return false, settingsPath, err
 	}
 	return true, settingsPath, nil
-}
-
-// migrateClaudeMatcher updates the `matcher` of any existing group that contains
-// a blamely hook but whose matcher differs from the current one (e.g. an older
-// install that didn't watch Bash). Returns true if it changed anything. This
-// keeps `blamely install` idempotent while still upgrading legacy hook entries.
-func migrateClaudeMatcher(groups []any, matcher string) bool {
-	changed := false
-	for _, g := range groups {
-		grp, ok := g.(map[string]any)
-		if !ok {
-			continue
-		}
-		if m, _ := grp["matcher"].(string); m == matcher {
-			continue
-		}
-		inner := getSlice(grp, "hooks")
-		for _, h := range inner {
-			hm, _ := h.(map[string]any)
-			if cmd, _ := hm["command"].(string); containsBlamelyHook(cmd) {
-				grp["matcher"] = matcher
-				changed = true
-				break
-			}
-		}
-	}
-	return changed
 }
 
 // prependIntoMatcherGroup adds {type:command, command} as the FIRST hook of the
@@ -266,22 +233,60 @@ func getSlice(parent map[string]any, key string) []any {
 	return nil
 }
 
-func alreadyPresent(groups []any) bool {
+// canonJSON returns a deterministic JSON encoding of v (encoding/json sorts map
+// keys), used to detect whether a hook reconcile actually changed the file so
+// install only rewrites when something differs.
+func canonJSON(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+// stripBlamelyMatcherGroups removes every blamely hook (command containing
+// marker) from each group's "hooks" array and drops any group left empty,
+// returning the surviving groups. Works for both matcher-keyed groups (Claude,
+// Gemini) and matcher-less groups (Codex) since it only looks at "hooks".
+// Install calls this before re-adding a single fresh blamely hook, so repeated
+// installs dedupe instead of stacking and a stale command/matcher is replaced.
+func stripBlamelyMatcherGroups(groups []any, marker string) []any {
+	out := make([]any, 0, len(groups))
 	for _, g := range groups {
 		grp, ok := g.(map[string]any)
 		if !ok {
+			out = append(out, g)
 			continue
 		}
 		inner := getSlice(grp, "hooks")
+		kept := make([]any, 0, len(inner))
 		for _, h := range inner {
 			hm, _ := h.(map[string]any)
 			cmd, _ := hm["command"].(string)
-			if containsBlamelyHook(cmd) {
-				return true
+			if cmd != "" && containsSubstr(cmd, marker) {
+				continue
 			}
+			kept = append(kept, h)
 		}
+		if len(kept) == 0 {
+			continue
+		}
+		grp["hooks"] = kept
+		out = append(out, grp)
 	}
-	return false
+	return out
+}
+
+// stripBlamelyEntries removes every blamely hook from a flat list of
+// {command,…} entries (Cursor, Copilot), returning the survivors.
+func stripBlamelyEntries(entries []any, marker string) []any {
+	out := make([]any, 0, len(entries))
+	for _, e := range entries {
+		em, _ := e.(map[string]any)
+		cmd, _ := em["command"].(string)
+		if cmd != "" && containsSubstr(cmd, marker) {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 func containsBlamelyHook(cmd string) bool {

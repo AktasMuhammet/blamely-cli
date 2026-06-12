@@ -55,9 +55,25 @@ func TestInstallClaudeHook_EmptySettings(t *testing.T) {
 	if !containsBlamelyHook("/usr/local/bin/blamely record claude") {
 		t.Error("containsBlamelyHook helper broken")
 	}
-	if !alreadyPresent(getSlice(getMap(m, "hooks", false), "PostToolUse")) {
+	if !groupsHaveBlamelyHook(getSlice(getMap(m, "hooks", false), "PostToolUse")) {
 		t.Error("hook not found in installed settings")
 	}
+}
+
+// groupsHaveBlamelyHook reports whether any matcher group's hooks contain a
+// blamely command. Test helper (the production alreadyPresent check was
+// replaced by strip-then-prepend reconcile).
+func groupsHaveBlamelyHook(groups []any) bool {
+	for _, g := range groups {
+		grp, _ := g.(map[string]any)
+		for _, h := range getSlice(grp, "hooks") {
+			hm, _ := h.(map[string]any)
+			if cmd, _ := hm["command"].(string); containsBlamelyHook(cmd) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func TestInstallClaudeHook_Idempotent(t *testing.T) {
@@ -220,6 +236,78 @@ func TestInstallClaudeHook_RunsFirst_SharedMatcher(t *testing.T) {
 	hm, _ := inner[0].(map[string]any)
 	if cmd, _ := hm["command"].(string); !containsBlamelyHook(cmd) {
 		t.Errorf("expected blamely hook first inside shared matcher, got %q", cmd)
+	}
+}
+
+// TestInstallClaudeHook_DedupesAndReplaces reproduces the reported bug: an
+// existing config has DUPLICATE blamely hooks pointing at a STALE binary path
+// (from older/buggy installs). Re-running install must collapse them to a
+// single fresh hook (current path) kept first, while preserving foreign hooks.
+func TestInstallClaudeHook_DedupesAndReplaces(t *testing.T) {
+	existing := `{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write",
+        "hooks": [{"type":"command","command":"/some/other-tool hook"}]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {"type":"command","command":"/old/path/blamely record claude"},
+          {"type":"command","command":"/old/path/blamely record claude"}
+        ]
+      }
+    ]
+  }
+}`
+	setupFakeHome(t, existing)
+	added, settingsPath, err := InstallClaudeHook("/new/bin/blamely")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !added {
+		t.Error("expected added=true (duplicates collapsed + stale path replaced)")
+	}
+	m := claudeSettingsAt(t, settingsPath)
+	groups := getSlice(getMap(m, "hooks", false), "PostToolUse")
+
+	// Exactly one blamely hook must survive, and it must be the very first hook.
+	count, foreign := 0, false
+	var firstCmd string
+	for gi, g := range groups {
+		grp, _ := g.(map[string]any)
+		for hi, h := range getSlice(grp, "hooks") {
+			hm, _ := h.(map[string]any)
+			cmd, _ := hm["command"].(string)
+			if containsBlamelyHook(cmd) {
+				count++
+				if gi == 0 && hi == 0 {
+					firstCmd = cmd
+				}
+			}
+			if cmd == "/some/other-tool hook" {
+				foreign = true
+			}
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected exactly 1 blamely hook after dedupe, got %d", count)
+	}
+	if firstCmd != "/new/bin/blamely record claude" {
+		t.Errorf("blamely hook should be first and use the new path, got firstCmd=%q", firstCmd)
+	}
+	if !foreign {
+		t.Error("foreign hook was dropped — must be preserved")
+	}
+
+	// And it's now idempotent: a second identical install rewrites nothing.
+	added2, _, err := InstallClaudeHook("/new/bin/blamely")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if added2 {
+		t.Error("expected added=false on second install after dedupe")
 	}
 }
 

@@ -53,6 +53,7 @@ func InstallCursorHook(binaryPath string) (added bool, hooksPath string, err err
 	if err != nil {
 		return false, hooksPath, err
 	}
+	before := canonJSON(root)
 
 	if _, ok := root["version"]; !ok {
 		root["version"] = float64(1)
@@ -63,19 +64,16 @@ func InstallCursorHook(binaryPath string) (added bool, hooksPath string, err err
 
 	for _, event := range cursorHookEvents {
 		entries := getSlice(hooks, event)
-		if cursorAlreadyPresent(entries) {
-			continue
-		}
-		// Prepend so blamely runs first — see prependIntoMatcherGroup: a failing
-		// third-party hook ordered ahead of us must not abort the chain before
-		// blamely records the edit.
+		// Strip any existing blamely entry (dedupe / drop stale path), then
+		// prepend a single fresh one first — a failing third-party hook ordered
+		// ahead of us must not abort the chain before blamely records the edit.
+		entries = stripBlamelyEntries(entries, cursorBlamelyMarker)
 		entries = append([]any{map[string]any{"command": command}}, entries...)
 		hooks[event] = entries
-		added = true
 	}
 	root["hooks"] = hooks
 
-	if !added {
+	if canonJSON(root) == before {
 		return false, hooksPath, nil
 	}
 
@@ -152,17 +150,6 @@ func UninstallCursorHook() (removed bool, err error) {
 		return false, err
 	}
 	return true, nil
-}
-
-func cursorAlreadyPresent(entries []any) bool {
-	for _, h := range entries {
-		hm, _ := h.(map[string]any)
-		cmd, _ := hm["command"].(string)
-		if containsCursorBlamelyHook(cmd) {
-			return true
-		}
-	}
-	return false
 }
 
 func containsCursorBlamelyHook(cmd string) bool {

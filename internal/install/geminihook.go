@@ -56,6 +56,7 @@ func InstallGeminiHook(binaryPath string) (added bool, settingsPath string, err 
 	if err != nil {
 		return false, settingsPath, err
 	}
+	before := canonJSON(root)
 
 	tools := getMap(root, "tools", true)
 	tools["enableHooks"] = true
@@ -66,16 +67,13 @@ func InstallGeminiHook(binaryPath string) (added bool, settingsPath string, err 
 
 	for _, event := range geminiHookEvents {
 		groups := getSlice(hooks, event)
-		if geminiAlreadyPresent(groups) {
-			continue
-		}
+		groups = stripBlamelyMatcherGroups(groups, geminiBlamelyMarker)
 		groups = prependIntoMatcherGroup(groups, geminiHookMatcher, command)
 		hooks[event] = groups
-		added = true
 	}
 	root["hooks"] = hooks
 
-	if !added {
+	if canonJSON(root) == before {
 		return false, settingsPath, nil
 	}
 
@@ -170,21 +168,4 @@ func UninstallGeminiHook() (removed bool, err error) {
 		return false, err
 	}
 	return true, nil
-}
-
-func geminiAlreadyPresent(groups []any) bool {
-	for _, g := range groups {
-		grp, ok := g.(map[string]any)
-		if !ok {
-			continue
-		}
-		for _, h := range getSlice(grp, "hooks") {
-			hm, _ := h.(map[string]any)
-			cmd, _ := hm["command"].(string)
-			if containsSubstr(cmd, geminiBlamelyMarker) {
-				return true
-			}
-		}
-	}
-	return false
 }

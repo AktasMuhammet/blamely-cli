@@ -58,6 +58,73 @@ type = "command"
 	}
 }
 
+// TestInstallCodexHook_DedupesAndReplaces: duplicate blamely groups pointing at
+// a stale path collapse to one fresh group, kept first, foreign hook preserved.
+func TestInstallCodexHook_DedupesAndReplaces(t *testing.T) {
+	existing := `[features]
+hooks = true
+
+[[hooks.PostToolUse]]
+
+[[hooks.PostToolUse.hooks]]
+command = "/old/blamely record codex"
+type = "command"
+
+[[hooks.PostToolUse]]
+
+[[hooks.PostToolUse.hooks]]
+command = "/some/other-tool hook"
+type = "command"
+
+[[hooks.PostToolUse]]
+
+[[hooks.PostToolUse.hooks]]
+command = "/old/blamely record codex"
+type = "command"
+`
+	setupFakeCodexHome(t, existing)
+	added, configPath, err := InstallCodexHook("/new/blamely")
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if !added {
+		t.Error("expected added=true (duplicates collapsed + path replaced)")
+	}
+	root, err := readTOML(configPath)
+	if err != nil {
+		t.Fatalf("re-parse: %v", err)
+	}
+	groups := getSlice(getMap(root, "hooks", false), "PostToolUse")
+
+	count, foreign := 0, false
+	var firstCmd string
+	for gi, g := range groups {
+		grp, _ := g.(map[string]any)
+		for hi, h := range getSlice(grp, "hooks") {
+			hm, _ := h.(map[string]any)
+			cmd, _ := hm["command"].(string)
+			if containsSubstr(cmd, codexBlamelyMarker) {
+				count++
+				if gi == 0 && hi == 0 {
+					firstCmd = cmd
+				}
+			}
+			if cmd == "/some/other-tool hook" {
+				foreign = true
+			}
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected exactly 1 blamely hook after dedupe, got %d", count)
+	}
+	if firstCmd != "/new/blamely record codex" {
+		t.Errorf("blamely hook should be first and use the new path, got %q", firstCmd)
+	}
+	if !foreign {
+		t.Error("foreign hook was dropped — must be preserved")
+	}
+}
+
 func TestInstallCodexHook_EmptyFile(t *testing.T) {
 	setupFakeCodexHome(t, "")
 	added, configPath, err := InstallCodexHook("/usr/local/bin/blamely")

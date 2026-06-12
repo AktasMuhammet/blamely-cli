@@ -48,28 +48,26 @@ func InstallCopilotHook(binaryPath string) (added bool, hookPath string, err err
 	if err != nil {
 		return false, hookPath, err
 	}
+	before := canonJSON(root)
 
 	hooks := getMap(root, "hooks", true)
 	command := binaryPath + " record copilot"
 
 	for _, event := range copilotHookEvents {
 		entries := getSlice(hooks, event)
-		if copilotAlreadyPresent(entries) {
-			continue
-		}
-		// Prepend so blamely runs first — see prependIntoMatcherGroup: a failing
-		// third-party hook ordered ahead of us must not abort the chain before
-		// blamely records the edit.
+		// Strip any existing blamely entry (dedupe / drop stale path), then
+		// prepend a single fresh one first — a failing third-party hook ordered
+		// ahead of us must not abort the chain before blamely records the edit.
+		entries = stripBlamelyEntries(entries, copilotBlamelyMarker)
 		entries = append([]any{map[string]any{
 			"command": command,
 			"type":    "command",
 		}}, entries...)
 		hooks[event] = entries
-		added = true
 	}
 	root["hooks"] = hooks
 
-	if !added {
+	if canonJSON(root) == before {
 		return false, hookPath, nil
 	}
 
@@ -156,15 +154,4 @@ func UninstallCopilotHook() (removed bool, err error) {
 		return false, err
 	}
 	return true, nil
-}
-
-func copilotAlreadyPresent(entries []any) bool {
-	for _, h := range entries {
-		hm, _ := h.(map[string]any)
-		cmd, _ := hm["command"].(string)
-		if containsSubstr(cmd, copilotBlamelyMarker) {
-			return true
-		}
-	}
-	return false
 }

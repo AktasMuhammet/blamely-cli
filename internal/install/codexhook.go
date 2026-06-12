@@ -51,6 +51,7 @@ func InstallCodexHook(binaryPath string) (added bool, configPath string, err err
 	if err != nil {
 		return false, configPath, err
 	}
+	before := canonJSON(root)
 
 	features := getMap(root, "features", true)
 	features["hooks"] = true
@@ -61,12 +62,11 @@ func InstallCodexHook(binaryPath string) (added bool, configPath string, err err
 
 	for _, event := range codexHookEvents {
 		groups := getSlice(hooks, event)
-		if codexAlreadyPresent(groups) {
-			continue
-		}
-		// Prepend so blamely runs first — a third-party hook ordered ahead of us
-		// that errors out can abort the rest of the chain, which would stop
-		// blamely from ever recording the edit. See prependIntoMatcherGroup.
+		// Strip any existing blamely group first (dedupe repeats / drop a stale
+		// binary path), then prepend a single fresh one so blamely runs first —
+		// a third-party hook ordered ahead of us that errors out can abort the
+		// rest of the chain and stop blamely from recording the edit.
+		groups = stripBlamelyMatcherGroups(groups, codexBlamelyMarker)
 		blamelyGroup := map[string]any{
 			"hooks": []any{
 				map[string]any{"command": command, "type": "command"},
@@ -74,11 +74,10 @@ func InstallCodexHook(binaryPath string) (added bool, configPath string, err err
 		}
 		groups = append([]any{blamelyGroup}, groups...)
 		hooks[event] = groups
-		added = true
 	}
 	root["hooks"] = hooks
 
-	if !added {
+	if canonJSON(root) == before {
 		return false, configPath, nil
 	}
 
@@ -164,23 +163,6 @@ func UninstallCodexHook() (removed bool, err error) {
 		return false, err
 	}
 	return true, nil
-}
-
-func codexAlreadyPresent(groups []any) bool {
-	for _, g := range groups {
-		grp, ok := g.(map[string]any)
-		if !ok {
-			continue
-		}
-		for _, h := range getSlice(grp, "hooks") {
-			hm, _ := h.(map[string]any)
-			cmd, _ := hm["command"].(string)
-			if containsSubstr(cmd, codexBlamelyMarker) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func readTOML(path string) (map[string]any, error) {
