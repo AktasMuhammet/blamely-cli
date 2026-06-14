@@ -18,11 +18,11 @@ import (
 	"github.com/blamely/blamely/internal/tools"
 )
 
-// version is the release tag, injected at link time by the release workflow via
-// `-ldflags "-X main.version=<tag>"`. When it's left at the sentinel below
-// (any plain `go build`/`go install`), resolveVersion derives a real version
-// from the build metadata Go embeds automatically — so nothing is hardcoded.
-var version = "dev"
+// version is the baseline product version, kept in sync with the VS Code and
+// JetBrains plugins. The release workflow can still override it at link time via
+// `-ldflags "-X main.version=<tag>"`; otherwise this hardcoded value is what
+// `blamely --version` reports.
+var version = "1.0.1"
 
 // resolveVersion returns the effective CLI version. Precedence:
 //  1. an explicit -ldflags override (release builds);
@@ -65,6 +65,17 @@ func resolveVersion() string {
 }
 
 func main() {
+	// On Windows, switch the console to UTF-8 and enable ANSI color processing
+	// so the install log's glyphs and colors render instead of mojibake. No-op
+	// on Linux/macOS.
+	initConsole()
+
+	// Propagate the resolved version so notes stamp their writer (generated_by)
+	// and reports show the running version, instead of a hardcoded placeholder.
+	ver := resolveVersion()
+	gitnotes.Version = ver
+	report.Version = ver
+
 	root := &cobra.Command{
 		Use:   "blamely",
 		Short: "Trace code changes and attribute them to AI tools or humans",
@@ -104,11 +115,13 @@ func cmdDaemon() *cobra.Command {
 		Short: "Run the long-lived attribution daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Watchers use direct, observable signals (hooks, log parsers,
-			// editor plugin events). The velocity/heuristic watcher has been
-			// removed: inline completions are now attributed at high confidence
-			// by the VS Code and IntelliJ plugins via the
-			// editor.action.inlineSuggest.commit command and AnActionListener
-			// APIs respectively, both of which POST directly to /edit.
+			// editor plugin events). When the editor extension is installed it
+			// attributes inline completions at high confidence via the
+			// editor.action.inlineSuggest.commit command (VS Code) /
+			// AnActionListener (IntelliJ), POSTing directly to /edit. The
+			// velocity watcher below is the CLI-only fallback for users who do
+			// NOT install the extension: it pairs a filesystem line-burst with a
+			// Copilot/Cursor session marker to attribute Tab completions.
 			daemon.Watchers = []daemon.Watcher{
 				&tools.CodexWatcher{},
 				// Cursor: file-history presence signal + log events + chat panel.
@@ -126,7 +139,15 @@ func cmdDaemon() *cobra.Command {
 				// (it never goes through Gemini CLI's BeforeTool/AfterTool
 				// framework), so this tails the agent's own transcript logs.
 				&tools.AntigravityGeminiWatcher{},
+				// Claude Desktop's "cowork" sandbox has no PostToolUse hook; this
+				// tails its undocumented logs to attribute its file edits/deletes.
+				&tools.ClaudeDesktopWatcher{},
 			}
+			// Velocity needs DB access (to enumerate known repos and look up
+			// recent Copilot/Cursor session markers), so it's wired through the
+			// DB-backed factory list rather than the static Watchers slice.
+			daemon.DBWatcherFactories = append(daemon.DBWatcherFactories,
+				func(db *store.DB) daemon.Watcher { return &tools.VelocityWatcher{DB: db} })
 			return daemon.Run(cmd.Context())
 		},
 	}
@@ -307,7 +328,7 @@ func cmdAttribute() *cobra.Command {
 				return err
 			}
 			if !quiet && note != nil {
-				report.RenderBar(os.Stdout, note, 40)
+				report.RenderCommitSummary(os.Stdout, note)
 			}
 			return nil
 		},
@@ -317,17 +338,30 @@ func cmdAttribute() *cobra.Command {
 }
 
 func cmdReport() *cobra.Command {
-	var since string
+	var since, out string
+	var htmlMode, noOpen bool
 	c := &cobra.Command{
 		Use:   "report [<sha>]",
-		Short: "Show line-by-line attribution for a commit, or an aggregated table",
+		Short: "Show line-by-line attribution for a commit in the terminal (or --html for a browser dashboard)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if len(args) == 1 {
-				return report.RenderCommit(args[0])
+			if len(args) == 0 {
+				return report.RenderSince(since)
 			}
-			return report.RenderSince(since)
+			sha := args[0]
+			if htmlMode {
+				path, err := report.RenderCommitHTML(sha, out, !noOpen)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("Report written to %s\n", path)
+				return nil
+			}
+			return report.RenderCommit(sha)
 		},
 	}
+	c.Flags().BoolVar(&htmlMode, "html", false, "render an HTML dashboard and open it in the browser")
+	c.Flags().StringVarP(&out, "out", "o", "", "with --html: write the report to this path instead of a temp file")
+	c.Flags().BoolVar(&noOpen, "no-open", false, "with --html: write the file but don't open the browser")
 	c.Flags().StringVar(&since, "since", "7d", "time window for the aggregated table (e.g. 1d, 7d)")
 	return c
 }

@@ -183,9 +183,9 @@ func (s *codexState) flush(input, output, cacheRead, cacheWrite int64, hasTokens
 // codexLine accepts any plausible Codex CLI event shape and extracts the
 // fields we care about. Extra fields are ignored.
 type codexLine struct {
-	Type      string          `json:"type"`
-	Model     string          `json:"model"`
-	Timestamp string          `json:"timestamp"`
+	Type      string `json:"type"`
+	Model     string `json:"model"`
+	Timestamp string `json:"timestamp"`
 	Message   *struct {
 		Model string `json:"model"`
 		Usage *struct {
@@ -336,6 +336,114 @@ func processCodexWrappedLine(env *codexWrappedLine, st *codexState) {
 		case "token_count":
 			flushCodexTokenCount(env.Payload, st)
 		}
+	case "response_item":
+		// Codex deletes files by running a shell `rm` (exec_command), not via
+		// apply_patch — those removals are otherwise invisible to this tailer
+		// and fall to Human at commit time. Fingerprint each deleted file here.
+		emitCodexShellDeletions(env.Payload, when, st)
+	}
+}
+
+// codexShellNames are the function-call names Codex uses to run a shell
+// command. exec_command is the current one; the others cover older / variant
+// builds so a shell deletion is caught regardless of the wrapper.
+var codexShellNames = map[string]bool{
+	"exec_command":     true,
+	"shell":            true,
+	"local_shell":      true,
+	"local_shell_call": true,
+	"container.exec":   true,
+}
+
+// emitCodexShellDeletions inspects a response_item function_call. When it's a
+// shell command that deletes files (`rm`/`git rm`, or Windows `del`/`erase`/
+// `Remove-Item`), it fingerprints each deleted file's HEAD content as removed
+// lines and buffers a codex event — mirroring how Claude handles a `Bash rm`,
+// so commit-time attribution credits Codex for the deletion instead of Human.
+func emitCodexShellDeletions(payload json.RawMessage, when time.Time, st *codexState) {
+	var p struct {
+		Type      string          `json:"type"`
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if json.Unmarshal(payload, &p) != nil || p.Type != "function_call" {
+		return
+	}
+	if !codexShellNames[strings.ToLower(p.Name)] {
+		return
+	}
+	// arguments is usually a JSON object, but some builds encode it as a JSON
+	// string-of-JSON — unwrap that first.
+	raw := p.Arguments
+	if len(raw) > 0 && raw[0] == '"' {
+		var s string
+		if json.Unmarshal(raw, &s) == nil {
+			raw = json.RawMessage(s)
+		}
+	}
+	var args struct {
+		Cmd     string `json:"cmd"`
+		Command string `json:"command"`
+		Workdir string `json:"workdir"`
+		Cwd     string `json:"cwd"`
+	}
+	if json.Unmarshal(raw, &args) != nil {
+		return
+	}
+	cmd := args.Cmd
+	if cmd == "" {
+		cmd = args.Command
+	}
+	workdir := args.Workdir
+	if workdir == "" {
+		workdir = args.Cwd
+	}
+	if cmd == "" || workdir == "" {
+		return
+	}
+	for _, tok := range shellDeleteTargets(cmd) {
+		abs := tok
+		if !filepath.IsAbs(abs) {
+			abs = filepath.Join(workdir, tok)
+		}
+		root := findRepoRoot(abs, workdir)
+		if root == "" {
+			continue
+		}
+		// The file is already gone, so resolve its repo-relative name via the
+		// surviving parent dir, in the root's symlink-space.
+		dir := filepath.Dir(abs)
+		if rd, err := filepath.EvalSymlinks(dir); err == nil {
+			dir = rd
+		}
+		rootResolved := root
+		if rr, err := filepath.EvalSymlinks(root); err == nil {
+			rootResolved = rr
+		}
+		rel, err := filepath.Rel(rootResolved, filepath.Join(dir, filepath.Base(abs)))
+		if err != nil || strings.HasPrefix(rel, "..") {
+			continue
+		}
+		removed := headFileRemovedHashes(root, rel)
+		if len(removed) == 0 {
+			continue
+		}
+		repo, _ := gitutil.RepoID(rootResolved)
+		if repo == "" {
+			repo = root
+		}
+		st.pending = append(st.pending, daemon.Event{
+			When:           when,
+			Tool:           "codex",
+			Confidence:     "high",
+			GenType:        "cli",
+			RepoPath:       repo,
+			FilePath:       rel,
+			Model:          st.model,
+			RemovedLines:   toDaemonRemovedLines(removed),
+			SuggestedLines: int64(len(removed)),
+			RawMeta:        `{"source":"codex_session","shell_delete":true}`,
+		})
 	}
 }
 
@@ -364,6 +472,14 @@ func emitCodexPatchApplyEvents(payload json.RawMessage, when time.Time, st *code
 		}
 		repo, _ := gitutil.RepoID(abs)
 		wt, _ := gitutil.Toplevel(abs)
+		// A deleted file is gone from disk, so RepoID/Toplevel (which stat the
+		// path) fail — resolve from its still-existing parent directory instead.
+		if repo == "" {
+			repo, _ = gitutil.RepoID(filepath.Dir(abs))
+		}
+		if wt == "" {
+			wt, _ = gitToplevel(filepath.Dir(abs))
+		}
 		rel := abs
 		if wt != "" {
 			if r, err := filepath.Rel(wt, abs); err == nil && !strings.HasPrefix(r, "..") {
@@ -390,6 +506,31 @@ func emitCodexPatchApplyEvents(payload json.RawMessage, when time.Time, st *code
 			lines = toDaemonLineRanges(ranges)
 			suggested = n
 			removed = toDaemonRemovedLines(UnifiedDiffRemovedLineHashes(change.UnifiedDiff))
+		case "delete":
+			// A removed file carries no added lines — fingerprint its content
+			// as removed so commit-time attribution credits codex for the
+			// deletion. Prefer the patch's own record of the removed text (the
+			// file is already gone from disk); fall back to HEAD when the
+			// payload didn't include it.
+			if change.UnifiedDiff != "" {
+				removed = toDaemonRemovedLines(UnifiedDiffRemovedLineHashes(change.UnifiedDiff))
+			}
+			if len(removed) == 0 && change.Content != "" {
+				removed = toDaemonRemovedLines(RemovedLineHashes(change.Content, ""))
+			}
+			if len(removed) == 0 {
+				root := wt
+				if root == "" {
+					root, _ = gitToplevel(filepath.Dir(abs))
+				}
+				if root != "" {
+					removed = toDaemonRemovedLines(headFileRemovedHashes(root, rel))
+				}
+			}
+			if len(removed) == 0 {
+				continue
+			}
+			suggested = int64(len(removed))
 		default:
 			continue
 		}
@@ -486,29 +627,7 @@ func parsePatchFiles(raw json.RawMessage) []patchedFile {
 	if len(raw) == 0 {
 		return nil
 	}
-	// Arguments may itself be a JSON string containing JSON. Unwrap.
-	if raw[0] == '"' {
-		var s string
-		if err := json.Unmarshal(raw, &s); err == nil {
-			raw = json.RawMessage(s)
-		}
-	}
-	// Try the canonical envelope.
-	var env struct {
-		Input string `json:"input"`
-		Patch string `json:"patch"`
-		Path  string `json:"path"`
-		File  string `json:"file_path"`
-	}
-	_ = json.Unmarshal(raw, &env)
-
-	body := env.Input
-	if body == "" {
-		body = env.Patch
-	}
-	if body == "" && len(raw) > 0 && raw[0] != '{' {
-		body = string(raw)
-	}
+	body, env := patchEnvelope(raw)
 	if body != "" {
 		return parsePatchBody(body)
 	}
@@ -520,6 +639,59 @@ func parsePatchFiles(raw json.RawMessage) []patchedFile {
 		return []patchedFile{{Path: path, StartLine: 1, EndLine: 1}}
 	}
 	return nil
+}
+
+// patchEnvelope unwraps the several argument shapes a Codex apply_patch call
+// may take (a JSON string, {"input":...}, {"patch":...}, {"path"/"file_path"},
+// or a bare patch body) and returns the patch text plus the parsed envelope.
+func patchEnvelope(raw json.RawMessage) (body string, env struct {
+	Input string `json:"input"`
+	Patch string `json:"patch"`
+	Path  string `json:"path"`
+	File  string `json:"file_path"`
+}) {
+	if len(raw) == 0 {
+		return "", env
+	}
+	// Arguments may itself be a JSON string containing JSON. Unwrap.
+	if raw[0] == '"' {
+		var s string
+		if err := json.Unmarshal(raw, &s); err == nil {
+			raw = json.RawMessage(s)
+		}
+	}
+	_ = json.Unmarshal(raw, &env)
+	body = env.Input
+	if body == "" {
+		body = env.Patch
+	}
+	if body == "" && len(raw) > 0 && raw[0] != '{' {
+		body = string(raw)
+	}
+	return body, env
+}
+
+// parsePatchDeletedFiles returns the paths a Codex apply_patch removes via
+// `*** Delete File: <path>` directives. A single patch can delete files
+// alongside adds/updates, so callers must check this independently of the
+// add/update primary path.
+func parsePatchDeletedFiles(raw json.RawMessage) []string {
+	body, _ := patchEnvelope(raw)
+	if body == "" {
+		return nil
+	}
+	var out []string
+	scanner := bufio.NewScanner(strings.NewReader(body))
+	scanner.Buffer(make([]byte, 0, 1<<16), 1<<22)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "*** Delete File: ") {
+			if p := strings.TrimSpace(strings.TrimPrefix(line, "*** Delete File: ")); p != "" {
+				out = append(out, p)
+			}
+		}
+	}
+	return out
 }
 
 // parsePatchBody walks a Codex/OpenAI patch envelope:

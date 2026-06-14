@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/daemon"
@@ -18,6 +19,11 @@ import (
 )
 
 const NotesRef = "refs/notes/blamely"
+
+// Version is the blamely version stamped into a note's generated_by field. It
+// defaults to "dev" and is overwritten at startup by cmd/blamely with the real
+// resolved version, so a note records exactly which blamely wrote it.
+var Version = "dev"
 
 // ConvTurn is one user or assistant turn from the AI tool's conversation
 // transcript that produced edits for this commit.
@@ -79,9 +85,9 @@ type Note struct {
 	CodingTimeNanos int64           `json:"coding_time_nanos,omitempty"`
 	Totals          Totals          `json:"totals"`
 	ByTool          map[string]Tool `json:"by_tool"`
-	ByGenType    ByGenType   `json:"by_gen_type"`
-	Files        []FileEntry `json:"files"`
-	GeneratedBy  string      `json:"generated_by"`
+	ByGenType       ByGenType       `json:"by_gen_type"`
+	Files           []FileEntry     `json:"files"`
+	GeneratedBy     string          `json:"generated_by"`
 	// Conversation holds the last few user/assistant turns from the
 	// AI transcript that drove the edits in this commit. Populated only
 	// when a transcript_path was captured in the edit's raw_meta.
@@ -102,23 +108,62 @@ type ByGenType struct {
 }
 
 type Totals struct {
-	AILines      int `json:"ai_lines"`
-	HumanLines   int `json:"human_lines"`
-	DeletedLines int `json:"deleted_lines"`
-	// AIDeletedLines is the subset of DeletedLines whose removal was matched
-	// to an AI edit's recorded edit_removed_lines hashes. The remaining
-	// DeletedLines - AIDeletedLines were removed by a human.
-	AIDeletedLines int     `json:"ai_deleted_lines,omitempty"`
-	Files          int     `json:"files"`
-	Tokens         *Tokens `json:"tokens,omitempty"`
+	// Added lines, split by author. AddedLines is their sum (ai + human). The Go
+	// field names stay AILines/HumanLines (used throughout the codebase) but they
+	// serialize under the clearly-scoped JSON keys so a reader never has to guess
+	// that a bare "lines" meant *added*.
+	AddedLines int `json:"added_lines"`
+	AILines    int `json:"ai_added_lines"`
+	HumanLines int `json:"human_added_lines"`
+
+	// Deleted lines, split by author. DeletedLines is the total; AIDeletedLines
+	// is the subset whose removal matched an AI edit's recorded
+	// edit_removed_lines hashes, and HumanDeletedLines is the rest.
+	DeletedLines      int `json:"deleted_lines"`
+	AIDeletedLines    int `json:"ai_deleted_lines"`
+	HumanDeletedLines int `json:"human_deleted_lines"`
+
+	Files  int     `json:"files"`
+	Tokens *Tokens `json:"tokens,omitempty"`
 	// Models is a per-model line-count rollup. Keys are concrete model
 	// identifiers (e.g. "claude-opus-4-7", "gpt-4o"), not provider names.
 	// Lines whose source AI didn't expose a model name aren't counted here.
 	Models map[string]int `json:"models,omitempty"`
 }
 
+// UnmarshalJSON reads a Totals, accepting notes written by older blamely
+// versions that used the pre-1.x keys ai_lines / human_lines (now
+// ai_added_lines / human_added_lines) and deriving added_lines when it's absent,
+// so `blamely report` on an old commit still shows the right numbers.
+func (t *Totals) UnmarshalJSON(data []byte) error {
+	type alias Totals
+	aux := struct {
+		*alias
+		LegacyAI    *int `json:"ai_lines"`
+		LegacyHuman *int `json:"human_lines"`
+	}{alias: (*alias)(t)}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if t.AILines == 0 && aux.LegacyAI != nil {
+		t.AILines = *aux.LegacyAI
+	}
+	if t.HumanLines == 0 && aux.LegacyHuman != nil {
+		t.HumanLines = *aux.LegacyHuman
+	}
+	if t.AddedLines == 0 {
+		t.AddedLines = t.AILines + t.HumanLines
+	}
+	return nil
+}
+
 type Tool struct {
+	// Lines is the tool's ADDED (authored) line count.
 	Lines int `json:"lines"`
+	// DeletedLines is the tool's removed-line count. A deletion-only commit
+	// still records the tool here (with Lines == 0) so by_tool isn't empty when
+	// an AI tool deleted code but authored nothing.
+	DeletedLines int `json:"deleted_lines,omitempty"`
 	// SuggestedLines and AcceptedLines are only set for AI tools — they
 	// describe the model's original proposal vs. what the user kept. They
 	// don't apply to human edits.
@@ -140,13 +185,13 @@ type FileEntry struct {
 	// Type is the file-level change kind: ADDED, DELETED, MODIFIED, RENAMED,
 	// or COPIED. Surfaced so consumers can render per-file status (e.g. a
 	// "+ added" / "- deleted" tag) without re-parsing the diff.
-	Type    string       `json:"type,omitempty"`
+	Type string `json:"type,omitempty"`
 	// RenamedFrom (resp. CopiedFrom) is set for RENAMED / COPIED files and
 	// names the source pre-commit path.
-	RenamedFrom string       `json:"renamed_from,omitempty"`
-	CopiedFrom  string       `json:"copied_from,omitempty"`
-	Added       int          `json:"added"`
-	Deleted     int          `json:"deleted"`
+	RenamedFrom string `json:"renamed_from,omitempty"`
+	CopiedFrom  string `json:"copied_from,omitempty"`
+	Added       int    `json:"added"`
+	Deleted     int    `json:"deleted"`
 	// Lines holds the attribution as collapsed ranges (schema 2): consecutive
 	// lines sharing the same (type, author_type, tool, model, gen_type) are
 	// merged into one RangeEntry. Added/Deleted above stay line-accurate.
@@ -236,6 +281,81 @@ func collapseToRanges(lines []LineEntry) []RangeEntry {
 	return out
 }
 
+// backfillFromClaudeTranscript credits whole-file creates/deletes the AI made
+// and committed in a single bash command. Such files attribute as Human because
+// the commit (and this note) ran before the PostToolUse hook recorded the edit,
+// and afterwards the working tree is clean — but the Claude transcript records
+// the `cat > f` / `rm f` / Write op. We only touch ADDED files the AI wrote and
+// DELETED files the AI removed (whole-file ops), so existing per-line matching
+// for MODIFIED files is never overridden.
+func backfillFromClaudeTranscript(db *store.DB, note *Note, repoRoot, repoID string, commitNanos int64) {
+	if note == nil || len(note.Files) == 0 {
+		return
+	}
+	since := db.PreviousCommitTimestampNanos(repoID, commitNanos)
+	until := commitNanos + int64(5*time.Second)
+	written, deleted := tools.ClaudeCommitFileOps(repoRoot, since, until)
+	if len(written) == 0 && len(deleted) == 0 {
+		return
+	}
+	chat := string(store.GenTypeChat)
+	if note.ByTool == nil {
+		note.ByTool = map[string]Tool{}
+	}
+	for i := range note.Files {
+		f := &note.Files[i]
+		switch f.Type {
+		case "ADDED":
+			if tools.MatchesFileOp(f.Path, written) {
+				flipFileToAI(note, f, "add", &chat)
+			}
+		case "DELETED":
+			if tools.MatchesFileOp(f.Path, deleted) {
+				flipFileToAI(note, f, "delete", &chat)
+			}
+		case "MODIFIED":
+			// A whole-file overwrite (`cat > f` / Write) the AI committed in one
+			// command: it replaced the whole file, so every added AND removed
+			// line is the AI's. (A partial Edit is NOT in `written`, so a
+			// genuinely-mixed file still relies on per-line matching.)
+			if tools.MatchesFileOp(f.Path, written) {
+				flipFileToAI(note, f, "add", &chat)
+				flipFileToAI(note, f, "delete", &chat)
+			}
+		}
+	}
+	note.Totals.AddedLines = note.Totals.AILines + note.Totals.HumanLines
+}
+
+// flipFileToAI reassigns a whole file's Human-attributed ranges of the given
+// kind ("add"/"delete") to claude/chat and adjusts the note's running totals.
+func flipFileToAI(note *Note, f *FileEntry, kind string, gen *string) {
+	for j := range f.Lines {
+		r := &f.Lines[j]
+		if r.Type != kind || r.AuthorType == "AI" {
+			continue
+		}
+		n := r.NumLines()
+		r.AuthorType = "AI"
+		r.Tool = "claude"
+		r.GenType = gen
+		note.ByGenType.Human -= n
+		note.ByGenType.Chat += n
+		t := note.ByTool["claude"]
+		t.Lines += n
+		t.AcceptedLines += n
+		t.SuggestedLines += int64(n)
+		note.ByTool["claude"] = t
+		if kind == "add" {
+			note.Totals.HumanLines -= n
+			note.Totals.AILines += n
+		} else {
+			note.Totals.HumanDeletedLines -= n
+			note.Totals.AIDeletedLines += n
+		}
+	}
+}
+
 // AttributeAndWrite is the main entry point invoked by the post-commit hook.
 // It returns the freshly-written Note so callers (like cmd/blamely) can render
 // a summary bar to stdout.
@@ -271,6 +391,11 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Backfill whole-file creates/deletes the AI committed in one bash command
+	// (e.g. `cat > f && git commit`, `rm f && git commit`). Those land here as
+	// Human because the commit — and this note — preceded the PostToolUse hook
+	// that would have recorded the edit; the AI's transcript still proves it.
+	backfillFromClaudeTranscript(db, note, repoPath, repoID, commitNanos)
 	// Branch + commit message are commit-scoped metadata; capture from git
 	// while we still have the working tree handy.
 	note.Branch = BranchName(repoPath)
@@ -488,6 +613,98 @@ func inheritBlankLineAttribution(resolved []perLine) {
 	}
 }
 
+// coalesceDuplicateBlocks makes a copy-pasted block coherent. Per-line
+// content matching splits a human's exact duplicate of an AI block jaggedly:
+// some lines fall to Human (the AI made fewer copies than now exist) while
+// others — lines that also repeat elsewhere in the file — stay AI, so the paste
+// shows up as a mix at confusing line numbers. This pass finds a contiguous run
+// of added lines that exactly duplicates an EARLIER run in the same file and,
+// when the AI did NOT author that many copies (signalled by at least one Human
+// line in either run), attributes the whole LATER run to Human (the paste) and
+// the EARLIER run to AI (the original). It only fires on runs of >=
+// dupBlockMinLines, so a single repeated line or a genuine AI-authored duplicate
+// block (where the budget already kept both copies AI, leaving no Human line) is
+// untouched. `resolved` must be sorted by (file, line).
+const dupBlockMinLines = 3
+
+func coalesceDuplicateBlocks(resolved []perLine) {
+	for s := 0; s < len(resolved); {
+		e := s
+		for e < len(resolved) && resolved[e].file == resolved[s].file {
+			e++
+		}
+		coalesceFileDuplicateBlocks(resolved[s:e])
+		s = e
+	}
+}
+
+func coalesceFileDuplicateBlocks(lines []perLine) {
+	n := len(lines)
+	posByContent := map[string][]int{} // earlier line indices per content
+	for i := 0; i < n; {
+		// Longest contiguous run starting at i that equals an earlier run.
+		bestLen, bestK := 0, -1
+		for _, k := range posByContent[lines[i].content] {
+			l := 0
+			for i+l < n && k+l < i && lines[i+l].content == lines[k+l].content {
+				l++
+			}
+			if l > bestLen {
+				bestLen, bestK = l, k
+			}
+		}
+		if bestLen >= dupBlockMinLines {
+			later := lines[i : i+bestLen]
+			earlier := lines[bestK : bestK+bestLen]
+			// Only act when the AI didn't author this many copies — i.e. the
+			// budget left a Human line somewhere in one of the two runs.
+			if blockHasHuman(later) || blockHasHuman(earlier) {
+				if ai := firstAILine(earlier, later); ai != nil {
+					for j := range earlier {
+						earlier[j].tool, earlier[j].genType, earlier[j].model = ai.tool, ai.genType, ai.model
+					}
+				}
+				for j := range later {
+					later[j].tool, later[j].genType, later[j].model = "", store.GenTypeHuman, ""
+				}
+			}
+			for j := i; j < i+bestLen; j++ {
+				posByContent[lines[j].content] = append(posByContent[lines[j].content], j)
+			}
+			i += bestLen
+			continue
+		}
+		posByContent[lines[i].content] = append(posByContent[lines[i].content], i)
+		i++
+	}
+}
+
+func blockHasHuman(block []perLine) bool {
+	for i := range block {
+		if isNonAITool(block[i].tool) {
+			return true
+		}
+	}
+	return false
+}
+
+// firstAILine returns the first AI-attributed line across the two runs, whose
+// tool/model/gen_type is applied to the original block. nil if neither run has
+// an AI line (then we leave attributions as-is rather than guess).
+func firstAILine(a, b []perLine) *perLine {
+	for i := range a {
+		if !isNonAITool(a[i].tool) {
+			return &a[i]
+		}
+	}
+	for i := range b {
+		if !isNonAITool(b[i].tool) {
+			return &b[i]
+		}
+	}
+	return nil
+}
+
 // perLine is the intermediate per-line attribution before collapsing into ranges.
 type perLine struct {
 	file    string
@@ -533,7 +750,10 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 	// Group changed lines by file so we hit the DB once per file.
 	// Also carry the line content for ContentSHA-based fallback attribution
 	// (so AI edits survive line-number drift from human edits made after apply).
-	type fileLineKey struct{ file string; lineNum int }
+	type fileLineKey struct {
+		file    string
+		lineNum int
+	}
 	lineContent := map[fileLineKey]string{}
 	byFile := map[string][]int{}
 	for _, a := range added {
@@ -561,6 +781,41 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		return sessionEdits, nil
 	}
 
+	// deletionEditsForFile pulls candidate edits for DELETION attribution across
+	// ALL sessions on this branch (not just the commit's session). An AI tool
+	// often removes content in one work-session, but the human stages and commits
+	// that deletion in a later session under a different HEAD — strict session
+	// scoping (correct for added lines, to keep human copy-paste of old AI code
+	// Human) would mislabel that genuine AI deletion as Human. The removal is
+	// still matched by exact content_sha with a consume-once budget, so each
+	// recorded AI removal credits at most one committed deletion.
+	delEditsByFile := map[string][]store.Edit{}
+	deletionEditsForFile := func(file string) []store.Edit {
+		if cached, ok := delEditsByFile[file]; ok {
+			return cached
+		}
+		// When the branch is unresolvable (detached HEAD / not a git repo), we
+		// can't branch-scope, so fall back to ALL edits for the file — mirroring
+		// how the add-path pulls session_id IS NULL rows in that situation.
+		pull := func(f string) ([]store.Edit, error) {
+			if branch == "" {
+				return db.EditsForFileAny(repoPath, f)
+			}
+			return db.EditsForFileOnBranch(repoPath, f, branch)
+		}
+		edits, err := pull(file)
+		if err != nil {
+			edits = nil
+		}
+		if from, ok := renames[file]; ok && from != "" {
+			if old, err := pull(from); err == nil {
+				edits = mergeEditsByTimeDesc(edits, old)
+			}
+		}
+		delEditsByFile[file] = edits
+		return edits
+	}
+
 	resolved := make([]perLine, 0, len(added))
 	sessionEditsByFile := map[string][]store.Edit{}
 	for file, lineNos := range byFile {
@@ -570,16 +825,57 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		}
 		sessionEditsByFile[file] = sessionEdits
 
-		// claimedSHA marks content SHAs that have an EXACT (StartLine==ln) match
-		// to some line being committed in this file. That line is the AI edit's
-		// "true" position; any OTHER line in this commit with the same content is
-		// a human copy-paste and must not also match via the drift fallback below.
-		// claimedSHANorm is the same guard for the normalized (autoformatter-drift)
-		// fallback: it's keyed by content_sha_norm so a human copy-paste of an
-		// AI line's (post-format) text doesn't also match via the normalized
-		// drift fallback.
-		claimedSHA := map[string]bool{}
-		claimedSHANorm := map[string]bool{}
+		// Drift budgets. A content_sha matched at its EXACT recorded line is always
+		// trusted as AI. The position-independent "drift" fallback (an AI line the
+		// user shifted) is RATIONED: a content may be drift-attributed to AI at
+		// most as many times as some AI edit actually recorded it, minus the
+		// committed lines already matched at their exact position. This is what
+		// keeps AI-generated REPEATS — closing braces, blank-line gaps, duplicated
+		// boilerplate — attributed AI even after the file drifts across multiple
+		// applies, while genuine human copies BEYOND what the AI produced still
+		// fall through to Human (a single recorded occurrence yields a single
+		// claim, so the original stays AI and the paste stays Human).
+		// driftBudgetNorm is the same for the whitespace-normalized (autoformatter)
+		// fallback, keyed by content_sha_norm.
+		// recordedSHA/recordedNorm = the MOST copies of a content the AI had in
+		// any SINGLE edit (the max over edits, NOT the sum). Tools that re-save a
+		// whole file across a session record the same lines repeatedly — an
+		// Antigravity conversation may persist a file as both a 700-line and a
+		// 190-line version — and summing those would over-count how many copies
+		// the AI actually authored, letting a human's exact duplicate of an AI
+		// line drift-match as AI. The max reflects the AI's real production: if
+		// its busiest version had the line twice, it produced two copies, and a
+		// third copy in the commit is the human's.
+		recordedSHA := map[string]int{}
+		recordedNorm := map[string]int{}
+		for i := range sessionEdits {
+			e := &sessionEdits[i]
+			if e.TimestampNanos <= sinceNanos || e.TimestampNanos > maxNanos || isNonAITool(e.Tool) {
+				continue
+			}
+			perEditSHA := map[string]int{}
+			perEditNorm := map[string]int{}
+			for _, l := range e.Lines {
+				if l.ContentSHA != "" {
+					perEditSHA[l.ContentSHA]++
+				}
+				if l.ContentSHANorm != "" {
+					perEditNorm[l.ContentSHANorm]++
+				}
+			}
+			for k, v := range perEditSHA {
+				if v > recordedSHA[k] {
+					recordedSHA[k] = v
+				}
+			}
+			for k, v := range perEditNorm {
+				if v > recordedNorm[k] {
+					recordedNorm[k] = v
+				}
+			}
+		}
+		exactSHA := map[string]int{}  // committed lines matched at their exact recorded position
+		exactNorm := map[string]int{} // ditto, normalized
 		for _, ln := range lineNos {
 			content := lineContent[fileLineKey{file, ln}]
 			if content == "" {
@@ -589,20 +885,41 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			normWant := sha256HexNormStr(content)
 			for i := range sessionEdits {
 				e := &sessionEdits[i]
-				if e.TimestampNanos <= sinceNanos || e.TimestampNanos > maxNanos {
+				if e.TimestampNanos <= sinceNanos || e.TimestampNanos > maxNanos || isNonAITool(e.Tool) {
 					continue
 				}
-				if !claimedSHA[shaWant] && coversContentSHA(e.Lines, content, ln) {
-					claimedSHA[shaWant] = true
-				}
-				if normWant != "" && !claimedSHANorm[normWant] && coversContentSHANorm(e.Lines, content, ln) {
-					claimedSHANorm[normWant] = true
-				}
-				if claimedSHA[shaWant] && (normWant == "" || claimedSHANorm[normWant]) {
+				if coversContentSHA(e.Lines, content, ln) {
+					exactSHA[shaWant]++
 					break
 				}
 			}
+			if normWant != "" {
+				for i := range sessionEdits {
+					e := &sessionEdits[i]
+					if e.TimestampNanos <= sinceNanos || e.TimestampNanos > maxNanos || isNonAITool(e.Tool) {
+						continue
+					}
+					if coversContentSHANorm(e.Lines, content, ln) {
+						exactNorm[normWant]++
+						break
+					}
+				}
+			}
 		}
+		driftBudget := map[string]int{}
+		for sha, rec := range recordedSHA {
+			if b := rec - exactSHA[sha]; b > 0 {
+				driftBudget[sha] = b
+			}
+		}
+		driftBudgetNorm := map[string]int{}
+		for n, rec := range recordedNorm {
+			if b := rec - exactNorm[n]; b > 0 {
+				driftBudgetNorm[n] = b
+			}
+		}
+		driftUsed := map[string]int{}
+		driftUsedNorm := map[string]int{}
 
 		for _, ln := range lineNos {
 			// Default: human-typed code. tool="" + gen_type=human is the
@@ -613,23 +930,44 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			// (content_sha must be at this exact line), bounded by the previous
 			// commit (intra-session separator).
 			e := pickEdit(sessionEdits, ln, content, sinceNanos, maxNanos, true, false)
-			if e == nil && content != "" && !claimedSHA[sha256HexStr([]byte(content))] {
-				// Drift fallback: this session's content_sha at a DIFFERENT line —
-				// a human insertion/deletion shifted the AI block. Skipped when this
-				// content's true position is already accounted for elsewhere in this
-				// commit (claimedSHA), which means THIS line is a copy, not a drift.
-				e = pickEdit(sessionEdits, ln, content, sinceNanos, maxNanos, false, false)
+			// AI drift fallback, rationed by driftBudget. Fires when nothing matched
+			// OR only a human row matched (the AI is the real author of content it
+			// recorded — the human merely shifted the line). The budget means an AI
+			// line that drifted to a new position stays AI, including duplicated
+			// content (braces, blank-line gaps), while a human copy beyond what the
+			// AI produced stays Human.
+			if content != "" && (e == nil || isNonAITool(e.Tool)) {
+				shaKey := sha256HexStr([]byte(content))
+				if driftUsed[shaKey] < driftBudget[shaKey] {
+					if ai := pickEdit(sessionEdits, ln, content, sinceNanos, maxNanos, false, false); ai != nil && !isNonAITool(ai.Tool) {
+						e = ai
+						driftUsed[shaKey]++
+						// An exact-sha drift also consumes the line's NORMALIZED
+						// budget: the two drift budgets count the same AI
+						// recordings (every exact line has a norm), so without
+						// this a content the AI wrote once could be claimed twice —
+						// once here, once via the norm fallback below — letting a
+						// human's exact duplicate of an AI line read as AI.
+						driftUsedNorm[sha256HexNormStr(content)]++
+					}
+				}
 			}
 			if e == nil && content != "" {
 				// Normalized fallback: an autoformatter reflowed this line's
 				// whitespace (reindent, trailing-whitespace, tabs/spaces) after the
 				// AI wrote it, so its exact content_sha no longer matches but its
 				// whitespace-collapsed content_sha_norm still does. Try this line's
-				// own position first, then any line in this session (drift), guarded
-				// by claimedSHANorm exactly like the exact-hash drift fallback above.
+				// own position first, then a budgeted drift, mirroring the exact-hash
+				// fallback above.
 				e = pickEdit(sessionEdits, ln, content, sinceNanos, maxNanos, true, true)
-				if e == nil && !claimedSHANorm[sha256HexNormStr(content)] {
-					e = pickEdit(sessionEdits, ln, content, sinceNanos, maxNanos, false, true)
+				if e == nil {
+					normKey := sha256HexNormStr(content)
+					if driftUsedNorm[normKey] < driftBudgetNorm[normKey] {
+						if ai := pickEdit(sessionEdits, ln, content, sinceNanos, maxNanos, false, true); ai != nil && !isNonAITool(ai.Tool) {
+							e = ai
+							driftUsedNorm[normKey]++
+						}
+					}
 				}
 			}
 			if e != nil {
@@ -656,13 +994,14 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 	})
 
 	inheritBlankLineAttribution(resolved)
+	coalesceDuplicateBlocks(resolved)
 
 	note := &Note{
 		Schema:      2,
 		Commit:      sha,
 		BaseSHA:     baseSHA,
 		ByTool:      map[string]Tool{},
-		GeneratedBy: "blamely 0.1.0",
+		GeneratedBy: "blamely " + Version,
 	}
 
 	// Aggregate per-tool and build files/lines.
@@ -710,9 +1049,9 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			delLines = deleted[old]
 		}
 		if len(delLines) > 0 {
-			sessionEdits := sessionEditsByFile[curFileEntry.Path]
-			remSHA, remNorm := removedHashMultisets(sessionEdits)
-			curFileEntry.acc = append(curFileEntry.acc, attributeDeletedLines(delLines, sessionEdits, sinceNanos, maxNanos, remSHA, remNorm, &note.Totals, &note.ByGenType)...)
+			delEdits := deletionEditsForFile(curFileEntry.Path)
+			remSHA, remNorm := removedHashMultisets(delEdits)
+			curFileEntry.acc = append(curFileEntry.acc, attributeDeletedLines(delLines, delEdits, 0, maxNanos, remSHA, remNorm, &note.Totals, &note.ByGenType)...)
 		}
 		curFileEntry.Deleted = len(delLines)
 		note.Totals.DeletedLines += curFileEntry.Deleted
@@ -816,12 +1155,9 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			kind = FileDeleted
 		}
 		fe := FileEntry{Path: path, Type: string(kind), Deleted: len(delLines)}
-		sessionEdits, err := editsForFile(path)
-		if err != nil {
-			return nil, err
-		}
-		remSHA, remNorm := removedHashMultisets(sessionEdits)
-		acc := attributeDeletedLines(delLines, sessionEdits, sinceNanos, maxNanos, remSHA, remNorm, &note.Totals, &note.ByGenType)
+		delEdits := deletionEditsForFile(path)
+		remSHA, remNorm := removedHashMultisets(delEdits)
+		acc := attributeDeletedLines(delLines, delEdits, 0, maxNanos, remSHA, remNorm, &note.Totals, &note.ByGenType)
 		fe.Lines = collapseToRanges(acc)
 		note.Files = append(note.Files, fe)
 		note.Totals.DeletedLines += fe.Deleted
@@ -884,6 +1220,27 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		}
 		note.ByTool[string(tool)] = t
 	}
+
+	// Fold per-tool DELETED line counts into by_tool from the resolved per-line
+	// delete ranges. by_tool above is built only from ADDED lines, so without
+	// this a deletion-only commit — or the deletion side of a mixed one — leaves
+	// by_tool empty even though an AI tool removed the code (the gutter/leaderboard
+	// would then show no contributor). Each AI delete range credits its tool's
+	// DeletedLines and backfills the tool's model when it has none yet.
+	for i := range note.Files {
+		for _, r := range note.Files[i].Lines {
+			if r.Type != "delete" || r.AuthorType != "AI" || r.Tool == "" {
+				continue
+			}
+			tl := note.ByTool[r.Tool]
+			tl.DeletedLines += r.NumLines()
+			if tl.Model == nil && r.Model != nil && *r.Model != "" {
+				tl.Model = r.Model
+			}
+			note.ByTool[r.Tool] = tl
+		}
+	}
+
 	note.Totals.Files = fileCount
 	if hasTotalTokens {
 		tk := totalTokens
@@ -916,6 +1273,12 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 	// Deleted lines were already bucketed into by_gen_type per-line above
 	// (attributeDeletedLine), using the matched AI edit's gen_type for
 	// AI-attributed deletions and "human" otherwise.
+
+	// Derive the totals from the working counters. AILines / HumanLines are
+	// added-line counts; DeletedLines is the total, so the human share is
+	// whatever wasn't matched to an AI deletion.
+	note.Totals.AddedLines = note.Totals.AILines + note.Totals.HumanLines
+	note.Totals.HumanDeletedLines = note.Totals.DeletedLines - note.Totals.AIDeletedLines
 
 	return note, nil
 }
@@ -1141,6 +1504,18 @@ func bumpGenType(by *ByGenType, gt store.GenType) {
 // (edits without a content_sha at all) are already covered by the non-norm
 // primary call, so re-checking them here would just duplicate that result.
 func pickEdit(edits []store.Edit, ln int, content string, minNanos, maxNanos int64, allowLineMatch, useNorm bool) *store.Edit {
+	// When a human edit and an AI edit both match a line by IDENTICAL content_sha,
+	// the AI authored that text — the human only shifted it (e.g. inserting lines
+	// above an AI block pushes it down, and the human-edit watcher re-records the
+	// moved lines at their new positions under a newer human row). Without this
+	// preference the newer human row, encountered first in time-desc order, would
+	// steal those lines and flip AI→Human in the committed note even though the
+	// gutter (which resolves live against the AI edit's sha) shows them correctly.
+	// So: take the first AI/tool match immediately; remember the first human match
+	// only as a fallback for lines no AI edit matches. A genuine human OVERRIDE is
+	// unaffected — there the human changes the line, so its content_sha differs
+	// from the AI's and no AI edit matches at all.
+	var humanFallback *store.Edit
 	for i := range edits {
 		e := &edits[i]
 		if e.TimestampNanos <= minNanos || e.TimestampNanos > maxNanos {
@@ -1154,17 +1529,24 @@ func pickEdit(edits []store.Edit, ln int, content string, minNanos, maxNanos int
 		if allowLineMatch {
 			shaLn = ln
 		}
+		var matched bool
 		if useNorm {
-			if coversContentSHANorm(e.Lines, content, shaLn) {
-				return e
+			matched = coversContentSHANorm(e.Lines, content, shaLn)
+		} else {
+			matched = coversContentSHA(e.Lines, content, shaLn) || (allowLineMatch && coversLine(e.Lines, ln))
+		}
+		if !matched {
+			continue
+		}
+		if isNonAITool(e.Tool) {
+			if humanFallback == nil {
+				humanFallback = e
 			}
 			continue
 		}
-		if coversContentSHA(e.Lines, content, shaLn) || (allowLineMatch && coversLine(e.Lines, ln)) {
-			return e
-		}
+		return e
 	}
-	return nil
+	return humanFallback
 }
 
 // coversLine reports whether any edit line covers post-image line n BY POSITION.

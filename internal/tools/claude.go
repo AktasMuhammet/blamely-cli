@@ -64,6 +64,36 @@ type multiEditInput struct {
 	} `json:"edits"`
 }
 
+// deletePathFromInput pulls the target path out of a Cursor `Delete` tool's
+// input, accepting either `path` (Cursor's field) or `file_path` (the
+// Claude-shaped alias) so the parser is tolerant of version drift.
+func deletePathFromInput(raw json.RawMessage) string {
+	var in struct {
+		Path     string `json:"path"`
+		FilePath string `json:"file_path"`
+	}
+	if json.Unmarshal(raw, &in) != nil {
+		return ""
+	}
+	if in.Path != "" {
+		return in.Path
+	}
+	return in.FilePath
+}
+
+// cursorGenType resolves a Cursor edit/delete's generation type: an explicit
+// gen_type if the payload carries one, "completion" for a Tab accept (no
+// conversation context), otherwise a Composer/chat edit.
+func cursorGenType(p claudeHookPayload) string {
+	if p.GenType != "" {
+		return p.GenType
+	}
+	if p.SessionID == "" && p.ConversationID == "" {
+		return "completion"
+	}
+	return "chat"
+}
+
 // RecordClaudeFromStdin handles the PostToolUse hook payload sent by both
 // Claude Code AND Cursor — they share the same hooks framework. The payload
 // is distinguished by the presence of `cursor_version`: Cursor payloads
@@ -105,18 +135,35 @@ func RecordClaudeFromStdin(r io.Reader) error {
 		return err
 	}
 	if filePath == "" {
+		// Cursor deletes a file with a dedicated `Delete` tool (payload: a bare
+		// `path`/`file_path`), and runs shell via `Shell`. Neither produces an
+		// edit range, so without this an AI-deleted file falls through to Human
+		// at commit time. Handle both so Cursor deletions are credited to it.
+		if isCursor {
+			switch p.ToolName {
+			case "Delete":
+				if path := deletePathFromInput(p.ToolInput); path != "" {
+					return recordToolDeletionPath(path, p.Cwd, "cursor", cursorGenType(p), p.Model, p.SessionID, p.TranscriptPath, "cursor_delete")
+				}
+			case "Shell":
+				if root := findRepoRoot(p.Cwd, p.Cwd); root != "" {
+					return recordShellDeletions(root, shellCommandFromInput(p.ToolInput), "cursor", cursorGenType(p), p.Model, p.SessionID, p.TranscriptPath, "cursor_shell_delete")
+				}
+			}
+			return nil
+		}
 		// No file-edit tool produced a path. A Bash command, however, may have
 		// created or modified files directly (e.g. `printf > f`, `cat > f`,
 		// heredocs, a script) — bypassing Write/Edit entirely. We can't parse
 		// arbitrary shell (paths are often dynamic, e.g. `> "$fname"`), so we
 		// ask git which source files in the repo just changed and attribute
 		// those. Claude only (Cursor Tab has no Bash tool).
-		if !isCursor && p.ToolName == "Bash" {
+		if p.ToolName == "Bash" {
 			gt := ReadTranscriptGenType(p.TranscriptPath)
 			if gt == "" {
 				gt = "chat"
 			}
-			return recordClaudeBashWrites(p.Cwd, p.SessionID, p.TranscriptPath, gt)
+			return recordClaudeBashWrites(p.Cwd, p.SessionID, p.TranscriptPath, gt, shellCommandFromInput(p.ToolInput))
 		}
 		return nil
 	}
@@ -214,7 +261,7 @@ const (
 // never appear. Each changed source file is recorded as a medium-confidence
 // claude edit covering the whole file, matching how a Write is stored, so the
 // existing commit-time attribution credits it without any further changes.
-func recordClaudeBashWrites(cwd, sessionID, transcriptPath, genType string) error {
+func recordClaudeBashWrites(cwd, sessionID, transcriptPath, genType, command string) error {
 	if cwd == "" {
 		return nil
 	}
@@ -222,6 +269,15 @@ func recordClaudeBashWrites(cwd, sessionID, transcriptPath, genType string) erro
 	if !ok {
 		return nil
 	}
+
+	// File deletions the command performed (e.g. `rm foo.html`), scoped to the
+	// command's actual rm/del targets so a file the USER deleted by hand isn't
+	// swept in. Done first (and unconditionally) so a command that ONLY deletes
+	// — leaving recentlyChangedFiles empty — still records its removals.
+	if err := recordShellDeletions(root, command, "claude", genType, "", sessionID, transcriptPath, "claude_bash_delete"); err != nil {
+		return err
+	}
+
 	files := recentlyChangedFiles(root, bashWriteWindow)
 	// none → read-only command (ls/grep/test); too many → bulk op we won't guess.
 	if len(files) == 0 || len(files) > maxBashWriteFiles {
@@ -260,6 +316,165 @@ func recordClaudeBashWrites(cwd, sessionID, transcriptPath, genType string) erro
 		}
 	}
 	return nil
+}
+
+// gitDeletedFiles returns repo-relative source-file paths git reports as
+// deleted in the working tree (a 'D' in either status column). The files are
+// gone from disk, so their content must come from HEAD.
+func gitDeletedFiles(root string) []string {
+	out, err := exec.Command("git", "-C", root, "status", "--porcelain", "--untracked-files=no").Output()
+	if err != nil {
+		return nil
+	}
+	var files []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if len(line) < 4 {
+			continue
+		}
+		if line[0] != 'D' && line[1] != 'D' {
+			continue
+		}
+		path := strings.TrimSpace(line[3:])
+		if i := strings.Index(path, " -> "); i >= 0 {
+			path = path[i+len(" -> "):]
+		}
+		path = strings.Trim(path, `"`)
+		if path != "" && looksLikeSourceFile(path) {
+			files = append(files, path)
+		}
+	}
+	return files
+}
+
+// headFileRemovedHashes fingerprints every non-blank line of rel as it exists
+// at HEAD — the removed-line content hashes for a deleted file, so commit-time
+// attribution can credit the AI that deleted it.
+func headFileRemovedHashes(root, rel string) []DeletedLineHash {
+	out, err := exec.Command("git", "-C", root, "show", "HEAD:"+filepath.ToSlash(rel)).Output()
+	if err != nil {
+		return nil
+	}
+	return RemovedLineHashes(string(out), "")
+}
+
+// recordHeadDeletion records that `tool` removed the repo-relative file `rel`
+// (gone from the working tree but still present at HEAD). It fingerprints the
+// file's HEAD content as removed lines and posts an edit carrying only those
+// hashes, so commit-time attribution credits `tool` for the deletion — the
+// same machinery that already handles a Claude `rm`. It is a no-op when the
+// file isn't at HEAD (nothing to fingerprint), so a file the AI both created
+// and deleted before any commit is never recorded (it never reaches a diff).
+//
+// Deletion edits carry no token usage: the session's tokens already land on the
+// tool's add/edit rows, so attaching them here too would double-count. `model`
+// is set only when the caller knows it (e.g. Cursor's payload carries one).
+func recordHeadDeletion(root, rel, tool, genType, model, sessionID, transcriptPath, source string) error {
+	payload, ok := buildHeadDeletionPayload(root, rel, tool, genType, model, sessionID, transcriptPath, source)
+	if !ok {
+		return nil
+	}
+	return postToDaemon(payload)
+}
+
+// buildHeadDeletionPayload assembles the daemon edit for a deleted file by
+// fingerprinting its HEAD content as removed lines. Returns ok=false when the
+// file isn't at HEAD (nothing to fingerprint). Separated from recordHeadDeletion
+// so the payload can be asserted in tests without a running daemon.
+func buildHeadDeletionPayload(root, rel, tool, genType, model, sessionID, transcriptPath, source string) (daemon.EditPayload, bool) {
+	removed := headFileRemovedHashes(root, rel)
+	if len(removed) == 0 {
+		return daemon.EditPayload{}, false
+	}
+	repoID, _ := gitutil.RepoID(resolveSymlinks(root))
+	if repoID == "" {
+		repoID = root
+	}
+	payload := daemon.EditPayload{
+		Tool:           tool,
+		Confidence:     "high",
+		GenType:        genType,
+		RepoPath:       repoID,
+		FilePath:       rel,
+		SuggestedLines: int64(len(removed)),
+		RemovedLines:   toDaemonRemovedLines(removed),
+		RawMeta: fmt.Sprintf(`{"session_id":%q,"tool":%q,"source":%q,"transcript_path":%q}`,
+			sessionID, tool, source, transcriptPath),
+	}
+	if model != "" {
+		payload.Model = model
+	}
+	return payload, true
+}
+
+// recordToolDeletionPath records `tool`'s deletion of a specific absolute file
+// path. The file is already gone from disk, so the repo root is resolved from
+// its still-existing parent directory (falling back to cwd) and the path is
+// rebuilt in the root's symlink-space for a clean repo-relative name. Used by
+// the tools that name the deleted file explicitly (Cursor's `Delete`, Codex's
+// `*** Delete File:`), so attribution is scoped to exactly that file rather
+// than every deletion in the working tree.
+func recordToolDeletionPath(absPath, cwd, tool, genType, model, sessionID, transcriptPath, source string) error {
+	if absPath == "" {
+		return nil
+	}
+	root := findRepoRoot(absPath, cwd)
+	if root == "" {
+		return nil
+	}
+	dir := filepath.Dir(absPath)
+	if rd, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = rd
+	}
+	rootResolved := root
+	if rr, err := filepath.EvalSymlinks(root); err == nil {
+		rootResolved = rr
+	}
+	rel, err := filepath.Rel(rootResolved, filepath.Join(dir, filepath.Base(absPath)))
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return nil
+	}
+	return recordHeadDeletion(root, rel, tool, genType, model, sessionID, transcriptPath, source)
+}
+
+// recordShellDeletions credits a tool for the files a shell command actually
+// removed. It intersects git's deleted-file list with the rm/del targets parsed
+// from `command` (via shellDeleteTargets), so a file the USER deleted by hand
+// around the same time is NOT mis-credited to the AI just because it happens to
+// be gone from the working tree. Used after a shell command an AI ran (Claude
+// `Bash`, Cursor `Shell`, Gemini `run_shell_command`, Copilot `run_in_terminal`)
+// where the deletion isn't a structured per-file op. When the command can't be
+// parsed for delete targets (dynamic paths, scripts), nothing is recorded —
+// under-attributing is safer than stealing credit for a human's deletion.
+func recordShellDeletions(root, command, tool, genType, model, sessionID, transcriptPath, source string) error {
+	targets := shellDeleteTargets(command)
+	if len(targets) == 0 {
+		return nil
+	}
+	for _, rel := range gitDeletedFiles(root) {
+		if !MatchesFileOp(rel, targets) {
+			continue
+		}
+		if err := recordHeadDeletion(root, rel, tool, genType, model, sessionID, transcriptPath, source); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// shellCommandFromInput pulls the shell command out of a tool's hook input,
+// accepting both `command` (Bash/Cursor Shell/Gemini/Copilot) and `cmd`.
+func shellCommandFromInput(raw json.RawMessage) string {
+	var in struct {
+		Command string `json:"command"`
+		Cmd     string `json:"cmd"`
+	}
+	if json.Unmarshal(raw, &in) != nil {
+		return ""
+	}
+	if in.Command != "" {
+		return in.Command
+	}
+	return in.Cmd
 }
 
 // perLineShaRanges returns one range per non-blank line of the file, each
@@ -515,7 +730,9 @@ func int64Ptr(v int64) *int64 { return &v }
 
 // cursorTranscriptPath derives the Cursor agent-transcript JSONL path for a
 // given project working directory and session UUID. Cursor stores transcripts at:
-//   ~/.cursor/projects/<cwd-encoded>/agent-transcripts/<uuid>/<uuid>.jsonl
+//
+//	~/.cursor/projects/<cwd-encoded>/agent-transcripts/<uuid>/<uuid>.jsonl
+//
 // where <cwd-encoded> is the cwd with leading slash removed and / replaced by -.
 // Returns "" if the file doesn't exist yet (e.g. session hasn't been written).
 func cursorTranscriptPath(cwd, sessionID string) string {
@@ -534,7 +751,9 @@ func cursorTranscriptPath(cwd, sessionID string) string {
 
 // claudeTranscriptPath derives the Claude CLI/Code transcript JSONL path for a
 // given project working directory and session UUID. Claude stores transcripts at:
-//   ~/.claude/projects/<cwd-encoded>/<session-id>.jsonl
+//
+//	~/.claude/projects/<cwd-encoded>/<session-id>.jsonl
+//
 // where <cwd-encoded> replaces ALL slashes (including the leading /) with -.
 // Returns "" if the file doesn't exist.
 func claudeTranscriptPath(cwd, sessionID string) string {

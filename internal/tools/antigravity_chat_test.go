@@ -292,3 +292,193 @@ func TestAntigravityGeminiWatcher_ResolvesModelFromConversationDB(t *testing.T) 
 		t.Errorf("model = %q, want gemini-3.5-flash-low", got)
 	}
 }
+
+func TestAntigravityModelNameRe(t *testing.T) {
+	match := []string{"gemini-3-flash", "gemini-3.5-flash-low", "claude-sonnet-4-6",
+		"claude-opus-4-8", "gpt-4o", "gpt-5", "gpt-4.1", "o3-mini", "o1-preview"}
+	for _, s := range match {
+		if !antigravityModelNameRe.MatchString(s) {
+			t.Errorf("expected %q to match", s)
+		}
+	}
+	noMatch := []string{"gemini-test", "used_claude_conservative", "claude_conservative",
+		"model", "registration", "gpt", "ogre"}
+	for _, s := range noMatch {
+		if antigravityModelNameRe.MatchString(s) {
+			t.Errorf("expected %q NOT to match", s)
+		}
+	}
+}
+
+// TestScanProtobufModelString_NonGemini reproduces the reported bug: an
+// Antigravity conversation running Claude (claude-sonnet-4-6) — its model name
+// must be recovered from the length-delimited protobuf field, not skipped just
+// because it isn't a gemini-* id.
+func TestScanProtobufModelString_NonGemini(t *testing.T) {
+	model := "claude-sonnet-4-6"
+	// protobuf string field: a length byte equal to len(model), then the bytes.
+	blob := append([]byte{0x0a, byte(len(model))}, []byte(model)...)
+	blob = append(blob, 0x10, 0x01) // trailing unrelated field
+	if got := scanProtobufModelString(blob); got != model {
+		t.Errorf("scanProtobufModelString = %q, want %q", got, model)
+	}
+}
+
+func TestUnquoteAntigravityArg(t *testing.T) {
+	cases := map[string]string{
+		`"rm register.html"`: "rm register.html", // JSON-quoted
+		`rm x.html`:          "rm x.html",        // already bare
+		`""`:                 "",
+		``:                   "",
+	}
+	for in, want := range cases {
+		if got := unquoteAntigravityArg(in); got != want {
+			t.Errorf("unquoteAntigravityArg(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestIsAntigravityShellTool(t *testing.T) {
+	for _, n := range []string{"run_command", "Run_Command", "execute_command", "shell"} {
+		if !isAntigravityShellTool(n) {
+			t.Errorf("%q should be a shell tool", n)
+		}
+	}
+	for _, n := range []string{"replace_file_content", "view_file", "create_file"} {
+		if isAntigravityShellTool(n) {
+			t.Errorf("%q should NOT be a shell tool", n)
+		}
+	}
+}
+
+// TestAntigravityRunCommandDeletion reproduces the reported case: Antigravity
+// deletes a file by shelling out (`run_command` → `rm register.html`). The
+// removal must be fingerprinted from HEAD and recorded as a gemini deletion.
+func TestAntigravityRunCommandDeletion(t *testing.T) {
+	root := initRepoWithFile(t, "register.html", "a\nb\nc\n") // committed then removed
+	raw, _ := json.Marshal(map[string]any{
+		"step_index": 5, "source": "MODEL", "type": "PLANNER_RESPONSE",
+		"created_at": "2026-06-14T06:12:10Z",
+		"tool_calls": []any{map[string]any{
+			"name": "run_command",
+			"args": map[string]any{"CommandLine": `"rm register.html"`, "Cwd": `"` + root + `"`},
+		}},
+	})
+	var step transcriptStep
+	if err := json.Unmarshal(raw, &step); err != nil {
+		t.Fatal(err)
+	}
+	w := &antigravityTranscriptWatcher{}
+	sink := &captureSink{}
+	st := &transcriptFileState{seen: map[int]bool{}, createdFromContent: map[string]bool{}}
+	w.handleToolCalls("/fake/transcript.jsonl", step, st, sink)
+
+	if len(sink.events) != 1 {
+		t.Fatalf("want 1 deletion event, got %d", len(sink.events))
+	}
+	ev := sink.events[0]
+	if ev.Tool != string(store.ToolGemini) || ev.FilePath != "register.html" {
+		t.Errorf("tool/file = %q/%q, want gemini/register.html", ev.Tool, ev.FilePath)
+	}
+	if len(ev.RemovedLines) != 3 {
+		t.Errorf("RemovedLines = %d, want 3", len(ev.RemovedLines))
+	}
+	if len(ev.Lines) != 0 {
+		t.Errorf("a deletion must record no added Lines, got %d", len(ev.Lines))
+	}
+}
+
+// TestAntigravityWriteUsesToolCallContent reproduces the "swapping" bug: the AI
+// created a file via write_to_file (CodeContent), then a human pasted a
+// duplicate. The recording must use the tool-call's AI content (one copy), NOT
+// the on-disk file (which already has the human's paste). It also marks the path
+// so the paired "Created file" CODE_ACTION skips its disk read.
+func TestAntigravityWriteUsesToolCallContent(t *testing.T) {
+	root := t.TempDir()
+	if out, err := exec.Command("git", "-C", root, "init").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	abs := filepath.Join(root, "index.html")
+	// disk has the human's DUPLICATE (block twice); the AI only wrote it once.
+	disk := "<div>a</div>\n<div>a</div>\n"
+	if err := os.WriteFile(abs, []byte(disk), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	aiContent := "<div>a</div>\n" // the AI's actual single-copy content
+
+	raw, _ := json.Marshal(map[string]any{
+		"step_index": 38, "source": "MODEL", "type": "PLANNER_RESPONSE",
+		"created_at": "2026-06-14T07:22:48Z",
+		"tool_calls": []any{map[string]any{
+			"name": "write_to_file",
+			"args": map[string]any{"TargetFile": abs, "CodeContent": aiContent},
+		}},
+	})
+	var step transcriptStep
+	if err := json.Unmarshal(raw, &step); err != nil {
+		t.Fatal(err)
+	}
+	w := &antigravityTranscriptWatcher{}
+	sink := &captureSink{}
+	st := &transcriptFileState{seen: map[int]bool{}, createdFromContent: map[string]bool{}}
+	w.handleToolCalls("/fake/t.jsonl", step, st, sink)
+
+	if len(sink.events) != 1 {
+		t.Fatalf("want 1 write event, got %d", len(sink.events))
+	}
+	ev := sink.events[0]
+	if ev.Tool != string(store.ToolGemini) || ev.FilePath != "index.html" {
+		t.Errorf("tool/file = %q/%q", ev.Tool, ev.FilePath)
+	}
+	// AI content has ONE line, not the two on disk — proving disk wasn't read.
+	if len(ev.Lines) != 1 {
+		t.Errorf("recorded %d lines, want 1 (the AI's content, not the 2-line disk)", len(ev.Lines))
+	}
+	absResolved := abs
+	if r, err := filepath.EvalSymlinks(abs); err == nil {
+		absResolved = r
+	}
+	if !st.createdFromContent[absResolved] {
+		t.Error("path should be marked so the CODE_ACTION skips its disk read")
+	}
+}
+
+func TestIsTruncatedAntigravityContent(t *testing.T) {
+	if !isTruncatedAntigravityContent("<html>...\n<truncated 18465 bytes>") {
+		t.Error("should detect the truncation marker")
+	}
+	if isTruncatedAntigravityContent("<html>\n<body></body>\n</html>\n") {
+		t.Error("complete content must not look truncated")
+	}
+}
+
+// TestAntigravityWrite_TruncatedFallsBackToDisk verifies the regression fix: a
+// truncated CodeContent records NOTHING and leaves the path unmarked, so the
+// paired "Created file" CODE_ACTION still reads the full file from disk.
+func TestAntigravityWrite_TruncatedFallsBackToDisk(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, "patient-register.html")
+	raw, _ := json.Marshal(map[string]any{
+		"step_index": 53, "source": "MODEL", "type": "PLANNER_RESPONSE",
+		"created_at": "2026-06-14T07:47:16Z",
+		"tool_calls": []any{map[string]any{
+			"name": "write_to_file",
+			"args": map[string]any{"TargetFile": abs, "CodeContent": "<div>a</div>\n<truncated 18465 bytes>"},
+		}},
+	})
+	var step transcriptStep
+	if err := json.Unmarshal(raw, &step); err != nil {
+		t.Fatal(err)
+	}
+	w := &antigravityTranscriptWatcher{}
+	sink := &captureSink{}
+	st := &transcriptFileState{seen: map[int]bool{}, createdFromContent: map[string]bool{}}
+	w.handleToolCalls("/fake/t.jsonl", step, st, sink)
+
+	if len(sink.events) != 0 {
+		t.Errorf("truncated content must record nothing, got %d events", len(sink.events))
+	}
+	if len(st.createdFromContent) != 0 {
+		t.Errorf("path must NOT be marked (so CODE_ACTION reads disk), got %v", st.createdFromContent)
+	}
+}

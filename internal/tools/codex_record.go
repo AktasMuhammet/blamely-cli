@@ -34,8 +34,32 @@ func RecordCodexFromStdin(r io.Reader) error {
 		return nil
 	}
 
+	// A single apply_patch can add/update some files and DELETE others. The
+	// `*** Delete File:` directives produce no edit range, so handle them up
+	// front — independent of whether the patch also has an add/update primary
+	// path — otherwise an AI-deleted file falls through to Human at commit time.
+	deletedViaPatch := parsePatchDeletedFiles(p.ToolInput)
+	for _, dp := range deletedViaPatch {
+		abs := dp
+		if !filepath.IsAbs(abs) && p.Cwd != "" {
+			abs = filepath.Join(p.Cwd, dp)
+		}
+		if err := recordToolDeletionPath(abs, p.Cwd, "codex", "cli", p.Model, p.SessionID, p.TranscriptPath, "codex_delete"); err != nil {
+			return err
+		}
+	}
+
 	filePath, ranges, suggested, removed, newFullContent := extractCodexHookRanges(p)
 	if filePath == "" {
+		// No edit range and no structured delete directive — but Codex also
+		// deletes via a shell `rm`. Fingerprint whatever git now reports as
+		// deleted and credit it to codex. Skipped when the patch already named
+		// its deletions above (avoids recording the same removal twice).
+		if len(deletedViaPatch) == 0 && looksLikePatch(strings.ToLower(p.ToolName)) {
+			if root := findRepoRoot(p.Cwd, p.Cwd); root != "" {
+				return recordShellDeletions(root, shellCommandFromInput(p.ToolInput), "codex", "cli", p.Model, p.SessionID, p.TranscriptPath, "codex_shell_delete")
+			}
+		}
 		return nil
 	}
 

@@ -54,8 +54,13 @@ func RenderStats(sha string) error {
 	}
 	sessionNanos := db.SessionDurationNanos(repoID, commitNanos)
 
-	w := os.Stdout
-	renderStats(w, &note, meta, sessionNanos)
+	// stats is the dashboard "head" — the same cards as `report` but without the
+	// per-file range detail. Fall back to the live session duration for older
+	// notes that didn't bake in coding time.
+	if note.CodingTimeNanos == 0 {
+		note.CodingTimeNanos = sessionNanos
+	}
+	renderDashboard(os.Stdout, &note, meta, false)
 	return nil
 }
 
@@ -91,113 +96,173 @@ func renderStats(w io.Writer, note *gitnotes.Note, meta commitMeta_, sessionNano
 	author := meta["author"]
 	dateStr := meta["date"]
 
-	// Header
-	ago := ""
+	// Title bar + commit identity block.
+	titleBar(w, "stats", sha)
+	if subject != "" {
+		fmt.Fprintf(w, "\n%s%s\n", gutter, bold("\""+subject+"\""))
+	}
+	metaRow(w, "author", author)
+	when := ""
 	if t, err := time.Parse("2006-01-02 15:04:05 -0700", dateStr); err == nil {
-		ago = fmt.Sprintf("  (%s)", humanDuration(time.Since(t)))
+		when = sep(t.Format("2006-01-02 15:04"), humanDuration(time.Since(t)))
 	}
-	fmt.Fprintf(w, "%s %s  %q%s\n", bold("commit"), dim(sha), subject, dim(ago))
-	if author != "" {
-		fmt.Fprintf(w, "  %s\n", dim("author: "+author))
-	}
-	if note.Branch != "" {
-		fmt.Fprintf(w, "  %s\n", dim("branch: "+note.Branch))
-	}
-	fmt.Fprintln(w)
+	metaRow(w, "branch", sep(note.Branch, when))
+	metaRow(w, "date", whenOnly(note, when))
 
-	// Changes
-	net := note.Totals.AILines + note.Totals.HumanLines - note.Totals.DeletedLines
-	fmt.Fprintf(w, "%s\n", bold("Changes:"))
-	fmt.Fprintf(w, "  %s  %s\n",
-		green(fmt.Sprintf("+%-4d added", note.Totals.AILines+note.Totals.HumanLines)),
-		dim(fmt.Sprintf("(AI %d · human %d)", note.Totals.AILines, note.Totals.HumanLines)))
-	if note.Totals.DeletedLines > 0 {
-		fmt.Fprintf(w, "  %s\n", red(fmt.Sprintf("-%-4d deleted", note.Totals.DeletedLines)))
+	// Changes — added and deleted, each split by author (AI vs Human). Computed
+	// from the always-present counters so the split is correct for older notes
+	// too (which predate the ai_added/human_deleted fields).
+	aiAdded, humanAdded := note.Totals.AILines, note.Totals.HumanLines
+	aiDeleted := note.Totals.AIDeletedLines
+	humanDeleted := note.Totals.DeletedLines - aiDeleted
+	added := aiAdded + humanAdded
+	deleted := note.Totals.DeletedLines
+	net := added - deleted
+	sectionHead(w, "Changes")
+	fmt.Fprintf(w, "%s  %s   %s\n", gutter,
+		green(fmt.Sprintf("+%-4d", added)),
+		dim(fmt.Sprintf("added    ·  AI %d · Human %d", aiAdded, humanAdded)))
+	if deleted > 0 {
+		fmt.Fprintf(w, "%s  %s   %s\n", gutter,
+			red(fmt.Sprintf("-%-4d", deleted)),
+			dim(fmt.Sprintf("deleted  ·  AI %d · Human %d", aiDeleted, humanDeleted)))
 	}
-	fmt.Fprintf(w, "  ─────────\n")
-	fmt.Fprintf(w, "  %s net\n", bold(fmt.Sprintf("%-5d", net)))
-	fmt.Fprintln(w)
+	fmt.Fprintf(w, "%s  %s\n", gutter, dim("─────"))
+	fmt.Fprintf(w, "%s  %s   %s\n", gutter, bold(fmt.Sprintf("%-4d", net)), dim("net"))
 
-	// AI attribution
+	// Attribution — one block per contributing AI tool.
 	if note.Totals.AILines > 0 {
-		fmt.Fprintf(w, "%s\n", bold("AI attribution:"))
+		sectionHead(w, "Attribution")
 		for _, name := range []string{"claude", "cursor", "codex", "copilot", "gemini"} {
 			t, ok := note.ByTool[name]
 			if !ok || t.Lines == 0 {
 				continue
 			}
-			modelStr := ""
-			if t.Model != nil && *t.Model != "" {
-				modelStr = "  " + dim(*t.Model)
-			}
-			tokStr := ""
-			if t.Tokens != nil {
-				tokStr = fmt.Sprintf("  %s", dim(fmt.Sprintf("in=%s out=%s cache=%s",
-					formatK(t.Tokens.Input), formatK(t.Tokens.Output), formatK(t.Tokens.CacheRead))))
-			}
-			acceptStr := ""
-			if t.SuggestedLines > 0 {
-				acceptStr = "  " + dim(fmt.Sprintf("suggested=%d accepted=%d", t.SuggestedLines, t.AcceptedLines))
-			}
 			genType := toolGenType(note, name)
 			if genType == "" {
-				// Fall back to the per-tool heuristic for tools that don't
-				// emit gen_type yet (e.g. legacy edits without per-line tags).
 				genType = legacyToolGenType(name)
 			}
-			fmt.Fprintf(w, "  %-10s %4d lines  %-12s%s%s%s\n",
-				name, t.Lines, dim(genType), modelStr, tokStr, acceptStr)
+			model := ""
+			if t.Model != nil {
+				model = *t.Model
+			}
+			head := fmt.Sprintf("%s   %s",
+				green(fmt.Sprintf("%-9s", name)),
+				dim(fmt.Sprintf("%d lines", t.Lines)))
+			fmt.Fprintf(w, "%s  %s   %s\n", gutter, head, sep(genType, model))
+			if t.Tokens != nil {
+				fmt.Fprintf(w, "%s  %s\n", gutter+"           ", dim(fmt.Sprintf("tokens   in %s · out %s · cache %s",
+					formatK(t.Tokens.Input), formatK(t.Tokens.Output), formatK(t.Tokens.CacheRead))))
+			}
+			if t.SuggestedLines > 0 {
+				pct := int64(t.AcceptedLines) * 100 / t.SuggestedLines
+				fmt.Fprintf(w, "%s  %s\n", gutter+"           ", dim(fmt.Sprintf("accepted %d%%   (%d suggested %s %d kept)",
+					pct, t.SuggestedLines, glyphArr, t.AcceptedLines)))
+			}
 		}
-		fmt.Fprintln(w)
 	}
 
-	// Generation type
+	// Generation — proportional mini-bars across the four modes.
 	g := note.ByGenType
-	if g.Chat+g.CLI+g.Completion > 0 {
-		fmt.Fprintf(w, "%s\n", bold("Generation:"))
-		if g.Chat > 0 {
-			fmt.Fprintf(w, "  chat        %4d lines\n", g.Chat)
-		}
-		if g.CLI > 0 {
-			fmt.Fprintf(w, "  cli         %4d lines\n", g.CLI)
-		}
-		if g.Completion > 0 {
-			fmt.Fprintf(w, "  completion  %4d lines\n", g.Completion)
-		}
-		fmt.Fprintln(w)
+	if g.Chat+g.CLI+g.Completion+g.Human > 0 {
+		sectionHead(w, "Generation")
+		renderGenRows(w, g)
 	}
 
-	// Files
+	// Files — per-file +/- and the tool breakdown.
 	if len(note.Files) > 0 {
-		fmt.Fprintf(w, "%s\n", bold("Files:"))
+		sectionHead(w, "Files")
+		nameW := 0
 		for _, f := range note.Files {
-			toolBreakdown := fileToolBreakdown(f)
-			fmt.Fprintf(w, "  %-32s %s%s  %s\n",
-				f.Path,
-				green(fmt.Sprintf("+%-3d", f.Added)),
-				red(fmt.Sprintf("-%-3d", f.Deleted)),
-				dim(toolBreakdown))
+			if len(f.Path) > nameW {
+				nameW = len(f.Path)
+			}
 		}
-		fmt.Fprintln(w)
+		if nameW > 44 {
+			nameW = 44
+		}
+		for _, f := range note.Files {
+			fmt.Fprintf(w, "%s  %-*s  %s %s   %s\n", gutter, nameW, f.Path,
+				green(fmt.Sprintf("+%-4d", f.Added)),
+				red(fmt.Sprintf("-%-4d", f.Deleted)),
+				dim(fileToolBreakdown(f)))
+		}
 	}
 
-	// Tokens total
+	// Tokens + coding-time one-liners.
+	if note.Totals.Tokens != nil || codingNanos(note, sessionNanos) > 0 {
+		fmt.Fprintln(w)
+	}
 	if note.Totals.Tokens != nil {
 		t := note.Totals.Tokens
-		fmt.Fprintf(w, "%s  in=%s  out=%s  cache_read=%s  cache_write=%s\n",
-			bold("Tokens:"),
-			formatK(t.Input), formatK(t.Output), formatK(t.CacheRead), formatK(t.CacheWrite))
+		inlineMeta(w, "Tokens", dim(fmt.Sprintf("in %s · out %s · cache_read %s · cache_write %s",
+			formatK(t.Input), formatK(t.Output), formatK(t.CacheRead), formatK(t.CacheWrite))))
 	}
+	if c := codingNanos(note, sessionNanos); c > 0 {
+		mins := c / int64(time.Minute)
+		inlineMeta(w, "Coding", dim(fmt.Sprintf("~%d min   first edit %s commit", mins, glyphArr)))
+	}
+	fmt.Fprintln(w)
+	versionLine(w)
+	fmt.Fprintln(w)
+}
 
-	// Session / coding time. Prefer the value baked into the note (captured
-	// at attribution time); fall back to the live DB lookup for older notes.
-	coding := note.CodingTimeNanos
-	if coding == 0 {
-		coding = sessionNanos
+// whenOnly returns the timestamp half of the header when there's no branch to
+// pair it with, so the date still shows on its own row.
+func whenOnly(note *gitnotes.Note, when string) string {
+	if note.Branch != "" {
+		return "" // already shown on the branch row
 	}
-	if coding > 0 {
-		mins := coding / int64(time.Minute)
-		fmt.Fprintf(w, "%s  ~%d min  (first edit → commit)\n", bold("Coding time:"), mins)
+	return when
+}
+
+// codingNanos prefers the value baked into the note (captured at attribution
+// time) and falls back to the live DB session duration for older notes.
+func codingNanos(note *gitnotes.Note, sessionNanos int64) int64 {
+	if note.CodingTimeNanos > 0 {
+		return note.CodingTimeNanos
+	}
+	return sessionNanos
+}
+
+// renderGenRows prints the four generation modes as labelled proportional
+// mini-bars, busiest-first ordering preserved by the fixed mode list.
+func renderGenRows(w io.Writer, g gitnotes.ByGenType) {
+	total := g.Chat + g.CLI + g.Completion + g.Human
+	if total == 0 {
+		total = 1
+	}
+	const barW = 20
+	rows := []struct {
+		name  string
+		lines int
+		clr   string
+	}{
+		{"chat", g.Chat, ansiGreen},
+		{"cli", g.CLI, ansiCyan},
+		{"completion", g.Completion, ansiMagenta},
+		{"human", g.Human, ansiBlue},
+	}
+	for _, r := range rows {
+		filled := int(float64(barW)*float64(r.lines)/float64(total) + 0.5)
+		if filled > barW {
+			filled = barW
+		}
+		var bar string
+		if colorEnabled() {
+			if r.lines > 0 {
+				bar = r.clr + strings.Repeat("█", filled) + ansiReset + dim(strings.Repeat("░", barW-filled))
+			} else {
+				bar = dim(strings.Repeat("░", barW))
+			}
+		} else {
+			bar = strings.Repeat("█", filled) + strings.Repeat("░", barW-filled)
+		}
+		pct := ""
+		if r.lines > 0 {
+			pct = fmt.Sprintf("   %5.1f%%", float64(r.lines)*100/float64(total))
+		}
+		fmt.Fprintf(w, "%s  %-11s %4d  %s%s\n", gutter, r.name, r.lines, bar, dim(pct))
 	}
 }
 

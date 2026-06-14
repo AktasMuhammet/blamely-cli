@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -57,10 +58,10 @@ type EditPayload struct {
 	HashBefore       string `json:"hash_before,omitempty"`
 	HashAfter        string `json:"hash_after,omitempty"`
 	// SuggestedLines: AI's original suggestion size before user edits.
-	SuggestedLines int64              `json:"suggested_lines,omitempty"`
-	Lines          []Range            `json:"lines"`
-	RemovedLines   []RemovedLineHash  `json:"removed_lines,omitempty"`
-	RawMeta        string             `json:"raw_meta,omitempty"`
+	SuggestedLines int64             `json:"suggested_lines,omitempty"`
+	Lines          []Range           `json:"lines"`
+	RemovedLines   []RemovedLineHash `json:"removed_lines,omitempty"`
+	RawMeta        string            `json:"raw_meta,omitempty"`
 	// Branch is the editor's checked-out branch when the edit was made. Optional:
 	// the daemon resolves it from repo_path if empty (e.g. watcher-sourced edits).
 	Branch string `json:"branch,omitempty"`
@@ -97,6 +98,13 @@ func Run(ctx context.Context) error {
 	}
 	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	// Route logging to ~/.blamely/daemon.log (with 24h retention) before anything
+	// else, so startup, hook traffic, and connection errors are all captured —
+	// including on Windows, where the hidden-VBScript launcher discards stderr.
+	closeLog := setupLogging(ctx)
+	defer closeLog()
+	log.Printf("blamelyd starting (pid=%d, os=%s)", os.Getpid(), runtime.GOOS)
 
 	db, err := store.Open()
 	if err != nil {
@@ -147,7 +155,7 @@ func Run(ctx context.Context) error {
 			}
 			defer removeSocketFile()
 			go watchListenerFile(ctx, sockPath, cancel)
-			fmt.Fprintf(os.Stderr, "blamelyd listening on %s\n", sockPath)
+			log.Printf("listening on unix socket %s", sockPath)
 		}
 	}
 	if listener == nil {
@@ -160,6 +168,7 @@ func Run(ctx context.Context) error {
 		}
 		l, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
+			log.Printf("FATAL: TCP listen failed: %v", err)
 			return fmt.Errorf("listen: %w", err)
 		}
 		listener = l
@@ -172,7 +181,7 @@ func Run(ctx context.Context) error {
 		if portPath, err := config.PortFile(); err == nil {
 			go watchListenerFile(ctx, portPath, cancel)
 		}
-		fmt.Fprintf(os.Stderr, "blamelyd listening on 127.0.0.1:%d\n", addr.Port)
+		log.Printf("listening on 127.0.0.1:%d", addr.Port)
 	}
 
 	s.http = &http.Server{
@@ -190,10 +199,12 @@ func Run(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
+		log.Printf("shutting down (signal received)")
 		shutdownCtx, sCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer sCancel()
 		return s.http.Shutdown(shutdownCtx)
 	case err := <-errCh:
+		log.Printf("FATAL: HTTP server stopped: %v", err)
 		return err
 	}
 }
@@ -221,6 +232,10 @@ func (s *Server) snapshot(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "repo, file required", http.StatusBadRequest)
 		return
 	}
+	// Match the forward-slash normalization the /edit path applies before caching
+	// snapshots, so a Windows recorder sending file=src\main.go still finds the
+	// snapshot stored under src/main.go.
+	file = cleanRel(file)
 	content, ok, err := s.db.GetFileSnapshot(repo, file)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -253,13 +268,17 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	}
 	var p EditPayload
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&p); err != nil {
+		log.Printf("/edit decode error: %v", err)
 		http.Error(w, fmt.Sprintf("decode: %v", err), http.StatusBadRequest)
 		return
 	}
 	if err := validateAndStore(s.db, p); err != nil {
+		log.Printf("/edit REJECTED tool=%q gen_type=%q file=%q: %v", p.Tool, p.GenType, p.FilePath, err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	log.Printf("/edit ok tool=%q gen_type=%q repo=%q file=%q lines=%d suggested=%d",
+		p.Tool, p.GenType, p.RepoPath, p.FilePath, len(p.Lines), p.SuggestedLines)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -267,6 +286,14 @@ func validateAndStore(db *store.DB, p EditPayload) error {
 	if p.RepoPath == "" || p.FilePath == "" {
 		return fmt.Errorf("repo_path, file_path required")
 	}
+	// Normalize to forward slashes so commit-time matching works on Windows: the
+	// Go recorders build file_path with filepath.Rel (backslashes for nested
+	// files), but git diff — the source of truth at commit — always uses forward
+	// slashes. Without this, a Windows edit to src\main.go never matches the
+	// committed src/main.go and the line silently falls back to Human. No-op on
+	// Unix (paths have no backslashes). Applied before the snapshot write below so
+	// the cached snapshot is keyed the same way the /snapshot lookup normalizes.
+	p.FilePath = cleanRel(p.FilePath)
 	tool := store.Tool(strings.ToLower(p.Tool))
 	gt := store.GenType(strings.ToLower(p.GenType))
 	if gt == "" {

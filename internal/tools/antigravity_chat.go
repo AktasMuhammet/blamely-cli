@@ -109,6 +109,13 @@ type transcriptFileState struct {
 	// trigger a DB open on every step indefinitely.
 	model         string
 	modelAttempts int
+
+	// createdFromContent holds the resolved abs path of files we've already
+	// recorded from a write_to_file tool-call's actual AI content. The matching
+	// "Created file" CODE_ACTION must then NOT re-record by reading the file from
+	// disk — disk may already contain a human edit (e.g. a paste) made before the
+	// watcher got there, which would mis-attribute those lines to the AI.
+	createdFromContent map[string]bool
 }
 
 func (w *antigravityTranscriptWatcher) run(ctx context.Context, sink daemon.Sink) error {
@@ -164,7 +171,7 @@ func (w *antigravityTranscriptWatcher) handleTranscriptFile(path string, state m
 	mu.Lock()
 	st, ok := state[path]
 	if !ok {
-		st = &transcriptFileState{seen: map[int]bool{}}
+		st = &transcriptFileState{seen: map[int]bool{}, createdFromContent: map[string]bool{}}
 		state[path] = st
 	}
 	if info.Size() < st.offset {
@@ -217,7 +224,12 @@ func (w *antigravityTranscriptWatcher) handleLine(path, line string, st *transcr
 	if err := json.Unmarshal([]byte(line), &step); err != nil {
 		return
 	}
-	if step.Type != "CODE_ACTION" || step.Source != "MODEL" {
+	if step.Source != "MODEL" {
+		return
+	}
+	// CODE_ACTION carries file edits; PLANNER_RESPONSE carries shell commands
+	// (e.g. `rm file` deletions). Everything else is narrative we ignore.
+	if step.Type != "CODE_ACTION" && step.Type != "PLANNER_RESPONSE" {
 		return
 	}
 	mu.Lock()
@@ -231,6 +243,11 @@ func (w *antigravityTranscriptWatcher) handleLine(path, line string, st *transcr
 		return
 	}
 
+	if step.Type == "PLANNER_RESPONSE" {
+		w.handleToolCalls(path, step, st, sink)
+		return
+	}
+
 	abs, ranges, suggested, wholeFile, removed := parseCodeAction(step.Content)
 	if abs == "" {
 		return
@@ -239,6 +256,11 @@ func (w *antigravityTranscriptWatcher) handleLine(path, line string, st *transcr
 		abs = r
 	}
 	if wholeFile {
+		// Already recorded from the write_to_file tool-call's actual AI content —
+		// don't re-read disk, which may now hold a human edit (e.g. a paste).
+		if st.createdFromContent[abs] {
+			return
+		}
 		lr, err := LineRangeForWholeFile(abs)
 		if err != nil || len(lr) == 0 {
 			return
@@ -294,6 +316,201 @@ func (w *antigravityTranscriptWatcher) handleLine(path, line string, st *transcr
 	}
 }
 
+// handleToolCalls processes a PLANNER_RESPONSE step's tool invocations:
+//   - run_command shell `rm`/`del` → record the deletion (gemini removal), and
+//   - write_to_file / create_file → record the new file from the tool-call's
+//     ACTUAL AI content (CodeContent), which is the source of truth — so the
+//     matching "Created file" CODE_ACTION won't re-read the file from disk and
+//     pick up a human edit (e.g. a paste) as AI-authored.
+func (w *antigravityTranscriptWatcher) handleToolCalls(path string, step transcriptStep, st *transcriptFileState, sink daemon.Sink) {
+	when := time.Now()
+	if t, err := time.Parse(time.RFC3339, step.CreatedAt); err == nil {
+		when = t
+	}
+	for _, tc := range step.ToolCalls {
+		switch {
+		case isAntigravityShellTool(tc.Name):
+			cmd := unquoteAntigravityArg(tc.Args.CommandLine)
+			cwd := unquoteAntigravityArg(tc.Args.Cwd)
+			if cmd == "" || cwd == "" {
+				continue
+			}
+			for _, tok := range shellDeleteTargets(cmd) {
+				abs := tok
+				if !filepath.IsAbs(abs) {
+					abs = filepath.Join(cwd, tok)
+				}
+				w.recordAntigravityDeletion(path, abs, cwd, st, when, sink)
+			}
+		case isAntigravityWriteTool(tc.Name):
+			w.recordAntigravityWrite(path, tc, st, when, sink)
+		}
+	}
+}
+
+// recordAntigravityWrite records a file the AI wrote via write_to_file/create_file
+// from the tool-call's own CodeContent — never from disk — so a human edit made
+// before the watcher catches up can't be mis-credited to the AI. It marks the
+// path so the paired "Created file" CODE_ACTION skips its disk re-read.
+func (w *antigravityTranscriptWatcher) recordAntigravityWrite(path string, tc transcriptToolCall, st *transcriptFileState, when time.Time, sink daemon.Sink) {
+	target := unquoteAntigravityArg(tc.Args.TargetFile)
+	content := unquoteAntigravityArg(tc.Args.CodeContent)
+	if target == "" || content == "" {
+		return
+	}
+	// Antigravity truncates large tool-call args in the transcript (a literal
+	// "<truncated N bytes>" marker). A truncated CodeContent is NOT the full
+	// file, so using it would record only the first couple of lines as AI and
+	// drop the rest to Human. Bail and leave the path unmarked so the paired
+	// "Created file" CODE_ACTION falls back to reading the full file from disk.
+	if isTruncatedAntigravityContent(content) {
+		return
+	}
+	abs := fileURIToPath(target)
+	if r, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = r
+	}
+	repo, _ := gitutil.RepoID(abs)
+	if repo == "" {
+		return
+	}
+	ranges := perLineShaRangesFromContent(content)
+	if len(ranges) == 0 {
+		return
+	}
+	wt, _ := gitutil.Toplevel(abs)
+	rel := abs
+	if wt != "" {
+		if r, err := filepath.Rel(wt, abs); err == nil && !strings.HasPrefix(r, "..") {
+			rel = r
+		}
+	}
+	st.createdFromContent[abs] = true // tell the CODE_ACTION to skip the disk read
+
+	const maxModelAttempts = 8
+	if st.model == "" && st.modelAttempts < maxModelAttempts {
+		st.modelAttempts++
+		if m := modelFromConversationDB(conversationDBPath(path)); m != "" {
+			st.model = m
+			st.modelAttempts = maxModelAttempts
+		}
+	}
+	ev := daemon.Event{
+		When:           when,
+		Tool:           string(store.ToolGemini),
+		Confidence:     "high",
+		GenType:        "chat",
+		Model:          st.model,
+		RepoPath:       repo,
+		FilePath:       rel,
+		Lines:          toDaemonLineRanges(ranges),
+		SuggestedLines: int64(len(ranges)),
+		RawMeta:        fmt.Sprintf(`{"source":"antigravity_gemini_write","transcript_path":%q}`, path),
+	}
+	if err := sink.Record(ev); err != nil {
+		log.Printf("antigravity-gemini write sink: %v", err)
+	} else {
+		log.Printf("antigravity-gemini: write %s lines=%d", rel, len(ranges))
+	}
+}
+
+// isTruncatedAntigravityContent reports whether a tool-call's CodeContent was
+// clipped by Antigravity's transcript logger, which appends a literal
+// "<truncated N bytes>" marker when an arg exceeds its size cap. Such content is
+// only a prefix of the real file and must not be used for attribution.
+func isTruncatedAntigravityContent(content string) bool {
+	return strings.Contains(content, "<truncated ")
+}
+
+// isAntigravityWriteTool reports whether a tool_call name is an Antigravity
+// whole-file write/create (which carries the AI's content in CodeContent).
+func isAntigravityWriteTool(name string) bool {
+	switch strings.ToLower(name) {
+	case "write_to_file", "write_file", "create_file", "create_text_file":
+		return true
+	}
+	return false
+}
+
+// recordAntigravityDeletion fingerprints a deleted file's HEAD content as
+// removed lines and records it as a gemini removal. The file is already gone, so
+// the repo + relative path are resolved from the still-existing parent dir / cwd.
+func (w *antigravityTranscriptWatcher) recordAntigravityDeletion(path, abs, cwd string, st *transcriptFileState, when time.Time, sink daemon.Sink) {
+	root := findRepoRoot(abs, cwd)
+	if root == "" {
+		return
+	}
+	dir := filepath.Dir(abs)
+	if rd, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = rd
+	}
+	rootResolved := root
+	if rr, err := filepath.EvalSymlinks(root); err == nil {
+		rootResolved = rr
+	}
+	rel, err := filepath.Rel(rootResolved, filepath.Join(dir, filepath.Base(abs)))
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return
+	}
+	removed := headFileRemovedHashes(root, rel)
+	if len(removed) == 0 {
+		return
+	}
+	repo, _ := gitutil.RepoID(rootResolved)
+	if repo == "" {
+		repo = root
+	}
+	const maxModelAttempts = 8
+	if st.model == "" && st.modelAttempts < maxModelAttempts {
+		st.modelAttempts++
+		if m := modelFromConversationDB(conversationDBPath(path)); m != "" {
+			st.model = m
+			st.modelAttempts = maxModelAttempts
+		}
+	}
+	ev := daemon.Event{
+		When:           when,
+		Tool:           string(store.ToolGemini),
+		Confidence:     "high",
+		GenType:        "chat",
+		Model:          st.model,
+		RepoPath:       repo,
+		FilePath:       rel,
+		RemovedLines:   toDaemonRemovedLines(removed),
+		SuggestedLines: int64(len(removed)),
+		RawMeta:        fmt.Sprintf(`{"source":"antigravity_gemini_delete","transcript_path":%q}`, path),
+	}
+	if err := sink.Record(ev); err != nil {
+		log.Printf("antigravity-gemini delete sink: %v", err)
+	} else {
+		log.Printf("antigravity-gemini: delete %s lines=%d", rel, len(removed))
+	}
+}
+
+// isAntigravityShellTool reports whether a tool_call name is an Antigravity
+// shell-command invocation (which is how it runs `rm`/`del`).
+func isAntigravityShellTool(name string) bool {
+	switch strings.ToLower(name) {
+	case "run_command", "runcommand", "run_terminal_command", "execute_command", "command", "shell":
+		return true
+	}
+	return false
+}
+
+// unquoteAntigravityArg decodes a tool_call arg, whose value is a JSON-encoded
+// string (e.g. "\"rm x.html\"" -> rm x.html). Falls back to trimming quotes.
+func unquoteAntigravityArg(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	var out string
+	if json.Unmarshal([]byte(s), &out) == nil {
+		return out
+	}
+	return strings.Trim(s, `"`)
+}
+
 func (w *antigravityTranscriptWatcher) evictStale(state map[string]*transcriptFileState, mu *sync.Mutex) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -306,12 +523,30 @@ func (w *antigravityTranscriptWatcher) evictStale(state map[string]*transcriptFi
 }
 
 // transcriptStep is the minimal shape of one transcript.jsonl record we need.
+// CODE_ACTION steps carry their edit in Content; PLANNER_RESPONSE steps carry
+// shell invocations in ToolCalls (e.g. a `run_command` running `rm file`).
 type transcriptStep struct {
-	StepIndex int    `json:"step_index"`
-	Source    string `json:"source"`
-	Type      string `json:"type"`
-	CreatedAt string `json:"created_at"`
-	Content   string `json:"content"`
+	StepIndex int                  `json:"step_index"`
+	Source    string               `json:"source"`
+	Type      string               `json:"type"`
+	CreatedAt string               `json:"created_at"`
+	Content   string               `json:"content"`
+	ToolCalls []transcriptToolCall `json:"tool_calls"`
+}
+
+// transcriptToolCall is one tool invocation inside a PLANNER_RESPONSE step. Arg
+// values are stored as JSON-encoded strings (e.g. CommandLine: "\"rm x.html\"").
+type transcriptToolCall struct {
+	Name string `json:"name"`
+	Args struct {
+		CommandLine string `json:"CommandLine"`
+		Cwd         string `json:"Cwd"`
+		// write_to_file / create_file carry the AI's actual new content here —
+		// the source of truth for an "AI created this file" attribution, used
+		// instead of reading the (possibly human-edited) file from disk.
+		TargetFile  string `json:"TargetFile"`
+		CodeContent string `json:"CodeContent"`
+	} `json:"args"`
 }
 
 // codeActionEditPathRe extracts the edited file's absolute path from a
@@ -441,11 +676,16 @@ func conversationDBPath(transcriptPath string) string {
 	return filepath.Join(ideRoot, "conversations", id+".db")
 }
 
-// geminiModelNameRe matches plausible Gemini model identifiers, e.g.
-// "gemini-3-flash-a" or "gemini-3.5-flash-low" — always "gemini-" followed by
-// a version digit, which rules out unrelated strings like a "gemini-test"
-// project path landing in the same blob.
-var geminiModelNameRe = regexp.MustCompile(`^gemini-\d[\w.-]{1,40}$`)
+// antigravityModelNameRe matches plausible model identifiers Antigravity can
+// run. Antigravity is model-agnostic — the user can pick Gemini, Claude, GPT,
+// etc. — so this must recognize each provider's id format, not just Gemini's.
+// Examples: "gemini-3-flash", "claude-sonnet-4-6", "gpt-4o", "gpt-5",
+// "o3-mini". Each alternative anchors on a known provider prefix so a stray
+// string in the same blob (e.g. a "gemini-test" project path or the word
+// "claude" in prose) can't match — and the scanner's exact length-byte check
+// makes a coincidental hit vanishingly unlikely.
+var antigravityModelNameRe = regexp.MustCompile(
+	`^(?:gemini-\d[\w.-]*|claude-[a-z][\w.-]+|gpt-\d[\w.+-]*|o[1-4](?:-[\w.-]+)?|grok-[\w.-]+|deepseek-[\w.-]+)$`)
 
 // modelFromConversationDB best-effort opens an Antigravity conversation's
 // SQLite db read-only and returns the most recent Gemini model name found in
@@ -485,21 +725,23 @@ func modelFromConversationDB(dbPath string) string {
 }
 
 // scanProtobufModelString walks a protobuf-encoded blob looking for a
-// length-delimited string field whose payload matches geminiModelNameRe. The
-// length byte must equal the candidate's exact byte length — a constraint a
+// length-delimited string field whose payload matches antigravityModelNameRe.
+// The length byte must equal the candidate's exact byte length — a constraint a
 // coincidental substring can't satisfy — making this reliable without
-// decoding the surrounding message.
+// decoding the surrounding message. The lower bound covers short ids like
+// "gpt-5" (5 bytes) while the regex's provider-prefix anchoring keeps that
+// loosening from admitting noise.
 func scanProtobufModelString(blob []byte) string {
 	for i := 0; i+1 < len(blob); i++ {
 		n := int(blob[i])
-		if n < 8 || n > 48 {
+		if n < 5 || n > 48 {
 			continue
 		}
 		end := i + 1 + n
 		if end > len(blob) {
 			continue
 		}
-		if cand := blob[i+1 : end]; geminiModelNameRe.Match(cand) {
+		if cand := blob[i+1 : end]; antigravityModelNameRe.Match(cand) {
 			return string(cand)
 		}
 	}

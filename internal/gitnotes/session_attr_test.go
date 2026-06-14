@@ -97,3 +97,58 @@ func TestBuildNote_FallbackRequiresContentMatch(t *testing.T) {
 		t.Errorf("overridden line: AuthorType want Human, got %q", l.AuthorType)
 	}
 }
+
+// TestBuildNote_CrossSessionDeletionIsAI is the deletion counterpart to
+// TestBuildNote_CrossSessionContentShaIsHuman: an AI tool recorded REMOVING a
+// line in an EARLIER work-session (different session_id), and the human commits
+// that deletion in a LATER commit. Unlike added lines (where cross-session
+// identical content is a human paste → Human), a cross-session AI removal is
+// credited AI: the AI genuinely deleted that content, the human merely staged
+// it later.
+func TestBuildNote_CrossSessionDeletionIsAI(t *testing.T) {
+	db := openTestDB(t)
+	repo := "/r"
+	now := time.Now().UnixNano()
+
+	const lineText = "    legacyHelper();"
+	// AI removal recorded in some OTHER session (id 99), long before this commit.
+	_, err := db.InsertEdit(store.Edit{
+		TimestampNanos: now - int64(8*time.Hour),
+		RepoPath:       repo,
+		FilePath:       "foo.go",
+		Tool:           store.ToolGemini,
+		Confidence:     store.ConfidenceHigh,
+		GenType:        store.GenTypeChat,
+		Model:          sqlNullString("gemini-3"),
+		Branch:         "main",
+		SessionID:      sql.NullString{Valid: true, String: "00000000-0000-4000-8000-000000000099"},
+		RemovedLines:   []store.RemovedLineHash{{ContentSHA: sha256HexStr([]byte(lineText)), ContentSHANorm: sha256HexNormStr(lineText)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The commit (current session, NULL since no git repo here) deletes that line.
+	deleted := map[string][]DeletedLine{"foo.go": {{LineNum: 130, Content: lineText}}}
+	note, err := buildNote(db, repo, "newsha", now, nil, deleted, nil, nil)
+	if err != nil {
+		t.Fatalf("buildNote: %v", err)
+	}
+	if note.Totals.AIDeletedLines != 1 {
+		t.Errorf("ai_deleted_lines: want 1, got %d", note.Totals.AIDeletedLines)
+	}
+	var found bool
+	for _, f := range note.Files {
+		for _, r := range f.Lines {
+			if r.Type == "delete" {
+				found = true
+				if r.AuthorType != "AI" || r.Tool != string(store.ToolGemini) {
+					t.Errorf("cross-session deletion: got author=%s tool=%s, want AI/gemini", r.AuthorType, r.Tool)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no delete range emitted")
+	}
+}

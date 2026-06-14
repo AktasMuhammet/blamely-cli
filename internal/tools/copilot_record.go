@@ -56,6 +56,21 @@ func RecordCopilotFromStdin(r io.Reader) error {
 
 	filePath, ranges, suggested := extractCopilotRanges(p)
 	if filePath == "" {
+		// Copilot removes files either with a dedicated delete tool (a bare
+		// path) or via its terminal tool (`rm`). Neither produces an edit
+		// range, so credit the removal here — otherwise an AI-deleted file
+		// falls through to Human at commit time.
+		gen := copilotGenType(p.ToolName)
+		switch p.ToolName {
+		case "delete_file", "remove_file", "delete", "Delete":
+			if path := deletePathFromInput(p.ToolInput); path != "" {
+				return recordToolDeletionPath(path, p.Cwd, "copilot", gen, p.Model, p.SessionID, p.TranscriptPath, "copilot_delete")
+			}
+		case "run_in_terminal", "Bash", "shell", "Shell":
+			if root := findRepoRoot(p.Cwd, p.Cwd); root != "" {
+				return recordShellDeletions(root, shellCommandFromInput(p.ToolInput), "copilot", gen, p.Model, p.SessionID, p.TranscriptPath, "copilot_shell_delete")
+			}
+		}
 		// Payload didn't carry a file path: keep the session-marker fallback.
 		return emitCopilotMarker(p.SessionID)
 	}

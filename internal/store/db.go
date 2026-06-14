@@ -164,6 +164,24 @@ var migrations = []string{
 		updated_at INTEGER NOT NULL,
 		PRIMARY KEY (repo_path, file_path)
 	)`,
+	// Migration 21: backfill for the Windows backslash-path bug. Edits recorded
+	// on Windows before the ingestion-side normalization landed stored
+	// file_path with backslashes for nested files (filepath.Rel uses the OS
+	// separator), so they never matched git diff's forward-slash paths at commit
+	// time and their AI lines silently fell back to Human. Rewrite them in place
+	// so existing installs self-heal on the next daemon start. edits has no
+	// UNIQUE constraint on file_path, so the rewrite can't collide. INSTR guard
+	// scopes the work to affected rows (a no-op on Unix DBs, which have none).
+	// repo_path is intentionally left untouched: both the recorder and the
+	// commit-time attributor canonicalize it via gitutil.RepoID, so they already
+	// agree — rewriting one side would introduce a mismatch.
+	/* 21 */ `UPDATE edits SET file_path = REPLACE(file_path, '\', '/') WHERE INSTR(file_path, '\') > 0`,
+	// Migration 22: file_snapshots is a regenerable cache with a (repo_path,
+	// file_path) primary key, so an in-place REPLACE could hit a UNIQUE
+	// collision if both separator forms somehow exist. Just drop the stale
+	// backslash rows; the daemon re-caches them on the next edit (and the
+	// /snapshot HEAD fallback covers the gap until then).
+	/* 22 */ `DELETE FROM file_snapshots WHERE INSTR(file_path, '\') > 0`,
 }
 
 func (db *DB) migrate() error {

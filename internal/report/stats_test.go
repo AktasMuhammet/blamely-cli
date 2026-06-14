@@ -73,7 +73,7 @@ func TestToolGenType_MultiFile(t *testing.T) {
 	note := &gitnotes.Note{
 		Files: []gitnotes.FileEntry{
 			{Lines: []gitnotes.RangeEntry{
-				{Start: 1, End: 2, Tool: "codex", GenType: &cli},  // 2 lines
+				{Start: 1, End: 2, Tool: "codex", GenType: &cli}, // 2 lines
 			}},
 			{Lines: []gitnotes.RangeEntry{
 				{Start: 1, End: 1, Tool: "codex", GenType: &chat}, // 1 line
@@ -131,8 +131,8 @@ func TestFileToolBreakdown_SingleTool(t *testing.T) {
 func TestFileToolBreakdown_MultiTool(t *testing.T) {
 	f := gitnotes.FileEntry{
 		Lines: []gitnotes.RangeEntry{
-			{Start: 1, End: 3, Type: "add", Tool: "claude"},   // 3
-			{Start: 4, End: 5, Type: "add", Tool: "copilot"},  // 2
+			{Start: 1, End: 3, Type: "add", Tool: "claude"},  // 3
+			{Start: 4, End: 5, Type: "add", Tool: "copilot"}, // 2
 		},
 	}
 	got := fileToolBreakdown(f)
@@ -279,7 +279,7 @@ func TestRenderStats_ContainsChangesSection(t *testing.T) {
 	var buf strings.Builder
 	renderStats(&buf, note, meta, 0)
 	out := buf.String()
-	if !strings.Contains(out, "Changes:") {
+	if !strings.Contains(out, "Changes") {
 		t.Errorf("output should contain Changes section:\n%s", out)
 	}
 	if !strings.Contains(out, "13") {
@@ -296,7 +296,7 @@ func TestRenderStats_ContainsAIAttribution(t *testing.T) {
 	var buf strings.Builder
 	renderStats(&buf, note, meta, 0)
 	out := buf.String()
-	if !strings.Contains(out, "AI attribution:") {
+	if !strings.Contains(out, "Attribution") {
 		t.Errorf("output should contain AI attribution section:\n%s", out)
 	}
 	if !strings.Contains(out, "claude") {
@@ -313,7 +313,7 @@ func TestRenderStats_ContainsGenerationSection(t *testing.T) {
 	var buf strings.Builder
 	renderStats(&buf, note, meta, 0)
 	out := buf.String()
-	if !strings.Contains(out, "Generation:") {
+	if !strings.Contains(out, "Generation") {
 		t.Errorf("output should contain Generation section:\n%s", out)
 	}
 	if !strings.Contains(out, "chat") {
@@ -327,7 +327,7 @@ func TestRenderStats_ContainsFilesSection(t *testing.T) {
 	var buf strings.Builder
 	renderStats(&buf, note, meta, 0)
 	out := buf.String()
-	if !strings.Contains(out, "Files:") {
+	if !strings.Contains(out, "Files") {
 		t.Errorf("output should contain Files section:\n%s", out)
 	}
 	if !strings.Contains(out, "main.go") {
@@ -341,7 +341,7 @@ func TestRenderStats_ContainsTokensSection(t *testing.T) {
 	var buf strings.Builder
 	renderStats(&buf, note, meta, 0)
 	out := buf.String()
-	if !strings.Contains(out, "Tokens:") {
+	if !strings.Contains(out, "Tokens") {
 		t.Errorf("output should contain Tokens section:\n%s", out)
 	}
 	if !strings.Contains(out, "1.0k") {
@@ -356,7 +356,7 @@ func TestRenderStats_CodingTime(t *testing.T) {
 	sessionNanos := int64(45 * 60 * 1e9) // 45 minutes
 	renderStats(&buf, note, meta, sessionNanos)
 	out := buf.String()
-	if !strings.Contains(out, "Coding time:") {
+	if !strings.Contains(out, "Coding") {
 		t.Errorf("output should contain Coding time section:\n%s", out)
 	}
 	if !strings.Contains(out, "45 min") {
@@ -371,7 +371,7 @@ func TestRenderStats_NoTokensSection_WhenNil(t *testing.T) {
 	var buf strings.Builder
 	renderStats(&buf, note, meta, 0)
 	out := buf.String()
-	if strings.Contains(out, "Tokens:") {
+	if strings.Contains(out, "Tokens") {
 		t.Errorf("Tokens section should be omitted when nil:\n%s", out)
 	}
 }

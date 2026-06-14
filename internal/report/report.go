@@ -3,8 +3,11 @@ package report
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -22,8 +25,7 @@ func RenderCommit(sha string) error {
 	}
 	repo := strings.TrimSpace(string(out))
 
-	cmd := exec.Command("git", "-C", repo, "notes", "--ref="+gitnotes.NotesRef, "show", sha)
-	body, err := cmd.Output()
+	body, err := readNote(repo, sha)
 	if err != nil {
 		return fmt.Errorf("no blamely note for %s: %w", sha, err)
 	}
@@ -31,13 +33,80 @@ func RenderCommit(sha string) error {
 	if err := json.Unmarshal(body, &note); err != nil {
 		return fmt.Errorf("parse note: %w", err)
 	}
-	printNote(&note)
+	meta, err := commitMeta(repo, sha)
+	if err != nil {
+		meta = commitMeta_{"sha": sha}
+	}
+	renderDashboard(os.Stdout, &note, meta, true)
 	return nil
 }
 
 func RenderSince(since string) error {
 	// Aggregated table across recent commits is deferred until basic flow works.
 	return fmt.Errorf("report --since=%s: aggregated rollup not yet implemented", since)
+}
+
+// RenderCommitHTML reads the blamely note for sha, renders the self-contained
+// HTML dashboard, writes it to outPath (a temp file when empty), optionally
+// opens it in the default browser, and returns the file path it wrote.
+func RenderCommitHTML(sha, outPath string, openFile bool) (string, error) {
+	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return "", fmt.Errorf("not a git repo: %w", err)
+	}
+	repo := strings.TrimSpace(string(out))
+
+	noteBytes, err := readNote(repo, sha)
+	if err != nil {
+		return "", fmt.Errorf("no blamely note for %s: run `blamely attribute %s %s` first", sha, repo, sha)
+	}
+	var note gitnotes.Note
+	if err := json.Unmarshal(noteBytes, &note); err != nil {
+		return "", fmt.Errorf("parse note: %w", err)
+	}
+	meta, err := commitMeta(repo, sha)
+	if err != nil {
+		meta = commitMeta_{"sha": sha}
+	}
+
+	html, err := RenderHTML(&note, meta)
+	if err != nil {
+		return "", err
+	}
+
+	if outPath == "" {
+		short := note.Commit
+		if len(short) > 12 {
+			short = short[:12]
+		}
+		if short == "" {
+			short = "report"
+		}
+		outPath = filepath.Join(os.TempDir(), "blamely-report-"+short+".html")
+	}
+	if err := os.WriteFile(outPath, []byte(html), 0o644); err != nil {
+		return "", fmt.Errorf("write %s: %w", outPath, err)
+	}
+	if openFile {
+		_ = openInBrowser(outPath) // best-effort: the path is printed regardless
+	}
+	return outPath, nil
+}
+
+// openInBrowser launches the OS default handler for path. Best-effort: it
+// returns the launcher's start error but never blocks (the report path is
+// printed either way).
+func openInBrowser(path string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", path)
+	case "windows":
+		cmd = exec.Command("cmd", "/c", "start", "", path)
+	default:
+		cmd = exec.Command("xdg-open", path)
+	}
+	return cmd.Start()
 }
 
 // printNote renders the full per-commit attribution view: the same premium
@@ -47,40 +116,48 @@ func RenderSince(since string) error {
 // the model rollup, the conversation, and a clean per-file, per-range
 // line-level attribution listing.
 func printNote(n *gitnotes.Note) {
-	RenderBar(os.Stdout, n, 40)
-	fmt.Println()
+	w := os.Stdout
+	RenderBar(w, n, 40)
+	fmt.Fprintln(w)
 
 	if n.CodingTimeNanos > 0 {
-		fmt.Printf("  %s  %s\n", bold("Coding time:"), formatDuration(time.Duration(n.CodingTimeNanos)))
+		inlineMeta(w, "Coding", dim(formatDuration(time.Duration(n.CodingTimeNanos))+"   first edit "+glyphArr+" commit"))
 	}
 	if len(n.Totals.Models) > 0 {
-		fmt.Printf("  %s  %s\n", bold("Models:"), formatModels(n.Totals.Models))
+		inlineMeta(w, "Models", formatModels(n.Totals.Models))
 	}
-	fmt.Println()
 
 	if len(n.Files) == 0 {
+		fmt.Fprintln(w)
+		versionLine(w)
 		return
 	}
-	fmt.Println(bold("Files:"))
+	sectionHead(w, "Files")
 	for _, f := range n.Files {
-		fmt.Println()
-		printFileHeader(f)
+		fmt.Fprintln(w)
+		printFileHeader(w, f)
 		for _, l := range f.Lines {
 			loc := fmt.Sprintf("L%d", l.Start)
 			if l.End > l.Start {
 				loc = fmt.Sprintf("L%d-%d", l.Start, l.End)
 			}
-			fmt.Printf("    %s  %s  %s\n", dim(fmt.Sprintf("%-9s", loc)), dim(fmt.Sprintf("%-6s", l.Type)), formatAttribution(l))
+			fmt.Fprintf(w, "%s  %s  %s  %s  %s\n", gutter,
+				dim(glyphBar),
+				dim(fmt.Sprintf("%-10s", loc)),
+				dim(fmt.Sprintf("%-6s", l.Type)),
+				formatAttribution(l))
 		}
 	}
-	fmt.Println()
+	fmt.Fprintln(w)
+	versionLine(w)
+	fmt.Fprintln(w)
 }
 
 // printFileHeader renders one file's status line:
 //
 //	app.js  [ADDED]                              +122  -0
 //	server.go  [RENAMED] (from old_server.go)     +18  -4
-func printFileHeader(f gitnotes.FileEntry) {
+func printFileHeader(w io.Writer, f gitnotes.FileEntry) {
 	name := bold(f.Path)
 	if f.Type != "" {
 		name += "  " + dim("["+f.Type+"]")
@@ -91,7 +168,7 @@ func printFileHeader(f gitnotes.FileEntry) {
 	if f.CopiedFrom != "" {
 		name += "  " + dim("(copied from "+f.CopiedFrom+")")
 	}
-	fmt.Printf("%s  %s %s\n", name, green(fmt.Sprintf("+%-4d", f.Added)), red(fmt.Sprintf("-%-4d", f.Deleted)))
+	fmt.Fprintf(w, "%s%s  %s %s\n", gutter, name, green(fmt.Sprintf("+%-4d", f.Added)), red(fmt.Sprintf("-%-4d", f.Deleted)))
 }
 
 // formatAttribution renders one range's authorship as a single colored token:

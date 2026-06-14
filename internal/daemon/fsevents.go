@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -47,9 +48,12 @@ func (s *Server) fsEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := applyFsEvent(s.db, p); err != nil {
+		log.Printf("/fs REJECTED kind=%q repo=%q: %v", p.Kind, p.RepoPath, err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	log.Printf("/fs ok kind=%q repo=%q path=%q old=%q new=%q",
+		p.Kind, p.RepoPath, p.Path, p.OldPath, p.NewPath)
 	w.WriteHeader(http.StatusNoContent)
 }
 

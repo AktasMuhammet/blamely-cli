@@ -32,9 +32,9 @@ type Sink interface {
 // historical replay (e.g. parsing yesterday's session log on daemon startup)
 // keeps the original timing.
 type Event struct {
-	When             time.Time
-	Tool             string // claude|cursor|codex|copilot
-	Confidence       string // high|medium|low — defaulted from Tool if blank
+	When       time.Time
+	Tool       string // claude|cursor|codex|copilot
+	Confidence string // high|medium|low — defaulted from Tool if blank
 	// GenType describes how the edit was produced.
 	// Values: chat | cli | completion | unknown
 	GenType          string
@@ -90,6 +90,11 @@ func (s *dbSink) Record(ev Event) error {
 	if ev.RepoPath == "" {
 		return nil
 	}
+	// Forward-slash the file path so it matches git diff's paths at commit time.
+	// The CodexWatcher (and other in-process watchers) build file_path with
+	// filepath.Rel, which yields backslashes for nested files on Windows; git
+	// uses forward slashes. No-op on Unix. Mirrors the /edit HTTP path.
+	ev.FilePath = cleanRel(ev.FilePath)
 	tool := store.Tool(ev.Tool)
 	gt := store.GenType(ev.GenType)
 	if gt == "" {
@@ -159,8 +164,11 @@ func (s *dbSink) Record(ev Event) error {
 	}
 	sessions.resolve(s.db, &e, ev.Branch)
 	if _, err := s.db.InsertEdit(e); err != nil {
+		log.Printf("watcher %q: insert edit failed file=%q: %v", ev.Tool, ev.FilePath, err)
 		return err
 	}
+	log.Printf("watcher %q: edit gen_type=%q repo=%q file=%q lines=%d",
+		tool, gt, ev.RepoPath, ev.FilePath, len(e.Lines))
 	// When a chat-session marker lands, retroactively re-stamp the apply edit
 	// that the editor plugin already recorded as a completion a beat earlier
 	// (the chat response streams in slightly after the apply hits the file).

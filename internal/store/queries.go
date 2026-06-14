@@ -280,7 +280,7 @@ func (db *DB) linesForEdit(editID int64) ([]EditLine, error) {
 // AND that has a non-null model. Returns "" when no such row exists. Used by
 // the ingest step to back-fill the model onto chat-attributed lines.
 //
-// The query also matches session markers with repo_path='' (emitted by the
+// The query also matches session markers with repo_path=” (emitted by the
 // chat-session watcher, which has no file context) so that the chat-selected
 // model is visible even when the edit row from the plugin/hook arrives before
 // the watcher has had a chance to emit a repo-scoped row.
@@ -304,15 +304,15 @@ func (db *DB) LatestChatModelNear(tool Tool, repoPath string, tsNanos, windowNan
 // the given tool is active in the [ts-window, ts+window] interval.
 //
 // Resolution order:
-//   1. If ANY chat marker exists in the window, return "chat". Chat is the
-//      more specific signal — it requires either a chat-session JSONL
-//      response chunk or an extension log line with "chat" in it, neither of
-//      which fire for an inline Tab accept.
-//   2. Otherwise return the gen_type of the most recent specific marker
-//      (skipping "unknown" rows from the globalStorage-only signal).
-//   3. Returns "" when no row matches; callers default accordingly
-//      (the inline Tab accept is the common case when no more-specific signal
-//      exists).
+//  1. If ANY chat marker exists in the window, return "chat". Chat is the
+//     more specific signal — it requires either a chat-session JSONL
+//     response chunk or an extension log line with "chat" in it, neither of
+//     which fire for an inline Tab accept.
+//  2. Otherwise return the gen_type of the most recent specific marker
+//     (skipping "unknown" rows from the globalStorage-only signal).
+//  3. Returns "" when no row matches; callers default accordingly
+//     (the inline Tab accept is the common case when no more-specific signal
+//     exists).
 func (db *DB) LatestChatGenTypeNear(tool Tool, tsNanos, windowNanos int64) string {
 	from, to := tsNanos-windowNanos, tsNanos+windowNanos
 	// Step 1: chat-preferred.
@@ -615,7 +615,7 @@ type ChatSessionRef struct {
 //
 // Chat-session response markers carry no file/repo context (the editor event
 // isn't tied to a file), so the watcher records them with an empty repo_path.
-// Matching repo_path='' rows unconditionally would leak a chat session into
+// Matching repo_path=” rows unconditionally would leak a chat session into
 // EVERY repo whose commit window overlaps it. Instead, an empty-repo_path row
 // is only trusted for this repo if the SAME chat_session_path also appears on
 // a textedit row that DOES carry this repo's path — i.e. that chat session
@@ -886,6 +886,20 @@ func (db *DB) EditsForFileInSession(repo, file string, sessionID string) ([]Edit
 // preserves AI authorship that a session/time-scoped query would miss.
 func (db *DB) EditsForFileAny(repo, file string) ([]Edit, error) {
 	return db.editsForFileWhere(`repo_path = ? AND file_path = ?`, repo, file)
+}
+
+// EditsForFileOnBranch returns every recorded edit for repo/file on the given
+// branch (plus legacy rows with no branch recorded), regardless of session or
+// timestamp. Used by commit-time DELETION attribution: an AI removal recorded
+// in an earlier work-session is committed by the human in a later session, so
+// the deletion must match removal records across sessions on the same branch —
+// unlike added lines, which stay session-scoped to keep a human's paste of old
+// AI code attributed Human.
+func (db *DB) EditsForFileOnBranch(repo, file, branch string) ([]Edit, error) {
+	return db.editsForFileWhere(
+		`repo_path = ? AND file_path = ? AND (branch = ? OR branch IS NULL OR branch = '')`,
+		repo, file, branch,
+	)
 }
 
 // GetFileSnapshot returns the cached full content of repo/file as of the last

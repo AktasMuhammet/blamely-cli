@@ -38,6 +38,25 @@ func RecordGeminiFromStdin(r io.Reader) error {
 
 	filePath, ranges, suggested, removed, newFullContent := extractGeminiRanges(p)
 	if filePath == "" {
+		// No file-edit tool produced a path. Gemini deletes files via a shell
+		// command (`run_shell_command` → `rm`), so fingerprint whatever git now
+		// reports as deleted and credit it to gemini — otherwise an AI-deleted
+		// file falls through to Human at commit time. Some builds expose a
+		// dedicated delete tool with a `file_path`/`path`; honour that too.
+		gt := ReadTranscriptGenType(p.TranscriptPath)
+		if gt == "" {
+			gt = "cli"
+		}
+		switch p.ToolName {
+		case "run_shell_command", "shell", "Shell":
+			if root := findRepoRoot(p.Cwd, p.Cwd); root != "" {
+				return recordShellDeletions(root, shellCommandFromInput(p.ToolInput), "gemini", gt, "", p.SessionID, p.TranscriptPath, "gemini_shell_delete")
+			}
+		case "delete_file", "delete", "Delete", "remove_file":
+			if path := deletePathFromInput(p.ToolInput); path != "" {
+				return recordToolDeletionPath(path, p.Cwd, "gemini", gt, "", p.SessionID, p.TranscriptPath, "gemini_delete")
+			}
+		}
 		return nil
 	}
 
