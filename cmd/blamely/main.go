@@ -115,13 +115,11 @@ func cmdDaemon() *cobra.Command {
 		Short: "Run the long-lived attribution daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Watchers use direct, observable signals (hooks, log parsers,
-			// editor plugin events). When the editor extension is installed it
-			// attributes inline completions at high confidence via the
-			// editor.action.inlineSuggest.commit command (VS Code) /
-			// AnActionListener (IntelliJ), POSTing directly to /edit. The
-			// velocity watcher below is the CLI-only fallback for users who do
-			// NOT install the extension: it pairs a filesystem line-burst with a
-			// Copilot/Cursor session marker to attribute Tab completions.
+			// editor plugin events). The velocity/heuristic watcher has been
+			// removed: inline completions are now attributed at high confidence
+			// by the VS Code and IntelliJ plugins via the
+			// editor.action.inlineSuggest.commit command and AnActionListener
+			// APIs respectively, both of which POST directly to /edit.
 			daemon.Watchers = []daemon.Watcher{
 				&tools.CodexWatcher{},
 				// Cursor: file-history presence signal + log events + chat panel.
@@ -143,11 +141,6 @@ func cmdDaemon() *cobra.Command {
 				// tails its undocumented logs to attribute its file edits/deletes.
 				&tools.ClaudeDesktopWatcher{},
 			}
-			// Velocity needs DB access (to enumerate known repos and look up
-			// recent Copilot/Cursor session markers), so it's wired through the
-			// DB-backed factory list rather than the static Watchers slice.
-			daemon.DBWatcherFactories = append(daemon.DBWatcherFactories,
-				func(db *store.DB) daemon.Watcher { return &tools.VelocityWatcher{DB: db} })
 			return daemon.Run(cmd.Context())
 		},
 	}
