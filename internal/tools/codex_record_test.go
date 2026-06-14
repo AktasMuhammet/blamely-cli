@@ -102,25 +102,6 @@ func TestShellDeleteTargets(t *testing.T) {
 // exec_command (`rm login.html`) against a git repo where login.html exists at
 // HEAD: it must buffer a codex event carrying the file's removed-line hashes.
 func TestEmitCodexShellDeletions_FingerprintsRm(t *testing.T) {
-	// Isolate git config so a setting on the CI runner's global/system config
-	// (core.hooksPath, commit.gpgsign, includeIf, autocrlf, …) can't perturb
-	// this repo and make the emit step's `git show HEAD:` behave differently
-	// than it does locally — the cause of this test passing locally but flaking
-	// in CI. emitCodexShellDeletions shells out to git with the ambient
-	// environment, and t.Setenv updates the process env exec.Command inherits,
-	// so this covers both the setup commands and the emit lookup. The lone
-	// safe.directory=* entry also neutralises git's "dubious ownership" refusal
-	// on runners whose temp dirs are owned by a different uid.
-	cfgHome := t.TempDir()
-	gitGlobal := filepath.Join(cfgHome, ".gitconfig")
-	if err := os.WriteFile(gitGlobal, []byte("[safe]\n\tdirectory = *\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("HOME", cfgHome)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(cfgHome, ".config"))
-	t.Setenv("GIT_CONFIG_GLOBAL", gitGlobal)
-	t.Setenv("GIT_CONFIG_SYSTEM", os.DevNull)
-
 	root := t.TempDir()
 	run := func(a ...string) {
 		cmd := exec.Command("git", append([]string{"-C", root}, a...)...)
@@ -139,7 +120,22 @@ func TestEmitCodexShellDeletions_FingerprintsRm(t *testing.T) {
 	run("commit", "-m", "add login.html")
 	_ = os.Remove(filepath.Join(root, "login.html")) // codex's rm already ran
 
-	payload := json.RawMessage(`{"type":"function_call","name":"exec_command","arguments":{"cmd":"rm login.html","workdir":"` + root + `"}}`)
+	// Build the payload with json.Marshal rather than string concatenation:
+	// on Windows `root` contains backslashes (C:\Users\…), which are invalid
+	// JSON escapes when spliced into a string literal, so the hand-built
+	// payload failed to parse and buffered nothing. Marshal escapes the path
+	// correctly on every platform.
+	payload, err := json.Marshal(map[string]any{
+		"type": "function_call",
+		"name": "exec_command",
+		"arguments": map[string]string{
+			"cmd":     "rm login.html",
+			"workdir": root,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	st := &codexState{}
 	emitCodexShellDeletions(payload, time.Now(), st)
 
