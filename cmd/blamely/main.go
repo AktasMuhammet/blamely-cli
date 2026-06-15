@@ -22,7 +22,7 @@ import (
 // JetBrains plugins. The release workflow can still override it at link time via
 // `-ldflags "-X main.version=<tag>"`; otherwise this hardcoded value is what
 // `blamely --version` reports.
-var version = "1.0.1"
+var version = "1.6.0"
 
 // resolveVersion returns the effective CLI version. Precedence:
 //  1. an explicit -ldflags override (release builds);

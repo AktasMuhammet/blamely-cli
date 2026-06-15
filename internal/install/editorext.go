@@ -1,7 +1,11 @@
 package install
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -9,13 +13,19 @@ import (
 	"time"
 )
 
-// blamelyExtensionID is the marketplace/registry identifier for the Blamely
-// extension. The same publisher.name id resolves across every VS Code-family
-// gallery we target:
+// blamelyExtensionID is the publisher.name identifier for the Blamely extension,
+// used to detect (--list-extensions) and uninstall it. The Microsoft VS Code
+// Marketplace has DELISTED the extension, so `--install-extension <id>` no longer
+// resolves on VS Code proper. We therefore install from a .vsix downloaded from
+// Open VSX (downloadOpenVSXVSIX), which is registry-independent and works on every
+// VS Code-family editor; the id stays the source-of-record for detect/uninstall.
 //
-//	https://marketplace.visualstudio.com/items?itemName=Blamely.blamely  (VS Code)
-//	https://open-vsx.org/extension/blamely/blamely                       (Open VSX — Antigravity IDE's gallery, Cursor's fallback)
+//	https://open-vsx.org/extension/blamely/blamely  (Open VSX — Antigravity/Cursor gallery; our install source)
 const blamelyExtensionID = "Blamely.blamely"
+
+// openVSXLatestAPI returns metadata (including the .vsix download URL) for the
+// latest published Blamely release on Open VSX.
+const openVSXLatestAPI = "https://open-vsx.org/api/blamely/blamely/latest"
 
 // signatureVerificationError is VS Code's own message when its bundled
 // vsce-sign helper fails to run during `--install-extension`. It's transient
@@ -84,6 +94,17 @@ func (r EditorExtensionResult) AlreadyPresent() bool {
 // failed).
 func InstallEditorExtensions() []EditorExtensionResult {
 	results := make([]EditorExtensionResult, 0, len(editorExtensionTargets))
+	// Resolve the install source ONCE. Prefer a .vsix downloaded from Open VSX —
+	// installing by path is registry-independent, so it works on VS Code proper
+	// (whose Marketplace listing was delisted) as well as the Open-VSX forks. If
+	// the download is unavailable (offline / Open VSX down), fall back to the
+	// registry id, which still resolves via the editor's own gallery on
+	// Cursor/Antigravity. Downloaded once and reused for every editor.
+	source := blamelyExtensionID
+	if vsix, err := downloadOpenVSXVSIX(); err == nil {
+		source = vsix
+		defer os.Remove(vsix)
+	}
 	for _, t := range editorExtensionTargets {
 		cliPath, _ := findEditorCLI(t)
 		r := EditorExtensionResult{Label: t.Label, CLIPath: cliPath}
@@ -91,14 +112,14 @@ func InstallEditorExtensions() []EditorExtensionResult {
 			results = append(results, r)
 			continue
 		}
-		// Force-reinstall unconditionally: a fresh marketplace pull both
-		// installs it the first time and updates it to latest on every
-		// subsequent run, so users never get stuck on a stale version.
+		// Force-reinstall unconditionally: a fresh pull both installs it the
+		// first time and updates it to latest on every subsequent run, so users
+		// never get stuck on a stale version.
 		wasPresent := extensionInstalled(cliPath, blamelyExtensionID)
-		out, err := installExtensionWithRetry(cliPath)
+		out, err := installExtensionWithRetry(cliPath, source)
 		if err != nil {
 			r.Err = fmt.Errorf("%s --install-extension %s --force: %w: %s",
-				filepath.Base(cliPath), blamelyExtensionID, err, strings.TrimSpace(string(out)))
+				filepath.Base(cliPath), source, err, strings.TrimSpace(string(out)))
 		} else if wasPresent {
 			r.Updated = true
 		} else {
@@ -109,6 +130,54 @@ func InstallEditorExtensions() []EditorExtensionResult {
 	return results
 }
 
+// downloadOpenVSXVSIX fetches the latest Blamely .vsix from Open VSX into a temp
+// file and returns its path; the caller removes it. Installing that file with
+// `--install-extension <path>` is registry-independent, so it works on VS Code
+// proper (Microsoft Marketplace delisted the extension) as well as the
+// Open-VSX-based forks (Cursor, Antigravity IDE).
+func downloadOpenVSXVSIX() (string, error) {
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Get(openVSXLatestAPI)
+	if err != nil {
+		return "", fmt.Errorf("query open-vsx: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("open-vsx returned %s", resp.Status)
+	}
+	var rel struct {
+		Version string `json:"version"`
+		Files   struct {
+			Download string `json:"download"`
+		} `json:"files"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&rel); err != nil {
+		return "", fmt.Errorf("decode open-vsx response: %w", err)
+	}
+	if rel.Files.Download == "" {
+		return "", fmt.Errorf("open-vsx response has no download url")
+	}
+	// The download URL 302-redirects to the CDN; http.Client follows redirects.
+	dl, err := client.Get(rel.Files.Download)
+	if err != nil {
+		return "", fmt.Errorf("download vsix: %w", err)
+	}
+	defer dl.Body.Close()
+	if dl.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("vsix download returned %s", dl.Status)
+	}
+	tmp, err := os.CreateTemp("", "blamely-*.vsix")
+	if err != nil {
+		return "", err
+	}
+	defer tmp.Close()
+	if _, err := io.Copy(tmp, io.LimitReader(dl.Body, 100<<20)); err != nil {
+		_ = os.Remove(tmp.Name())
+		return "", fmt.Errorf("save vsix: %w", err)
+	}
+	return tmp.Name(), nil
+}
+
 // signatureVerificationRetries is how many extra attempts we make when an
 // install fails with signatureVerificationError. The failure is transient and
 // environment-dependent — the bundled vsce-sign helper intermittently doesn't
@@ -117,17 +186,21 @@ func InstallEditorExtensions() []EditorExtensionResult {
 // a short backoff makes it reliable across VS Code and Cursor.
 const signatureVerificationRetries = 3
 
-// installExtensionWithRetry runs `<cli> --install-extension <id> --force`,
-// retrying only the signature-verification flake (never other errors). Returns
-// the combined output and error of the last attempt.
-func installExtensionWithRetry(cliPath string) ([]byte, error) {
-	out, err := exec.Command(cliPath, "--install-extension", blamelyExtensionID, "--force").CombinedOutput()
+// installExtensionWithRetry runs `<cli> --install-extension <source> --force`,
+// where source is either a downloaded .vsix path or the registry id, retrying
+// only the signature-verification flake (never other errors). Returns the
+// combined output and error of the last attempt.
+func installExtensionWithRetry(cliPath, source string) ([]byte, error) {
+	run := func() ([]byte, error) {
+		return exec.Command(cliPath, "--install-extension", source, "--force").CombinedOutput()
+	}
+	out, err := run()
 	for attempt := 0; attempt < signatureVerificationRetries; attempt++ {
 		if err == nil || !strings.Contains(string(out), signatureVerificationError) {
 			break
 		}
 		time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
-		out, err = exec.Command(cliPath, "--install-extension", blamelyExtensionID, "--force").CombinedOutput()
+		out, err = run()
 	}
 	return out, err
 }
