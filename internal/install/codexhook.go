@@ -58,7 +58,7 @@ func InstallCodexHook(binaryPath string) (added bool, configPath string, err err
 	root["features"] = features
 
 	hooks := getMap(root, "hooks", true)
-	command := binaryPath + " record codex"
+	command := recordHookCommand(binaryPath, "codex")
 
 	for _, event := range codexHookEvents {
 		groups := getSlice(hooks, event)

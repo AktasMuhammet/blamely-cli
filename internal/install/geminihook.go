@@ -63,7 +63,7 @@ func InstallGeminiHook(binaryPath string) (added bool, settingsPath string, err 
 	root["tools"] = tools
 
 	hooks := getMap(root, "hooks", true)
-	command := binaryPath + " record gemini"
+	command := recordHookCommand(binaryPath, "gemini")
 
 	for _, event := range geminiHookEvents {
 		groups := getSlice(hooks, event)

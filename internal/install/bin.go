@@ -11,6 +11,24 @@ import (
 	"github.com/blamely/blamely/internal/config"
 )
 
+// recordHookCommand builds the `<binary> record <tool>` command embedded in each
+// AI tool's hook config (Claude/Cursor/Codex/Copilot/Gemini). The binary path is
+// normalized to forward slashes so the command is byte-identical on every run and
+// platform.
+//
+// Why this matters on Windows: filepath.Join yields a backslash path
+// (C:\Users\…\blamely.exe), but the hook files store forward slashes
+// (C:/Users/…/blamely.exe). The install step strips the existing blamely entry by
+// marker and re-adds a freshly built one, then compares the result — so a
+// separator mismatch made it re-add the hook on every run and report it as "not
+// detected" instead of recognizing the existing entry. A single canonical form
+// (forward slashes, which CreateProcess accepts and which need no JSON/TOML
+// escaping) makes the comparison stable. Matching by marker on uninstall is
+// unaffected (it's path-agnostic).
+func recordHookCommand(binaryPath, tool string) string {
+	return filepath.ToSlash(binaryPath) + " record " + tool
+}
+
 // InstalledBinaryPath returns the path where `blamely install` keeps a stable
 // copy of the binary, so the post-commit hook and the daemon agent keep
 // working even if the user moves or deletes the dev binary.

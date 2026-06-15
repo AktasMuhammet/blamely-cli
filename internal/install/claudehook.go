@@ -56,7 +56,7 @@ func InstallClaudeHook(binaryPath string) (added bool, settingsPath string, err 
 	before := canonJSON(root)
 
 	hooks := getMap(root, "hooks", true)
-	command := binaryPath + " record claude"
+	command := recordHookCommand(binaryPath, "claude")
 
 	for _, event := range claudeHookEvents {
 		entries := getSlice(hooks, event)

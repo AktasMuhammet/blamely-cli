@@ -51,7 +51,7 @@ func InstallCopilotHook(binaryPath string) (added bool, hookPath string, err err
 	before := canonJSON(root)
 
 	hooks := getMap(root, "hooks", true)
-	command := binaryPath + " record copilot"
+	command := recordHookCommand(binaryPath, "copilot")
 
 	for _, event := range copilotHookEvents {
 		entries := getSlice(hooks, event)

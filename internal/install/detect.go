@@ -152,6 +152,14 @@ func detectCopilot() ToolPresence {
 		hints = append(hints, p)
 	}
 
+	// The standalone GitHub Copilot CLI keeps its config (and hooks) under
+	// ~/.copilot — the same dir blamely installs its hook into (copilothook.go:
+	// ~/.copilot/hooks/). Checking it here keeps detection aligned with what we
+	// actually hook, on every OS (this was previously missed on Windows).
+	if p := filepath.Join(home, ".copilot"); pathExists(p) {
+		hints = append(hints, p)
+	}
+
 	// macOS-specific app support.
 	if runtime.GOOS == "darwin" {
 		for _, p := range []string{

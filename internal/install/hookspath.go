@@ -124,7 +124,7 @@ if [ -x "$REPO_HOOK" ]; then
     exec "$REPO_HOOK" "$@"
 fi
 exit 0
-`, binaryPath)
+`, filepath.ToSlash(binaryPath))
 
 	if err := atomicWrite(path, []byte(script), 0o755); err != nil {
 		return err

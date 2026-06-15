@@ -60,7 +60,7 @@ func InstallCursorHook(binaryPath string) (added bool, hooksPath string, err err
 	}
 
 	hooks := getMap(root, "hooks", true)
-	command := binaryPath + " record cursor"
+	command := recordHookCommand(binaryPath, "cursor")
 
 	for _, event := range cursorHookEvents {
 		entries := getSlice(hooks, event)

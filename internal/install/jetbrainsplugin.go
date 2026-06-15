@@ -190,24 +190,22 @@ func hasJetBrainsPlugin(pluginsDir string) bool {
 // .app bundles (confirmed: IntelliJ IDEA + WebStorm under ~/Applications,
 // DataGrip under /Applications — all Toolbox-managed on this machine).
 func findJetBrainsIDEs() ([]jetbrainsIDE, error) {
-	if runtime.GOOS != "darwin" {
-		return nil, nil // TODO: Linux (~/.local/share/JetBrains) / Windows (%APPDATA%\JetBrains)
-	}
 	home, err := config.Home()
 	if err != nil {
 		return nil, err
 	}
 
-	var apps []string
-	for _, base := range []string{"/Applications", filepath.Join(home, "Applications")} {
-		matches, _ := filepath.Glob(filepath.Join(base, "*.app"))
-		apps = append(apps, matches...)
+	// Per OS: every product-info.json to inspect (one per installed IDE) plus the
+	// base dir holding each IDE's per-user config (where its plugins/ dir lives).
+	infoPaths, configBase := jetbrainsInfoPathsAndConfigBase(home)
+	if configBase == "" {
+		return nil, nil // unsupported OS
 	}
 
 	var ides []jetbrainsIDE
 	seen := map[string]bool{}
-	for _, app := range apps {
-		data, err := os.ReadFile(filepath.Join(app, "Contents", "Resources", "product-info.json"))
+	for _, infoPath := range infoPaths {
+		data, err := os.ReadFile(infoPath)
 		if err != nil {
 			continue
 		}
@@ -216,9 +214,9 @@ func findJetBrainsIDEs() ([]jetbrainsIDE, error) {
 			pi.DataDirectoryName == "" || pi.BuildNumber == "" || pi.ProductCode == "" {
 			continue
 		}
-		configDir := filepath.Join(home, "Library", "Application Support", "JetBrains", pi.DataDirectoryName)
+		configDir := filepath.Join(configBase, pi.DataDirectoryName)
 		if !dirExists(configDir) || seen[configDir] {
-			continue // not a real per-user JetBrains config layout, or a duplicate bundle
+			continue // not a real per-user JetBrains config layout, or a duplicate install
 		}
 		seen[configDir] = true
 		ides = append(ides, jetbrainsIDE{
@@ -228,6 +226,84 @@ func findJetBrainsIDEs() ([]jetbrainsIDE, error) {
 		})
 	}
 	return ides, nil
+}
+
+// jetbrainsInfoPathsAndConfigBase returns the product-info.json paths to inspect
+// and the per-user JetBrains config base for the host OS. Every JetBrains IDE
+// ships a product-info.json in its install root (under Contents/Resources on
+// macOS) and keeps per-user config — including plugins/ — under a versioned
+// subdir of the config base. Returns configBase=="" on an unsupported OS.
+func jetbrainsInfoPathsAndConfigBase(home string) (infoPaths []string, configBase string) {
+	switch runtime.GOOS {
+	case "darwin":
+		for _, base := range []string{"/Applications", filepath.Join(home, "Applications")} {
+			matches, _ := filepath.Glob(filepath.Join(base, "*.app"))
+			for _, app := range matches {
+				infoPaths = append(infoPaths, filepath.Join(app, "Contents", "Resources", "product-info.json"))
+			}
+		}
+		return infoPaths, filepath.Join(home, "Library", "Application Support", "JetBrains")
+	case "windows":
+		var roots []string
+		if p := os.Getenv("LOCALAPPDATA"); p != "" {
+			roots = append(roots,
+				filepath.Join(p, "Programs"),                     // Toolbox default install root
+				filepath.Join(p, "JetBrains", "Toolbox", "apps"), // Toolbox app store
+			)
+		}
+		for _, pf := range []string{os.Getenv("ProgramFiles"), os.Getenv("ProgramFiles(x86)")} {
+			if pf != "" {
+				roots = append(roots, filepath.Join(pf, "JetBrains"))
+			}
+		}
+		for _, root := range roots {
+			infoPaths = append(infoPaths, findFilesUpTo(root, "product-info.json", 4)...)
+		}
+		appdata := os.Getenv("APPDATA")
+		if appdata == "" {
+			appdata = filepath.Join(home, "AppData", "Roaming")
+		}
+		return infoPaths, filepath.Join(appdata, "JetBrains")
+	case "linux":
+		roots := []string{
+			filepath.Join(home, ".local", "share", "JetBrains", "Toolbox", "apps"),
+			"/opt",
+			filepath.Join(home, ".local", "share"),
+		}
+		for _, root := range roots {
+			infoPaths = append(infoPaths, findFilesUpTo(root, "product-info.json", 4)...)
+		}
+		return infoPaths, filepath.Join(home, ".config", "JetBrains")
+	default:
+		return nil, ""
+	}
+}
+
+// findFilesUpTo walks root up to maxDepth levels deep and returns every path whose
+// base name is `name`. Bounded so a deep tree (Program Files, /opt) can't make the
+// scan crawl; missing roots and permission errors are skipped.
+func findFilesUpTo(root, name string, maxDepth int) []string {
+	var out []string
+	rootDepth := strings.Count(filepath.Clean(root), string(os.PathSeparator))
+	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			if d != nil && d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			if strings.Count(filepath.Clean(p), string(os.PathSeparator))-rootDepth > maxDepth {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.Name() == name {
+			out = append(out, p)
+		}
+		return nil
+	})
+	return out
 }
 
 // marketplaceUpdate is the subset of the JetBrains Marketplace "updates" API
