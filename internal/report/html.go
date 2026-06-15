@@ -5,12 +5,23 @@ import (
 	"fmt"
 	"html/template"
 	"math"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/blamely/blamely/internal/gitnotes"
 )
+
+// Keep the view-model field names intact under garble (the release build runs
+// `garble -literals -tiny`). html/template resolves `{{.ShortHash}}` etc. by
+// reflection at run time, which garble cannot trace through the `any` argument
+// of template.Execute — so by default it renames htmlVM's exported fields and the
+// template lookups fail ("can't evaluate field ShortHash"). Referencing the type
+// with reflect.TypeOf marks it — and, transitively, the field types reachable
+// from it (htmlGen/htmlAccepted/htmlFile/htmlRange/htmlLeader/htmlTool) — as used
+// in reflection, so garble preserves all their field names.
+var _ = reflect.TypeOf(htmlVM{})
 
 // RenderHTML builds a self-contained dark-dashboard HTML report for a commit's
 // blamely note — the "stats head" panel (AI/Human donut, changes, generation,
