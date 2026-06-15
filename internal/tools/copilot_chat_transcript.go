@@ -20,11 +20,54 @@ package tools
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 )
+
+// deleteFileDirectiveRe matches the `*** Delete File: <path>` line of an
+// apply_patch tool call as it appears (JSON-escaped) inside a chat-session JSONL.
+// The path runs until the JSON string escape (\) that precedes the patch's
+// newline, a closing quote, or a real newline.
+var deleteFileDirectiveRe = regexp.MustCompile(`\*\*\* Delete File: ([^"\\\n]+)`)
+
+// ChatSessionDeletedFiles scans a VS Code / Cursor chat-session JSONL for
+// `*** Delete File: <path>` directives — the apply_patch form a Copilot or Cursor
+// AGENT uses to remove a file. Returns the (usually absolute) paths it found.
+//
+// Used at commit time to credit an AI file deletion that left no edit record: a
+// pure delete produces no textEditGroup for the watcher to record, and the editor
+// plugin only attributes a deletion to AI within a short window after the last AI
+// edit — so an agent that deletes a file minutes later would otherwise fall to
+// Human. Best-effort: returns nil on read error.
+func ChatSessionDeletedFiles(path string) []string {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 16<<20)
+	seen := map[string]bool{}
+	var out []string
+	needle := []byte("*** Delete File: ")
+	for sc.Scan() {
+		if !bytes.Contains(sc.Bytes(), needle) {
+			continue
+		}
+		for _, m := range deleteFileDirectiveRe.FindAllStringSubmatch(sc.Text(), -1) {
+			p := strings.TrimSpace(m[1])
+			if p != "" && !seen[p] {
+				seen[p] = true
+				out = append(out, p)
+			}
+		}
+	}
+	return out
+}
 
 // chatRequest is one user→assistant exchange reconstructed from the delta log.
 type chatRequest struct {

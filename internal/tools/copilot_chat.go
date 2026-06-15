@@ -40,18 +40,25 @@ import (
 	"github.com/blamely/blamely/internal/store"
 )
 
-const copilotChatPollInterval = 3 * time.Second
+const copilotChatPollInterval = 2 * time.Second
 const copilotChatStaleCutoff = 24 * time.Hour
 
-// Adaptive polling: the 3s base cadence is fine when nothing is happening, but
-// it makes a freshly-typed chat edit take up to 3–4s to show up. So whenever a
-// session file changed recently we poll at copilotChatActiveInterval instead,
-// for a copilotChatActiveWindow grace period after the last observed change.
-// This cuts perceived detection latency to <1s during active use without
-// walking workspaceStorage any more often than before while idle.
+// Adaptive polling: the idle base cadence is fine when nothing is happening, but
+// it makes a freshly-typed chat edit take up to a couple seconds to show up. So
+// whenever a session file changed recently we poll at copilotChatActiveInterval
+// instead, for a copilotChatActiveWindow grace period after the last observed
+// change. This cuts detection latency during active use without walking
+// workspaceStorage any more often than before while idle.
+//
+// The window is sized to outlast a whole agent turn (thinking + tool calls +
+// streamed apply, which can run tens of seconds): Copilot only writes the
+// textEditGroup's `done=true` checkpoint at the END of the turn, and if the
+// window lapsed mid-turn we'd drop to the idle cadence and not record the edit
+// until the next slow poll. Keeping the fast cadence across the turn means the
+// edit is read within one active interval of Copilot finalizing it.
 const (
-	copilotChatActiveInterval = 600 * time.Millisecond
-	copilotChatActiveWindow   = 20 * time.Second
+	copilotChatActiveInterval = 300 * time.Millisecond
+	copilotChatActiveWindow   = 45 * time.Second
 )
 
 // ── Public watcher types ──────────────────────────────────────────────────────

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -307,11 +308,11 @@ func backfillFromClaudeTranscript(db *store.DB, note *Note, repoRoot, repoID str
 		switch f.Type {
 		case "ADDED":
 			if tools.MatchesFileOp(f.Path, written) {
-				flipFileToAI(note, f, "add", &chat)
+				flipFileToAI(note, f, "add", "claude", &chat)
 			}
 		case "DELETED":
 			if tools.MatchesFileOp(f.Path, deleted) {
-				flipFileToAI(note, f, "delete", &chat)
+				flipFileToAI(note, f, "delete", "claude", &chat)
 			}
 		case "MODIFIED":
 			// A whole-file overwrite (`cat > f` / Write) the AI committed in one
@@ -319,17 +320,89 @@ func backfillFromClaudeTranscript(db *store.DB, note *Note, repoRoot, repoID str
 			// line is the AI's. (A partial Edit is NOT in `written`, so a
 			// genuinely-mixed file still relies on per-line matching.)
 			if tools.MatchesFileOp(f.Path, written) {
-				flipFileToAI(note, f, "add", &chat)
-				flipFileToAI(note, f, "delete", &chat)
+				flipFileToAI(note, f, "add", "claude", &chat)
+				flipFileToAI(note, f, "delete", "claude", &chat)
 			}
 		}
 	}
 	note.Totals.AddedLines = note.Totals.AILines + note.Totals.HumanLines
 }
 
+// backfillFromChatSessions credits whole-file deletions a Copilot or Cursor AGENT
+// performed via an apply_patch `*** Delete File:` tool call. Such a deletion
+// produces no edit (no textEditGroup to record), and the editor plugin only
+// attributes a deletion to AI within a short window after the last AI edit — so an
+// agent that removes a file minutes after its last edit falls to Human. The chat
+// session JSONL still records the delete directive; we match it against this
+// commit's DELETED files and flip them to the owning AI tool. Only DELETED files
+// are touched, so per-line add/modify attribution is never overridden.
+func backfillFromChatSessions(db *store.DB, note *Note, repoRoot, repoID string, commitNanos int64) {
+	if note == nil || len(note.Files) == 0 {
+		return
+	}
+	hasDeleted := false
+	for i := range note.Files {
+		if note.Files[i].Type == string(FileDeleted) || note.Files[i].Type == "DELETED" {
+			hasDeleted = true
+			break
+		}
+	}
+	if !hasDeleted {
+		return
+	}
+	// Discover candidate chat sessions over a WIDE lookback, not just since the
+	// previous commit: a pure `*** Delete File:` leaves no edit row in the
+	// [prevCommit, commit] window, so the session that performed it is only
+	// findable via its EARLIER edits (the agent edited, the human committed, then
+	// the agent deleted in a later turn that produced no edit). This is safe — the
+	// flip below only applies to files DELETED in THIS commit whose exact path the
+	// session named, so an unrelated old session can't claim a deletion.
+	since := commitNanos - int64(2*time.Hour)
+	until := commitNanos + int64(5*time.Second)
+	refs, err := db.ChatSessionPathsForPeriod(repoID, since, until)
+	if err != nil || len(refs) == 0 {
+		return
+	}
+	chat := string(store.GenTypeChat)
+	if note.ByTool == nil {
+		note.ByTool = map[string]Tool{}
+	}
+	for _, ref := range refs {
+		tool := string(ref.Tool)
+		if tool == "" {
+			continue
+		}
+		raw := tools.ChatSessionDeletedFiles(ref.Path)
+		if len(raw) == 0 {
+			continue
+		}
+		// Prefer repo-relative paths so MatchesFileOp can match exactly; absolute
+		// paths still match by basename inside MatchesFileOp.
+		targets := make([]string, 0, len(raw))
+		for _, d := range raw {
+			if rel, err := filepath.Rel(repoRoot, d); err == nil && !strings.HasPrefix(rel, "..") {
+				targets = append(targets, filepath.ToSlash(rel))
+			} else {
+				targets = append(targets, d)
+			}
+		}
+		for i := range note.Files {
+			f := &note.Files[i]
+			if f.Type != string(FileDeleted) && f.Type != "DELETED" {
+				continue
+			}
+			if tools.MatchesFileOp(f.Path, targets) {
+				flipFileToAI(note, f, "delete", tool, &chat)
+			}
+		}
+	}
+	note.Totals.HumanDeletedLines = note.Totals.DeletedLines - note.Totals.AIDeletedLines
+}
+
 // flipFileToAI reassigns a whole file's Human-attributed ranges of the given
-// kind ("add"/"delete") to claude/chat and adjusts the note's running totals.
-func flipFileToAI(note *Note, f *FileEntry, kind string, gen *string) {
+// kind ("add"/"delete") to the given AI tool (chat gen_type) and adjusts the
+// note's running totals.
+func flipFileToAI(note *Note, f *FileEntry, kind, tool string, gen *string) {
 	for j := range f.Lines {
 		r := &f.Lines[j]
 		if r.Type != kind || r.AuthorType == "AI" {
@@ -337,22 +410,23 @@ func flipFileToAI(note *Note, f *FileEntry, kind string, gen *string) {
 		}
 		n := r.NumLines()
 		r.AuthorType = "AI"
-		r.Tool = "claude"
+		r.Tool = tool
 		r.GenType = gen
 		note.ByGenType.Human -= n
 		note.ByGenType.Chat += n
-		t := note.ByTool["claude"]
-		t.Lines += n
-		t.AcceptedLines += n
-		t.SuggestedLines += int64(n)
-		note.ByTool["claude"] = t
+		t := note.ByTool[tool]
 		if kind == "add" {
+			t.Lines += n
+			t.AcceptedLines += n
+			t.SuggestedLines += int64(n)
 			note.Totals.HumanLines -= n
 			note.Totals.AILines += n
 		} else {
+			t.DeletedLines += n
 			note.Totals.HumanDeletedLines -= n
 			note.Totals.AIDeletedLines += n
 		}
+		note.ByTool[tool] = t
 	}
 }
 
@@ -396,6 +470,10 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	// Human because the commit — and this note — preceded the PostToolUse hook
 	// that would have recorded the edit; the AI's transcript still proves it.
 	backfillFromClaudeTranscript(db, note, repoPath, repoID, commitNanos)
+	// Same idea for Copilot/Cursor agents: a `*** Delete File:` tool call in the
+	// chat session removes a file with no edit record, so the deletion would
+	// otherwise attribute to Human. Credit it to the owning AI tool.
+	backfillFromChatSessions(db, note, repoPath, repoID, commitNanos)
 	// Branch + commit message are commit-scoped metadata; capture from git
 	// while we still have the working tree handy.
 	note.Branch = BranchName(repoPath)
