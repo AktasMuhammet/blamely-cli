@@ -632,6 +632,134 @@ func TestBuildNote_CopyPasteOfAIBlockIsHuman(t *testing.T) {
 	}
 }
 
+// TestBuildNote_NarrowedDeltaDuplicateStaysAI reproduces the bug where an AI
+// line that legitimately appears TWICE in the final file (the agent generated a
+// second copy in a later apply) was mislabeled Human. The first apply is a FULL
+// recording (role@3); the second apply is a NARROWED delta that recorded only
+// its genuinely-new copy (role@10) and dropped the first copy because it was
+// unchanged in the pre-chat snapshot. The committed file has the first copy
+// drifted to line 5 and the second at line 10 — both AI. With a max-over-edits
+// budget, recorded=1, the exact match at line 10 exhausts it, and line 5 falls
+// to Human. Summing narrowed deltas (recorded = max(full) + sum(narrowed) = 2)
+// keeps the drifted copy AI.
+func TestBuildNote_NarrowedDeltaDuplicateStaysAI(t *testing.T) {
+	db := openTestDB(t)
+	repo := "/r"
+	commitNanos := time.Now().UnixNano()
+
+	// Apply 1: a FULL recording (no narrowed flag) — role at line 3.
+	if _, err := db.InsertEdit(store.Edit{
+		TimestampNanos: commitNanos - int64(10*time.Second),
+		RepoPath:       repo,
+		FilePath:       "app.js",
+		Tool:           store.ToolCopilot,
+		Confidence:     store.ConfidenceHigh,
+		GenType:        store.GenTypeChat,
+		Lines: []store.EditLine{
+			{StartLine: 3, EndLine: 3, ContentSHA: sha256HexStr([]byte("role"))},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Apply 2: a NARROWED delta — only the genuinely-new second copy at line 10.
+	if _, err := db.InsertEdit(store.Edit{
+		TimestampNanos: commitNanos - int64(5*time.Second),
+		RepoPath:       repo,
+		FilePath:       "app.js",
+		Tool:           store.ToolCopilot,
+		Confidence:     store.ConfidenceHigh,
+		GenType:        store.GenTypeChat,
+		RawMeta:        sql.NullString{String: `{"source":"copilot_chat_textedit","narrowed":true}`, Valid: true},
+		Lines: []store.EditLine{
+			{StartLine: 10, EndLine: 10, ContentSHA: sha256HexStr([]byte("role"))},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Committed file: apply-1's copy drifted to line 5, apply-2's copy at line 10.
+	added := []AddedLine{
+		{File: "app.js", LineNum: 5, Content: "role"},
+		{File: "app.js", LineNum: 10, Content: "role"},
+	}
+
+	note, err := buildNote(db, repo, "abc123", commitNanos, added, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("buildNote: %v", err)
+	}
+	got := map[int]string{}
+	for _, l := range expandLines(note.Files[0]) {
+		if l.Type == "add" {
+			got[l.Line] = l.AuthorType
+		}
+	}
+	for _, ln := range []int{5, 10} {
+		if got[ln] != "AI" {
+			t.Errorf("line %d: want AI, got %s", ln, got[ln])
+		}
+	}
+}
+
+// TestBuildNote_ClipboardPastePinnedHuman reproduces the worst copy-paste case:
+// the human pastes a duplicate of AI content at the very line the AI originally
+// produced it (the paste then pushes the AI's own copy down). By content+position
+// alone the paste "steals" the exact-position match and reads AI, while the real
+// AI line, now drifted, runs out of budget and reads Human — exactly inverted.
+// The editor plugin records the paste as a copypaste edit at its exact line; we
+// pin that line Human and free the budget so the drifted AI copy reads AI.
+func TestBuildNote_ClipboardPastePinnedHuman(t *testing.T) {
+	db := openTestDB(t)
+	repo := "/r"
+	commitNanos := time.Now().UnixNano()
+
+	// AI generated "x" at line 1.
+	if _, err := db.InsertEdit(store.Edit{
+		TimestampNanos: commitNanos - int64(10*time.Second),
+		RepoPath:       repo,
+		FilePath:       "app.js",
+		Tool:           store.ToolCopilot,
+		Confidence:     store.ConfidenceHigh,
+		GenType:        store.GenTypeChat,
+		Lines:          []store.EditLine{{StartLine: 1, EndLine: 1, ContentSHA: sha256HexStr([]byte("x"))}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Human pasted "x" at line 1 (plugin recorded it), pushing the AI copy down.
+	if _, err := db.InsertEdit(store.Edit{
+		TimestampNanos: commitNanos - int64(5*time.Second),
+		RepoPath:       repo,
+		FilePath:       "app.js",
+		Tool:           store.ToolCopyPaste,
+		Confidence:     store.ConfidenceHigh,
+		GenType:        store.GenTypeHuman,
+		Lines:          []store.EditLine{{StartLine: 1, EndLine: 1, ContentSHA: sha256HexStr([]byte("x"))}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Committed: line 1 is the paste, line 3 is the AI original (drifted down).
+	added := []AddedLine{
+		{File: "app.js", LineNum: 1, Content: "x"},
+		{File: "app.js", LineNum: 3, Content: "x"},
+	}
+	note, err := buildNote(db, repo, "abc123", commitNanos, added, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("buildNote: %v", err)
+	}
+	got := map[int]string{}
+	for _, l := range expandLines(note.Files[0]) {
+		if l.Type == "add" {
+			got[l.Line] = l.AuthorType
+		}
+	}
+	if got[1] != "Human" {
+		t.Errorf("line 1 (paste): want Human, got %s", got[1])
+	}
+	if got[3] != "AI" {
+		t.Errorf("line 3 (AI original): want AI, got %s", got[3])
+	}
+}
+
 // TestBuildNote_AutoformatterDriftNormalizedFallback reproduces the
 // "AI generates code, then an autoformatter reflows it" bug: the AI's edit was
 // recorded with content_sha for "\treturn 1" (tab indent), but an

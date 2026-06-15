@@ -12,8 +12,9 @@ import (
 // blamelyExtensionID is the marketplace/registry identifier for the Blamely
 // extension. The same publisher.name id resolves across every VS Code-family
 // gallery we target:
-//   https://marketplace.visualstudio.com/items?itemName=Blamely.blamely  (VS Code)
-//   https://open-vsx.org/extension/blamely/blamely                       (Open VSX — Antigravity IDE's gallery, Cursor's fallback)
+//
+//	https://marketplace.visualstudio.com/items?itemName=Blamely.blamely  (VS Code)
+//	https://open-vsx.org/extension/blamely/blamely                       (Open VSX — Antigravity IDE's gallery, Cursor's fallback)
 const blamelyExtensionID = "Blamely.blamely"
 
 // signatureVerificationError is VS Code's own message when its bundled

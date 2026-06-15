@@ -825,6 +825,32 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		}
 		sessionEditsByFile[file] = sessionEdits
 
+		// Explicit clipboard pastes. The editor plugin records a paste as a
+		// copypaste edit carrying the pasted lines at their exact positions (see
+		// CompletionDetector.maybeRecordPaste). A committed line that one of those
+		// covers at its exact position, with matching content, is a human paste —
+		// even if its text duplicates AI-generated content elsewhere. We pin those
+		// lines Human and exclude them from the AI budget below, so the paste no
+		// longer steals the AI original's exact-position match (which scattered the
+		// Human label onto the wrong occurrence). Exact position only: a copypaste
+		// edit never drift-claims, so it can't mislabel AI repeats elsewhere.
+		pastedLines := map[int]bool{}
+		for i := range sessionEdits {
+			e := &sessionEdits[i]
+			if e.Tool != store.ToolCopyPaste || e.TimestampNanos <= sinceNanos || e.TimestampNanos > maxNanos {
+				continue
+			}
+			for _, l := range e.Lines {
+				if l.ContentSHA == "" {
+					continue
+				}
+				content := lineContent[fileLineKey{file, l.StartLine}]
+				if content != "" && l.ContentSHA == sha256HexStr([]byte(content)) {
+					pastedLines[l.StartLine] = true
+				}
+			}
+		}
+
 		// Drift budgets. A content_sha matched at its EXACT recorded line is always
 		// trusted as AI. The position-independent "drift" fallback (an AI line the
 		// user shifted) is RATIONED: a content may be drift-attributed to AI at
@@ -837,17 +863,26 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		// claim, so the original stays AI and the paste stays Human).
 		// driftBudgetNorm is the same for the whitespace-normalized (autoformatter)
 		// fallback, keyed by content_sha_norm.
-		// recordedSHA/recordedNorm = the MOST copies of a content the AI had in
-		// any SINGLE edit (the max over edits, NOT the sum). Tools that re-save a
-		// whole file across a session record the same lines repeatedly — an
-		// Antigravity conversation may persist a file as both a 700-line and a
-		// 190-line version — and summing those would over-count how many copies
-		// the AI actually authored, letting a human's exact duplicate of an AI
-		// line drift-match as AI. The max reflects the AI's real production: if
-		// its busiest version had the line twice, it produced two copies, and a
-		// third copy in the commit is the human's.
-		recordedSHA := map[string]int{}
-		recordedNorm := map[string]int{}
+		// recordedSHA/recordedNorm = how many copies of a content the AI authored.
+		// Two kinds of edits combine differently:
+		//
+		//   - FULL re-saves (a tool persisting the whole file repeatedly — an
+		//     Antigravity conversation may store a file as both a 700-line and a
+		//     190-line version) record the same lines over and over, so we take the
+		//     MAX over them: if the busiest version had a line twice, the AI
+		//     produced two copies, and a third copy in the commit is the human's.
+		//   - NARROWED deltas (a chat/agent apply that recorded only the lines
+		//     differing from the pre-chat snapshot — see copilot_chat.go) record
+		//     DISTINCT new lines, never re-recording what an earlier apply already
+		//     covered. Those SUM: an AI line re-included unchanged by a later
+		//     narrowed apply was dropped by that apply, so without summing its
+		//     earlier recording it would lose drift budget and fall to Human.
+		//
+		// So recorded = max(full edits) + sum(narrowed deltas).
+		maxFullSHA := map[string]int{}
+		sumNarrowedSHA := map[string]int{}
+		maxFullNorm := map[string]int{}
+		sumNarrowedNorm := map[string]int{}
 		for i := range sessionEdits {
 			e := &sessionEdits[i]
 			if e.TimestampNanos <= sinceNanos || e.TimestampNanos > maxNanos || isNonAITool(e.Tool) {
@@ -863,20 +898,46 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 					perEditNorm[l.ContentSHANorm]++
 				}
 			}
-			for k, v := range perEditSHA {
-				if v > recordedSHA[k] {
-					recordedSHA[k] = v
+			if editIsNarrowed(e) {
+				for k, v := range perEditSHA {
+					sumNarrowedSHA[k] += v
+				}
+				for k, v := range perEditNorm {
+					sumNarrowedNorm[k] += v
+				}
+			} else {
+				for k, v := range perEditSHA {
+					if v > maxFullSHA[k] {
+						maxFullSHA[k] = v
+					}
+				}
+				for k, v := range perEditNorm {
+					if v > maxFullNorm[k] {
+						maxFullNorm[k] = v
+					}
 				}
 			}
-			for k, v := range perEditNorm {
-				if v > recordedNorm[k] {
-					recordedNorm[k] = v
-				}
-			}
+		}
+		recordedSHA := map[string]int{}
+		recordedNorm := map[string]int{}
+		for k, v := range maxFullSHA {
+			recordedSHA[k] = v
+		}
+		for k, v := range sumNarrowedSHA {
+			recordedSHA[k] += v
+		}
+		for k, v := range maxFullNorm {
+			recordedNorm[k] = v
+		}
+		for k, v := range sumNarrowedNorm {
+			recordedNorm[k] += v
 		}
 		exactSHA := map[string]int{}  // committed lines matched at their exact recorded position
 		exactNorm := map[string]int{} // ditto, normalized
 		for _, ln := range lineNos {
+			if pastedLines[ln] {
+				continue // explicit human paste — not an AI line, must not consume budget
+			}
 			content := lineContent[fileLineKey{file, ln}]
 			if content == "" {
 				continue
@@ -926,6 +987,12 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			// canonical representation; humans aren't a tool.
 			content := lineContent[fileLineKey{file, ln}]
 			p := perLine{file: file, line: ln, content: content, tool: "", genType: store.GenTypeHuman}
+			// Explicit clipboard paste: keep Human, skip AI matching entirely so the
+			// pasted line isn't claimed by a content match to AI code elsewhere.
+			if pastedLines[ln] {
+				resolved = append(resolved, p)
+				continue
+			}
 			// Primary: a session edit covering this line by range OR content_sha
 			// (content_sha must be at this exact line), bounded by the previous
 			// commit (intra-session separator).
@@ -1051,7 +1118,7 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		if len(delLines) > 0 {
 			delEdits := deletionEditsForFile(curFileEntry.Path)
 			remSHA, remNorm := removedHashMultisets(delEdits)
-			curFileEntry.acc = append(curFileEntry.acc, attributeDeletedLines(delLines, delEdits, 0, maxNanos, remSHA, remNorm, &note.Totals, &note.ByGenType)...)
+			curFileEntry.acc = append(curFileEntry.acc, attributeDeletedLines(delLines, delEdits, sinceNanos, maxNanos, remSHA, remNorm, &note.Totals, &note.ByGenType)...)
 		}
 		curFileEntry.Deleted = len(delLines)
 		note.Totals.DeletedLines += curFileEntry.Deleted
@@ -1157,7 +1224,7 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		fe := FileEntry{Path: path, Type: string(kind), Deleted: len(delLines)}
 		delEdits := deletionEditsForFile(path)
 		remSHA, remNorm := removedHashMultisets(delEdits)
-		acc := attributeDeletedLines(delLines, delEdits, 0, maxNanos, remSHA, remNorm, &note.Totals, &note.ByGenType)
+		acc := attributeDeletedLines(delLines, delEdits, sinceNanos, maxNanos, remSHA, remNorm, &note.Totals, &note.ByGenType)
 		fe.Lines = collapseToRanges(acc)
 		note.Files = append(note.Files, fe)
 		note.Totals.DeletedLines += fe.Deleted
@@ -1612,6 +1679,26 @@ func coversContentSHANorm(lines []store.EditLine, content string, ln int) bool {
 		return true
 	}
 	return false
+}
+
+// editIsNarrowed reports whether an edit was recorded as a NARROWED delta
+// (it captured only the lines that differ from a pre-chat snapshot, rather than
+// the whole applied text). The recorder stamps `"narrowed":true` into raw_meta
+// (see tools.recordTextEditGroup). Such edits record distinct new lines, so the
+// drift budget sums them across edits instead of taking the max. A missing or
+// false flag (every non-chat tool, and chat applies with no fresh snapshot)
+// means a full recording, which is max'd.
+func editIsNarrowed(e *store.Edit) bool {
+	if e == nil || !e.RawMeta.Valid || e.RawMeta.String == "" {
+		return false
+	}
+	var meta struct {
+		Narrowed bool `json:"narrowed"`
+	}
+	if err := json.Unmarshal([]byte(e.RawMeta.String), &meta); err != nil {
+		return false
+	}
+	return meta.Narrowed
 }
 
 func confidenceFor(tool store.Tool, e *store.Edit) store.Confidence {

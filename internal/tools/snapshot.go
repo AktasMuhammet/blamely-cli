@@ -53,6 +53,45 @@ func fetchSnapshot(repoPath, filePath string) (content string, ok bool) {
 	return out.Content, out.Found
 }
 
+// fetchPreChatSnapshot retrieves the pre-chat file content stored by the VS
+// Code plugin via PUT /snapshot. The entry is consumed (deleted) on first
+// read, so subsequent calls return ok=false. Returns ok=false if no entry
+// exists — the caller should then fall back to recording all lines rather
+// than applying multiset narrowing, which would miss AI line-reordering edits.
+func fetchPreChatSnapshot(repoPath, filePath string) (content string, ok bool) {
+	q := url.Values{"repo": {repoPath}, "file": {filePath}}
+
+	var client *http.Client
+	var reqURL string
+	if sock, serr := daemon.ReadSocket(); serr == nil {
+		client = daemon.UnixHTTPClient(sock)
+		reqURL = "http://unix/prechat-snapshot?" + q.Encode()
+	} else if port, perr := daemon.ReadPort(); perr == nil {
+		client = &http.Client{Timeout: 2 * time.Second}
+		reqURL = fmt.Sprintf("http://127.0.0.1:%d/prechat-snapshot?%s", port, q.Encode())
+	} else {
+		return "", false
+	}
+
+	resp, err := client.Get(reqURL)
+	if err != nil {
+		return "", false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return "", false
+	}
+
+	var out struct {
+		Content string `json:"content"`
+		Found   bool   `json:"found"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", false
+	}
+	return out.Content, out.Found
+}
+
 // removedLinesForTextEditRange computes removed-line hashes for an editor
 // text-edit that replaces lines [startLine, endLine) of snapshot (1-based,
 // VS Code's half-open range convention: endLine is exclusive) with newText.

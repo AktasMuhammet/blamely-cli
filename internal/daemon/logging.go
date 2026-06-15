@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"io"
 	"log"
 	"os"
 	"sync"
@@ -40,7 +41,12 @@ func setupLogging(ctx context.Context) func() {
 		log.Printf("logging: cannot create ~/.blamely: %v", err)
 		return func() {}
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	// O_RDWR (not O_WRONLY|O_APPEND): prune reads, truncates and rewrites the
+	// file through THIS one handle with explicit Seeks. A second handle plus
+	// O_APPEND+Truncate is unreliable on Windows (the rewrite could no-op,
+	// leaving the file unpruned); one read-write handle behaves identically on
+	// every platform.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		log.Printf("logging: cannot open %s: %v", path, err)
 		return func() {}
@@ -70,6 +76,11 @@ type rotatingLog struct {
 func (r *rotatingLog) Write(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// Without O_APPEND we position writes ourselves: seek to EOF so log lines
+	// always extend the file (and land correctly after a prune rewrite).
+	if _, err := r.f.Seek(0, io.SeekEnd); err != nil {
+		return 0, err
+	}
 	return r.f.Write(p)
 }
 
@@ -81,7 +92,12 @@ func (r *rotatingLog) prune() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	data, err := os.ReadFile(r.path)
+	// Read the whole file through our own handle (seek to start first), so we
+	// never open a second descriptor — the source of the Windows flakiness.
+	if _, err := r.f.Seek(0, io.SeekStart); err != nil {
+		return
+	}
+	data, err := io.ReadAll(r.f)
 	if err != nil || len(data) == 0 {
 		return
 	}
@@ -92,7 +108,9 @@ func (r *rotatingLog) prune() {
 	if err := r.f.Truncate(0); err != nil {
 		return
 	}
-	// f is O_APPEND, so this write lands at the (now zero) end of file.
+	if _, err := r.f.Seek(0, io.SeekStart); err != nil {
+		return
+	}
 	if _, err := r.f.Write(kept); err != nil {
 		log.Printf("logging: prune rewrite failed: %v", err)
 	}

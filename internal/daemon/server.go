@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -40,6 +41,12 @@ func UnixHTTPClient(sockPath string) *http.Client {
 type Server struct {
 	db   *store.DB
 	http *http.Server
+
+	// preChatSnaps holds file content PUT by the VS Code plugin right before a
+	// chat apply. Keyed by "repo\x00file". The chat watcher consumes the entry
+	// (deletes on first read) so it's only used once per apply. Guarded by mu.
+	preChatMu   sync.Mutex
+	preChatSnaps map[string]string
 }
 
 // EditPayload is the JSON body POSTed to /edit by tool integrations.
@@ -130,6 +137,7 @@ func Run(ctx context.Context) error {
 	mux.HandleFunc("/edit", s.ingest)
 	mux.HandleFunc("/fs", s.fsEvent)
 	mux.HandleFunc("/snapshot", s.snapshot)
+	mux.HandleFunc("/prechat-snapshot", s.preChatSnapshot)
 
 	// Prefer a Unix domain socket — it bypasses network security tools (e.g.
 	// Trend Micro) that intercept localhost TCP. Falls back to a random TCP port
@@ -222,10 +230,17 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 // content at HEAD; found=false if neither is available (e.g. a brand-new
 // untracked file — correctly yields no removed lines).
 func (s *Server) snapshot(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "GET required", http.StatusMethodNotAllowed)
-		return
+	switch r.Method {
+	case http.MethodGet:
+		s.snapshotGet(w, r)
+	case http.MethodPut:
+		s.snapshotPut(w, r)
+	default:
+		http.Error(w, "GET or PUT required", http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *Server) snapshotGet(w http.ResponseWriter, r *http.Request) {
 	repo := r.URL.Query().Get("repo")
 	file := r.URL.Query().Get("file")
 	if repo == "" || file == "" {
@@ -249,6 +264,64 @@ func (s *Server) snapshot(w http.ResponseWriter, r *http.Request) {
 		Content string `json:"content"`
 		Found   bool   `json:"found"`
 	}{Content: content, Found: ok})
+}
+
+// snapshotPut stores the pre-chat file content in an in-memory map so the
+// chat watcher can use it as an accurate diff baseline. Using in-memory (not
+// the DB) means: (a) the entry is consumed once and deleted on first read —
+// subsequent watcher polls see nothing and fall back to recording all lines,
+// which is the safe behavior after a restart; (b) non-plugin users never have
+// a pre-chat entry so the watcher always falls back to all-lines attribution,
+// which correctly handles AI line-reordering / block-swap edits that the
+// multiset diff would otherwise miss.
+func (s *Server) snapshotPut(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Repo    string `json:"repo"`
+		File    string `json:"file"`
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Repo == "" || req.File == "" {
+		http.Error(w, "repo, file, content required", http.StatusBadRequest)
+		return
+	}
+	req.File = cleanRel(req.File)
+	key := req.Repo + "\x00" + req.File
+	s.preChatMu.Lock()
+	if s.preChatSnaps == nil {
+		s.preChatSnaps = make(map[string]string)
+	}
+	s.preChatSnaps[key] = req.Content
+	s.preChatMu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// preChatSnapshot serves GET /prechat-snapshot. Returns the content PUT by
+// the plugin and immediately deletes the entry (consume-once). Returns
+// found=false if no entry exists (non-plugin user, restart, or timing race).
+func (s *Server) preChatSnapshot(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET required", http.StatusMethodNotAllowed)
+		return
+	}
+	repo := r.URL.Query().Get("repo")
+	file := r.URL.Query().Get("file")
+	if repo == "" || file == "" {
+		http.Error(w, "repo, file required", http.StatusBadRequest)
+		return
+	}
+	file = cleanRel(file)
+	key := repo + "\x00" + file
+	s.preChatMu.Lock()
+	content, found := s.preChatSnaps[key]
+	if found {
+		delete(s.preChatSnaps, key)
+	}
+	s.preChatMu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		Content string `json:"content"`
+		Found   bool   `json:"found"`
+	}{Content: content, Found: found})
 }
 
 // headFileContent returns file's content at HEAD in repoPath, or ok=false if

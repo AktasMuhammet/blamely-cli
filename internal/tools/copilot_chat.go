@@ -484,9 +484,44 @@ func (w *chatSessionWatcher) recordTextEditGroup(teg *textEditGroupPart, model, 
 		return
 	}
 
+	// Resolve the repo and relative path early so we can fetch the pre-chat
+	// snapshot for narrowing (see snapshotPut in server.go).
+	if r, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = r
+	}
+	repo, _ := gitutil.RepoID(abs)
+	rel := abs
+	if repo != "" {
+		wt, _ := gitutil.Toplevel(abs)
+		if wt != "" {
+			if r, err := filepath.Rel(wt, abs); err == nil && !strings.HasPrefix(r, "..") {
+				rel = r
+			}
+		}
+	}
+
+	// Fetch the pre-chat snapshot stored by the VS Code plugin via PUT /snapshot.
+	// This is consume-once (deleted on first read) and only exists when the
+	// plugin is installed. If absent (non-plugin user, daemon restart, or timing
+	// race), hasFreshSnap=false and the watcher falls back to recording all lines
+	// rather than applying multiset narrowing — this preserves correct attribution
+	// for AI line-reordering / block-swap edits that the multiset diff would miss.
+	snapshot, hasFreshSnap := "", false
+	if repo != "" {
+		snapshot, hasFreshSnap = fetchPreChatSnapshot(repo, rel)
+	}
+
 	var ranges []daemon.LineRange
 	var suggested int64
 	hasRemoval := false
+	// narrowed marks this edit as a DELTA (it recorded only the lines that
+	// differ from the pre-chat snapshot, dropping unchanged ones). The note's
+	// drift budget needs this: a delta records DISTINCT new AI lines, so its
+	// per-content counts SUM across edits, whereas a full re-save records the
+	// same lines repeatedly and must be MAX'd. Without the distinction, an AI
+	// line the agent re-included unchanged in a later narrowed apply (so this
+	// edit didn't re-record it) loses its drift budget and falls to Human.
+	narrowed := false
 	for _, grp := range teg.Edits {
 		for _, e := range grp {
 			// endLineNumber > startLineNumber means this edit's range spans
@@ -504,15 +539,32 @@ func (w *chatSessionWatcher) recordTextEditGroup(teg *textEditGroupPart, model, 
 			if start <= 0 {
 				start = 1
 			}
-			for i, lt := range strings.Split(strings.TrimSuffix(e.Text, "\n"), "\n") {
-				ln := start + i
-				text := strings.TrimRight(lt, "\r")
-				ranges = append(ranges, daemon.LineRange{
-					Start: ln, End: ln,
-					ContentSHA:     sha256Hex([]byte(text)),
-					ContentSHANorm: sha256HexNorm(text),
-				})
-				suggested++
+			allLines := strings.Split(strings.TrimSuffix(e.Text, "\n"), "\n")
+			suggested += int64(len(allLines))
+
+			if e.Range.EndLineNumber > e.Range.StartLineNumber && hasFreshSnap {
+				// Narrowing: only record lines that differ from the pre-chat file
+				// content. The plugin PUT the pre-chat snapshot before the watcher
+				// polls, so this diff correctly excludes unchanged human-typed lines.
+				narrowed = true
+				for _, relPos := range chatNarrowedPositions(snapshot, start, e.Range.EndLineNumber, e.Text) {
+					text := strings.TrimRight(allLines[relPos-1], "\r")
+					ranges = append(ranges, daemon.LineRange{
+						Start: start + relPos - 1, End: start + relPos - 1,
+						ContentSHA:     sha256Hex([]byte(text)),
+						ContentSHANorm: sha256HexNorm(text),
+					})
+				}
+			} else {
+				// Pure insertion or no snapshot: record all lines.
+				for i, lt := range allLines {
+					text := strings.TrimRight(lt, "\r")
+					ranges = append(ranges, daemon.LineRange{
+						Start: start + i, End: start + i,
+						ContentSHA:     sha256Hex([]byte(text)),
+						ContentSHANorm: sha256HexNorm(text),
+					})
+				}
 			}
 		}
 	}
@@ -544,32 +596,24 @@ func (w *chatSessionWatcher) recordTextEditGroup(teg *textEditGroupPart, model, 
 		return
 	}
 
-	if r, err := filepath.EvalSymlinks(abs); err == nil {
-		abs = r
-	}
-	repo, _ := gitutil.RepoID(abs)
 	if repo == "" {
 		return
 	}
-	wt, _ := gitutil.Toplevel(abs)
-	rel := abs
-	if wt != "" {
-		if r, err := filepath.Rel(wt, abs); err == nil && !strings.HasPrefix(r, "..") {
-			rel = r
-		}
-	}
 
-	// Copilot's textEditGroup edits carry only the new text and a line range,
-	// not the replaced text — fetch the daemon's cached snapshot (the file's
-	// content as of its last recorded edit) so multi-line replacements can
-	// still be checked for removed lines.
+	// Removed-line attribution: use the pre-chat snapshot if the plugin
+	// provided one; otherwise fall back to the regular cached snapshot so
+	// non-plugin users still get removed-line attribution.
 	var removed []DeletedLineHash
 	if hasRemoval {
-		if snapshot, ok := fetchSnapshot(repo, rel); ok {
+		removalSnap := snapshot
+		if !hasFreshSnap {
+			removalSnap, _ = fetchSnapshot(repo, rel)
+		}
+		if removalSnap != "" {
 			for _, grp := range teg.Edits {
 				for _, e := range grp {
 					if e.Range.EndLineNumber > e.Range.StartLineNumber {
-						removed = append(removed, removedLinesForTextEditRange(snapshot, e.Range.StartLineNumber, e.Range.EndLineNumber, e.Text)...)
+						removed = append(removed, removedLinesForTextEditRange(removalSnap, e.Range.StartLineNumber, e.Range.EndLineNumber, e.Text)...)
 					}
 				}
 			}
@@ -587,14 +631,40 @@ func (w *chatSessionWatcher) recordTextEditGroup(teg *textEditGroupPart, model, 
 		Lines:          ranges,
 		SuggestedLines: suggested,
 		RemovedLines:   toDaemonRemovedLines(removed),
-		RawMeta: fmt.Sprintf(`{"source":"copilot_chat_textedit","tool":%q,"chat_session_path":%q}`,
-			string(w.tool), sessionPath),
+		RawMeta: fmt.Sprintf(`{"source":"copilot_chat_textedit","tool":%q,"chat_session_path":%q,"narrowed":%t}`,
+			string(w.tool), sessionPath, narrowed),
 	}
 	if err := sink.Record(ev); err != nil {
 		log.Printf("%s-chat textedit sink: %v", w.tool, err)
 	} else {
 		log.Printf("%s-chat: apply %s lines=%d model=%s", w.tool, rel, len(ranges), model)
 	}
+}
+
+// chatNarrowedPositions returns the 1-based positions (within newText) of lines
+// that are genuinely new or changed relative to the pre-chat file content at
+// [startLine, endLine). Used to exclude unchanged human-typed lines from the
+// watcher's attribution when the plugin has stored the pre-chat snapshot.
+func chatNarrowedPositions(snapshot string, startLine, endLine int, newText string) []int {
+	lines := strings.Split(snapshot, "\n")
+	if n := len(lines); n > 0 && lines[n-1] == "" {
+		lines = lines[:n-1]
+	}
+	last := endLine - 1
+	if last > len(lines) {
+		last = len(lines)
+	}
+	var oldSection []byte
+	if startLine-1 >= 0 && startLine-1 < len(lines) {
+		oldSection = []byte(strings.Join(lines[startLine-1:last], "\n"))
+	}
+	var positions []int
+	for _, r := range AddedOrChangedRanges(oldSection, []byte(newText)) {
+		for p := r.Start; p <= r.End; p++ {
+			positions = append(positions, p)
+		}
+	}
+	return positions
 }
 
 // applyModel updates the session's display model from a raw selectedModel
