@@ -37,6 +37,21 @@ func RenderHTML(note *gitnotes.Note, meta commitMeta_) (string, error) {
 	return buf.String(), nil
 }
 
+// noteVersion returns the blamely version that GENERATED this commit's
+// attribution, read from the note's `generated_by` ("blamely <version>"). The
+// footer should credit the version that wrote the note, not the (possibly newer)
+// version rendering the report. Falls back to the running version when the note
+// predates generated_by or carries an unexpected shape.
+func noteVersion(note *gitnotes.Note) string {
+	if note != nil {
+		v := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(note.GeneratedBy), "blamely"))
+		if v != "" {
+			return v
+		}
+	}
+	return Version
+}
+
 // ---- view model ---------------------------------------------------------
 
 type htmlVM struct {
@@ -178,7 +193,7 @@ func buildHTMLModel(note *gitnotes.Note, meta commitMeta_) htmlVM {
 		Author:       meta["author"],
 		Ago:          agoFromDate(meta["date"]),
 		Date:         shortDate(meta["date"]),
-		Version:      Version,
+		Version:      noteVersion(note),
 		AILines:      aiTouched,
 		HumanLines:   humanTouched,
 		Added:        added,

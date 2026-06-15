@@ -203,7 +203,7 @@ func renderStats(w io.Writer, note *gitnotes.Note, meta commitMeta_, sessionNano
 		inlineMeta(w, "Coding", dim(fmt.Sprintf("~%d min   first edit %s commit", mins, glyphArr)))
 	}
 	fmt.Fprintln(w)
-	versionLine(w)
+	versionLine(w, noteVersion(note))
 	fmt.Fprintln(w)
 }
 

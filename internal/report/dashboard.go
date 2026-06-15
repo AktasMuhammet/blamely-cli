@@ -42,7 +42,7 @@ func renderDashboard(w io.Writer, note *gitnotes.Note, meta commitMeta_, withRan
 	}
 
 	fmt.Fprintln(w)
-	versionLine(w)
+	versionLine(w, noteVersion(note))
 	fmt.Fprintln(w)
 }
 

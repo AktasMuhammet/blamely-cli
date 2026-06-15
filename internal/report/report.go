@@ -129,7 +129,7 @@ func printNote(n *gitnotes.Note) {
 
 	if len(n.Files) == 0 {
 		fmt.Fprintln(w)
-		versionLine(w)
+		versionLine(w, noteVersion(n))
 		return
 	}
 	sectionHead(w, "Files")
@@ -149,7 +149,7 @@ func printNote(n *gitnotes.Note) {
 		}
 	}
 	fmt.Fprintln(w)
-	versionLine(w)
+	versionLine(w, noteVersion(n))
 	fmt.Fprintln(w)
 }
 

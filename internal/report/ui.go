@@ -25,10 +25,12 @@ const (
 // with the real resolved version.
 var Version = "dev"
 
-// versionLine renders the dim footer that stamps the report with the current
-// blamely version.
-func versionLine(w io.Writer) {
-	fmt.Fprintf(w, "%s%s\n", gutter, dim("blamely "+Version))
+// versionLine renders the dim footer that stamps the report with the blamely
+// version that GENERATED the note's attribution (pass noteVersion(note)), not the
+// version rendering the report — so a footer on an old commit credits the version
+// that actually produced it.
+func versionLine(w io.Writer, version string) {
+	fmt.Fprintf(w, "%s%s\n", gutter, dim("blamely "+version))
 }
 
 // accent is the single brand color used for titles and the active value in a
