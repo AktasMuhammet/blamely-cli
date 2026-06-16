@@ -22,7 +22,7 @@ import (
 // JetBrains plugins. The release workflow can still override it at link time via
 // `-ldflags "-X main.version=<tag>"`; otherwise this hardcoded value is what
 // `blamely --version` reports.
-var version = "1.6.0"
+var version = "1.6.1"
 
 // resolveVersion returns the effective CLI version. Precedence:
 //  1. an explicit -ldflags override (release builds);
@@ -89,6 +89,7 @@ func main() {
 
 	root.AddCommand(cmdDaemon())
 	root.AddCommand(cmdInstall())
+	root.AddCommand(cmdInstallJetbrainsZip())
 	root.AddCommand(cmdUninstall())
 	root.AddCommand(cmdRepair())
 	root.AddCommand(cmdDetect())
@@ -247,6 +248,39 @@ func cmdInstall() *cobra.Command {
 	c.Flags().BoolVar(&skipPlugins, "skip-plugins", false,
 		"skip installing the VS Code-family/JetBrains IDE plugins (CLI + hooks only — handy for local dev builds)")
 	return c
+}
+
+// cmdInstallJetbrainsZip lets the offline/beta installers sideload a LOCAL plugin
+// zip using the CLI's robust IDE discovery (findJetBrainsIDEs), instead of a shell
+// glob over %APPDATA%\JetBrains that misses Toolbox installs and not-yet-launched
+// IDEs. Hidden: it's an installer helper, not an end-user command.
+func cmdInstallJetbrainsZip() *cobra.Command {
+	return &cobra.Command{
+		Use:    "install-jetbrains-zip <plugin.zip>",
+		Short:  "Install a local JetBrains plugin zip into every detected IDE",
+		Hidden: true,
+		Args:   cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			results := install.InstallJetBrainsPluginFromZip(args[0])
+			n := 0
+			for _, r := range results {
+				if r.Err != nil {
+					fmt.Fprintf(os.Stderr, "  %s: %v\n", r.Label, r.Err)
+					continue
+				}
+				if r.Installed || r.Updated {
+					n++
+					fmt.Printf("  %s: installed (%s)\n", r.Label, r.PluginsDir)
+				}
+			}
+			if n == 0 {
+				fmt.Println("no JetBrains IDEs detected")
+				return nil
+			}
+			fmt.Printf("JetBrains plugin installed into %d IDE(s) — restart them to load it\n", n)
+			return nil
+		},
+	}
 }
 
 func cmdUninstall() *cobra.Command {

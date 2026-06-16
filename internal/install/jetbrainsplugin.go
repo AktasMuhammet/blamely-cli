@@ -151,6 +151,40 @@ func InstallJetBrainsPlugins() []JetBrainsPluginResult {
 	return results
 }
 
+// InstallJetBrainsPluginFromZip installs a LOCAL plugin zip into every detected
+// JetBrains IDE, reusing the SAME robust discovery as the marketplace path:
+// findJetBrainsIDEs walks Toolbox / Program Files / .app bundles via
+// product-info.json, so it locates IDEs even before their config dir exists (the
+// common reason a shell installer's "%APPDATA%\JetBrains\<ver>" glob finds
+// nothing → "not find intellij"). The offline + beta installers ship the plugin
+// zip themselves and call this instead of re-implementing discovery in shell.
+func InstallJetBrainsPluginFromZip(zipPath string) []JetBrainsPluginResult {
+	ides, err := findJetBrainsIDEs()
+	if err != nil || len(ides) == 0 {
+		return nil
+	}
+	results := make([]JetBrainsPluginResult, 0, len(ides))
+	for _, ide := range ides {
+		if !jetbrainsIDELabels[ide.Label] {
+			continue
+		}
+		r := JetBrainsPluginResult{Label: ide.Label, PluginsDir: ide.PluginsDir}
+		alreadyPresent := hasJetBrainsPlugin(ide.PluginsDir)
+		if alreadyPresent {
+			_ = removeJetBrainsPlugin(ide.PluginsDir)
+		}
+		if eerr := extractPluginZip(zipPath, ide.PluginsDir); eerr != nil {
+			r.Err = eerr
+		} else if alreadyPresent {
+			r.Updated = true
+		} else {
+			r.Installed = true
+		}
+		results = append(results, r)
+	}
+	return results
+}
+
 // UninstallJetBrainsPlugins removes the Blamely plugin directory from every
 // plugins directory in `pluginsDirs` — the set this tool installed into.
 // Mirrors UninstallEditorExtensions: only ever removes what WE installed,
