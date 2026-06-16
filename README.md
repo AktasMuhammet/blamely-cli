@@ -3,15 +3,14 @@
 **Know who wrote what.** Blamely traces your code changes and attributes them to AI tools or humans — line by line — then writes the result as a git note on every commit.
 
 After you commit, you get an AI vs Human bar right in your terminal:
-
 ```
 AI 59% (20)  [████████████████████░░░░░░░░░░░░░░░░░░░░]  Human 41% (14)
 ```
 
 All data stays on your machine. No cloud, no telemetry.
-
+dasdas
 ## Supported tools
-
+dasdas
 | Tool | Detection | Attribution |
 |------|-----------|-------------|
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | ✓ | cli, chat |

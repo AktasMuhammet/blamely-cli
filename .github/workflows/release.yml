@@ -245,13 +245,31 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Fetch sqlite3.exe (Windows, for the editor plugins)
+        # The VS Code / JetBrains plugins read the attribution DB through the
+        # sqlite3 CLI, which Windows lacks. Ship it as a release asset so the
+        # Windows installer can drop it into ~/.blamely/bin — the plugins' first,
+        # PATH-independent lookup (a GUI-launched VS Code can't see PATH-installed
+        # tools, which surfaces as "spawn sqlite3 ENOENT"). Pin via SQLITE_WIN_URL.
+        shell: bash
+        working-directory: dist
+        env:
+          SQLITE_WIN_URL: 'https://www.sqlite.org/2025/sqlite-tools-win-x64-3500400.zip'
+        run: |
+          set -e
+          curl -fsSL "$SQLITE_WIN_URL" -o sqlite-tools.zip
+          unzip -q -o sqlite-tools.zip -d sqlite-tools
+          cp "$(find sqlite-tools -name sqlite3.exe -type f | head -1)" sqlite3.exe
+          rm -rf sqlite-tools sqlite-tools.zip
+          ls -la sqlite3.exe
+
       - name: Generate SHA256SUMS
         shell: bash
         working-directory: dist
         run: |
           set -e
           shopt -s nullglob
-          sha256sum *.tar.gz *.zip > SHA256SUMS
+          sha256sum *.tar.gz *.zip sqlite3.exe > SHA256SUMS
           cat SHA256SUMS
 
       - name: GPG-sign checksums
@@ -305,9 +323,10 @@ jobs:
               --title "blamely $TAG" \
               --generate-notes \
               --verify-tag=false
-          # Upload (or replace) every versioned archive plus SHA256SUMS and its signature.
+          # Upload (or replace) every versioned archive plus sqlite3.exe (Windows
+          # plugin dependency), SHA256SUMS and its signature.
           gh release upload "$TAG" --repo "$RELEASE_REPO" --clobber \
-            *.tar.gz *.zip SHA256SUMS SHA256SUMS.asc
+            *.tar.gz *.zip sqlite3.exe SHA256SUMS SHA256SUMS.asc
 
           # Mark the semver release as GitHub's default "Latest" (UI + /releases/latest).
           gh release edit "$TAG" --repo "$RELEASE_REPO" --latest
@@ -320,7 +339,9 @@ jobs:
             stable="blamely_${f#blamely_${TAG}_}"
             cp "$f" "latest-assets/${stable}"
           done
-          (cd latest-assets && sha256sum *.tar.gz *.zip > SHA256SUMS 2>/dev/null || true)
+          # sqlite3.exe already has a stable (version-less) name — ship it as-is.
+          cp sqlite3.exe latest-assets/sqlite3.exe
+          (cd latest-assets && sha256sum *.tar.gz *.zip sqlite3.exe > SHA256SUMS 2>/dev/null || true)
           # Sign the rolling manifest too (GPG key already imported above).
           if [ -f latest-assets/SHA256SUMS ]; then
             gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \

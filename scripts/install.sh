@@ -4,6 +4,7 @@
 # Usage:
 #   ./scripts/install.sh                  build + install (CLI + hooks only)
 #   ./scripts/install.sh --with-plugins   also install the VS Code/JetBrains IDE plugins
+#   ./scripts/install.sh --obfuscate      build with garble (release-style obfuscation)
 #   ./scripts/install.sh uninstall        uninstall + remove binary
 #   ./scripts/install.sh rebuild          rebuild without re-running install
 #   ./scripts/install.sh repair           remove stale legacy hooks only
@@ -28,17 +29,48 @@ require_go() {
     command -v go >/dev/null 2>&1 || die "Go is not installed. Install from https://go.dev/dl/"
 }
 
+# Garble version pinned to match the release pipeline (.github/workflows/release.yml).
+# garble couples to the Go toolchain — bump in lockstep with Go if it refuses to run.
+GARBLE_VERSION="v0.16.0"
+
+# Resolve a garble binary into $GARBLE: prefer one already installed (GOPATH/bin or
+# PATH), else install the pinned version. GOPATH/bin is often not on PATH, so we
+# look there explicitly rather than relying on `command -v` alone.
+resolve_garble() {
+    local gp
+    gp="$(go env GOPATH 2>/dev/null)/bin/garble"
+    if command -v garble >/dev/null 2>&1; then GARBLE="garble"; return; fi
+    if [ -x "$gp" ]; then GARBLE="$gp"; return; fi
+    info "Installing garble ${GARBLE_VERSION} (binary obfuscator)..."
+    go install "mvdan.cc/garble@${GARBLE_VERSION}" || die "failed to install garble"
+    if command -v garble >/dev/null 2>&1; then GARBLE="garble"
+    elif [ -x "$gp" ]; then GARBLE="$gp"
+    else die "garble installed but not found on PATH or at $gp"; fi
+}
+
 build_binary() {
-    info "Building blamely from source (stripped, trim-path)..."
     cd "$REPO_ROOT"
     mkdir -p "$STABLE_DIR"
-    # -s  strip the Go symbol table
-    # -w  strip DWARF debug info
-    # -trimpath  remove absolute build paths (no /Users/<you>/… embedded)
-    # -buildvcs=false  don't stamp git metadata into the binary
-    # Together these produce a smaller, harder-to-introspect binary. Source
-    # files are unchanged; rebuild without these flags for normal debugging.
-    go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$STABLE_BIN" ./cmd/blamely
+    if [ "$OBFUSCATE" = "1" ]; then
+        resolve_garble
+        info "Building blamely with garble (obfuscated, mirrors release build)..."
+        # Same flags as the release pipeline:
+        #   GOGARBLE='*'    garble everything (incl. deps); stdlib is never touched
+        #   -literals       encrypt string constants in the binary
+        #   -tiny           strip extra runtime metadata (no panic line numbers)
+        #   CGO_ENABLED=0   static binary (modernc.org/sqlite is pure Go)
+        GOGARBLE='*' CGO_ENABLED=0 "$GARBLE" -literals -tiny build \
+            -trimpath -buildvcs=false -ldflags="-s -w" -o "$STABLE_BIN" ./cmd/blamely
+    else
+        info "Building blamely from source (stripped, trim-path)..."
+        # -s  strip the Go symbol table
+        # -w  strip DWARF debug info
+        # -trimpath  remove absolute build paths (no /Users/<you>/… embedded)
+        # -buildvcs=false  don't stamp git metadata into the binary
+        # Together these produce a smaller, harder-to-introspect binary. Source
+        # files are unchanged; rebuild without these flags for normal debugging.
+        go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$STABLE_BIN" ./cmd/blamely
+    fi
     chmod +x "$STABLE_BIN"
     ok "Binary built: $STABLE_BIN ($(du -h "$STABLE_BIN" | cut -f1))"
 }
@@ -114,11 +146,13 @@ do_repair() {
 # --with-plugins can appear anywhere (`./scripts/install.sh --with-plugins` or
 # `./scripts/install.sh install --with-plugins`); whatever's left is the subcommand.
 WITH_PLUGINS=0
+OBFUSCATE=0
 SUBCMD="install"
 for arg in "$@"; do
     case "$arg" in
-        --with-plugins) WITH_PLUGINS=1 ;;
-        *)              SUBCMD="$arg" ;;
+        --with-plugins)        WITH_PLUGINS=1 ;;
+        --obfuscate|--release) OBFUSCATE=1 ;;
+        *)                     SUBCMD="$arg" ;;
     esac
 done
 
