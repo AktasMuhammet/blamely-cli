@@ -2,7 +2,9 @@ package install
 
 import (
 	"archive/zip"
+	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/blamely/blamely/internal/config"
@@ -139,7 +142,7 @@ func InstallJetBrainsPlugins() []JetBrainsPluginResult {
 		if alreadyPresent {
 			_ = removeJetBrainsPlugin(ide.PluginsDir)
 		}
-		if eerr := extractPluginZip(cachedZipPath, ide.PluginsDir); eerr != nil {
+		if eerr := extractWithCloseRetry(cachedZipPath, ide.PluginsDir, ide.Label); eerr != nil {
 			r.Err = eerr
 		} else if alreadyPresent {
 			r.Updated = true
@@ -173,7 +176,7 @@ func InstallJetBrainsPluginFromZip(zipPath string) []JetBrainsPluginResult {
 		if alreadyPresent {
 			_ = removeJetBrainsPlugin(ide.PluginsDir)
 		}
-		if eerr := extractPluginZip(zipPath, ide.PluginsDir); eerr != nil {
+		if eerr := extractWithCloseRetry(zipPath, ide.PluginsDir, ide.Label); eerr != nil {
 			r.Err = eerr
 		} else if alreadyPresent {
 			r.Updated = true
@@ -437,6 +440,66 @@ func extractPluginZip(zipPath, pluginsDir string) error {
 		}
 	}
 	return nil
+}
+
+// extractWithCloseRetry removes any existing Blamely plugin from pluginsDir and
+// extracts the new zip. On Windows a RUNNING IDE memory-maps its plugin JARs, so
+// overwriting them fails with ERROR_USER_MAPPED_FILE / sharing-violation — i.e.
+// "the IDE is open". When that happens and we have an interactive terminal, ask
+// the user to close the IDE and retry; otherwise return the error unchanged.
+func extractWithCloseRetry(zipPath, pluginsDir, label string) error {
+	var reader *bufio.Reader
+	for {
+		_ = removeJetBrainsPlugin(pluginsDir) // best-effort; may itself fail if locked
+		err := extractPluginZip(zipPath, pluginsDir)
+		if err == nil {
+			return nil
+		}
+		if !ideRunningLockErr(err) || !stdinInteractive() {
+			return err
+		}
+		if reader == nil {
+			reader = bufio.NewReader(os.Stdin)
+		}
+		fmt.Printf("\n  %s is open, so Windows won't let us replace its plugin files.\n", label)
+		fmt.Printf("  Close %s completely, then press Enter to retry (or type 'n' to skip): ", label)
+		line, _ := reader.ReadString('\n')
+		switch strings.ToLower(strings.TrimSpace(line)) {
+		case "n", "no", "s", "skip":
+			return err
+		}
+		// anything else (Enter / y) → loop and retry
+	}
+}
+
+// ideRunningLockErr reports whether err is the Windows "file is in use by a
+// running process" family — the signal that the JetBrains IDE is still open and
+// holding its plugin JARs. Matched by ERROR CODE (not the OS-localized message,
+// which varies by system language). Windows-only: the same numeric codes mean
+// unrelated things on Unix, where a running IDE doesn't lock its plugin files.
+func ideRunningLockErr(err error) bool {
+	if runtime.GOOS != "windows" || err == nil {
+		return false
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch uintptr(errno) {
+		case 1224, // ERROR_USER_MAPPED_FILE
+			32, // ERROR_SHARING_VIOLATION
+			33, // ERROR_LOCK_VIOLATION
+			5:  // ERROR_ACCESS_DENIED
+			return true
+		}
+	}
+	return false
+}
+
+// stdinInteractive reports whether stdin is a real terminal we can prompt on (a
+// char device). False under `curl | bash` / non-interactive runs, where we must
+// not block on input.
+func stdinInteractive() bool {
+	fi, err := os.Stdin.Stat()
+	return err == nil && (fi.Mode()&os.ModeCharDevice) != 0
 }
 
 func writeZipEntry(f *zip.File, dest string) error {
