@@ -138,6 +138,9 @@ func Run(ctx context.Context) error {
 	mux.HandleFunc("/fs", s.fsEvent)
 	mux.HandleFunc("/snapshot", s.snapshot)
 	mux.HandleFunc("/prechat-snapshot", s.preChatSnapshot)
+	if debugHTTP() {
+		log.Printf("BLAMELY_DEBUG=on — logging every HTTP request (method/path/status/latency/remote)")
+	}
 
 	// Prefer a Unix domain socket — it bypasses network security tools (e.g.
 	// Trend Micro) that intercept localhost TCP. Falls back to a random TCP port
@@ -193,7 +196,7 @@ func Run(ctx context.Context) error {
 	}
 
 	s.http = &http.Server{
-		Handler:           mux,
+		Handler:           accessLog(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -220,6 +223,47 @@ func Run(ctx context.Context) error {
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.WriteString(w, `{"ok":true}`)
+}
+
+// debugHTTP reports whether verbose per-request access logging is enabled via the
+// BLAMELY_DEBUG env var. Off by default so the daemon log isn't flooded by the
+// plugins' 5s /health heartbeats; turn it on to debug plugin<->daemon traffic.
+func debugHTTP() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("BLAMELY_DEBUG"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// accessLog wraps h so that, when BLAMELY_DEBUG is set, every request is logged
+// as one line: method, path, response status, latency, and remote address. This
+// makes the full two-way plugin<->daemon conversation (health pings, /edit,
+// /snapshot, /prechat-snapshot) visible in ~/.blamely/daemon.log. When debug is
+// off it returns h unwrapped, so there is zero per-request overhead.
+func accessLog(h http.Handler) http.Handler {
+	if !debugHTTP() {
+		return h
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		h.ServeHTTP(rec, r)
+		log.Printf("http %s %s -> %d (%s) from %s",
+			r.Method, r.URL.Path, rec.status, time.Since(start).Round(time.Millisecond), r.RemoteAddr)
+	})
+}
+
+// statusRecorder captures the response status code for accessLog. A handler that
+// never calls WriteHeader implicitly returns 200, matching the default here.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
 }
 
 // snapshot returns the cached "before" content for repo/file — the file's

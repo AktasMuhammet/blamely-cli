@@ -1355,3 +1355,54 @@ func TestBuildNote_DeletedBlankLine_HumanNeighborStaysHuman(t *testing.T) {
 		t.Errorf("ai_deleted_lines: want 1, got %d", note.Totals.AIDeletedLines)
 	}
 }
+
+// TestAttributeDeletedLines_MoveCreditsAITool: when an AI tool re-adds a line's
+// content elsewhere in the same commit (a move), git scores the old position as
+// a deletion — which must be credited to that tool, not Human. Regression for
+// the Cursor/Codex/etc. line-move case (e.g. commit fd64d2d2 in mix-test).
+func TestAttributeDeletedLines_MoveCreditsAITool(t *testing.T) {
+	const content = "    <h1>hello kerim</h1>"
+	noEdits := []store.Edit(nil)
+	emptyBudget := func() (map[int64]map[string]int, map[int64]map[string]int) {
+		return map[int64]map[string]int{}, map[int64]map[string]int{}
+	}
+
+	// Move present: deletion of content re-added by cursor → AI/cursor.
+	movedAI := map[string]*moveAttr{
+		content: {tool: store.ToolCursor, model: "composer-2.5", genType: store.GenTypeChat, remaining: 1},
+	}
+	totals := &Totals{DeletedLines: 1}
+	sha, norm := emptyBudget()
+	got := attributeDeletedLines([]DeletedLine{{LineNum: 17, Content: content}}, noEdits, 0, 1<<62, sha, norm, totals, &ByGenType{}, movedAI)
+	if len(got) != 1 || got[0].AuthorType != "AI" || got[0].Tool != string(store.ToolCursor) {
+		t.Fatalf("move deletion: got %+v, want AI/cursor", got)
+	}
+	if totals.AIDeletedLines != 1 {
+		t.Fatalf("AIDeletedLines = %d, want 1", totals.AIDeletedLines)
+	}
+
+	// Consume-once: a second identical deletion with the budget spent stays Human.
+	totals2 := &Totals{DeletedLines: 1}
+	sha, norm = emptyBudget()
+	got2 := attributeDeletedLines([]DeletedLine{{LineNum: 30, Content: content}}, noEdits, 0, 1<<62, sha, norm, totals2, &ByGenType{}, movedAI)
+	if got2[0].AuthorType != "Human" {
+		t.Fatalf("budget exhausted: got %s, want Human", got2[0].AuthorType)
+	}
+
+	// No move, no recorded removal → Human (baseline unchanged).
+	totals3 := &Totals{DeletedLines: 1}
+	sha, norm = emptyBudget()
+	got3 := attributeDeletedLines([]DeletedLine{{LineNum: 5, Content: "<p>unrelated</p>"}}, noEdits, 0, 1<<62, sha, norm, totals3, &ByGenType{}, map[string]*moveAttr{})
+	if got3[0].AuthorType != "Human" {
+		t.Fatalf("unrelated deletion: got %s, want Human", got3[0].AuthorType)
+	}
+
+	// Blank content is never credited as a move even if present in the map.
+	totals4 := &Totals{DeletedLines: 1}
+	sha, norm = emptyBudget()
+	blankMap := map[string]*moveAttr{"   ": {tool: store.ToolCursor, remaining: 1}}
+	got4 := attributeDeletedLines([]DeletedLine{{LineNum: 9, Content: "   "}}, noEdits, 0, 1<<62, sha, norm, totals4, &ByGenType{}, blankMap)
+	if got4[0].AuthorType != "Human" {
+		t.Fatalf("blank move: got %s, want Human", got4[0].AuthorType)
+	}
+}

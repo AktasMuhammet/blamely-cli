@@ -390,3 +390,25 @@ func TestCopilotChatWatcher_AlwaysEmitsCopilot(t *testing.T) {
 		t.Fatalf("want a single copilot event, got %+v", sink.events)
 	}
 }
+
+func TestResolveChatStaleCutoff(t *testing.T) {
+	cases := []struct {
+		name, env string
+		want      time.Duration
+	}{
+		{"default when unset", "", 24 * time.Hour},
+		{"override hours", "6", 6 * time.Hour},
+		{"fractional hours", "0.5", 30 * time.Minute},
+		{"garbage falls back", "abc", 24 * time.Hour},
+		{"non-positive falls back", "0", 24 * time.Hour},
+		{"negative falls back", "-3", 24 * time.Hour},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("BLAMELY_CHAT_STALE_HOURS", c.env)
+			if got := resolveChatStaleCutoff(); got != c.want {
+				t.Fatalf("env=%q: got %v, want %v", c.env, got, c.want)
+			}
+		})
+	}
+}

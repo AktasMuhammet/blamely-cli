@@ -52,6 +52,13 @@ func (sr *sessionResolver) resolve(db *store.DB, e *store.Edit, branchHint strin
 
 // gitInfo returns the cached (or freshly computed) branch + base_sha for a repo.
 // base_sha is the current HEAD SHA — one open work session per branch until commit.
+//
+// The value is recomputed synchronously once the cache is older than the short
+// TTL. It must NOT be served stale: base_sha keys the edit's work session, and a
+// stale base_sha (e.g. captured before a commit moved HEAD) keys the edit to the
+// wrong session — so at commit time the session-scoped match misses and genuine
+// AI additions fall back to Human. The TTL only coalesces a burst of edits within
+// a couple seconds; after a commit, the next edit (>TTL later) recomputes fresh.
 func (sr *sessionResolver) gitInfo(repo string) gitInfo {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()

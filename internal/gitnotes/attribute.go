@@ -794,6 +794,17 @@ type perLine struct {
 	edit    *store.Edit
 }
 
+// moveAttr carries the AI attribution of a line that was ADDED in this commit,
+// used to credit a same-commit DELETION of identical content (a line move) to
+// that tool. remaining is a consume-once budget: one AI add credits at most one
+// moved deletion.
+type moveAttr struct {
+	tool      store.Tool
+	model     string
+	genType   store.GenType
+	remaining int
+}
+
 func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []AddedLine, deleted map[string][]DeletedLine, renames map[string]string, fileChanges map[string]FileChangeType) (*Note, error) {
 	// Scope AI edits by WORK SESSION (branch + HEAD-at-edit-time), not by a
 	// timestamp window. At commit time the session is the one keyed by this
@@ -1010,6 +1021,42 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		for k, v := range sumNarrowedNorm {
 			recordedNorm[k] += v
 		}
+		// Per-edit occurrence counts, so the drift fallback can distribute identical
+		// content across the edits that recorded it (e.g. a chat that wrote 5 copies
+		// of a line and a later completion that wrote 1) instead of letting the
+		// newest edit claim them all. usedPerEdit is seeded by the exact pass below
+		// so an occurrence consumed at its exact position isn't reused via drift.
+		recPerEdit := map[int64]map[string]int{}
+		recPerEditNorm := map[int64]map[string]int{}
+		for i := range sessionEdits {
+			e := &sessionEdits[i]
+			if e.TimestampNanos <= sinceNanos || e.TimestampNanos > maxNanos || isNonAITool(e.Tool) {
+				continue
+			}
+			for _, l := range e.Lines {
+				if l.ContentSHA != "" {
+					if recPerEdit[e.ID] == nil {
+						recPerEdit[e.ID] = map[string]int{}
+					}
+					recPerEdit[e.ID][l.ContentSHA]++
+				}
+				if l.ContentSHANorm != "" {
+					if recPerEditNorm[e.ID] == nil {
+						recPerEditNorm[e.ID] = map[string]int{}
+					}
+					recPerEditNorm[e.ID][l.ContentSHANorm]++
+				}
+			}
+		}
+		usedPerEdit := map[int64]map[string]int{}
+		usedPerEditNorm := map[int64]map[string]int{}
+		bumpUsed := func(m map[int64]map[string]int, id int64, key string) {
+			if m[id] == nil {
+				m[id] = map[string]int{}
+			}
+			m[id][key]++
+		}
+
 		exactSHA := map[string]int{}  // committed lines matched at their exact recorded position
 		exactNorm := map[string]int{} // ditto, normalized
 		for _, ln := range lineNos {
@@ -1029,6 +1076,7 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 				}
 				if coversContentSHA(e.Lines, content, ln) {
 					exactSHA[shaWant]++
+					bumpUsed(usedPerEdit, e.ID, shaWant)
 					break
 				}
 			}
@@ -1040,6 +1088,7 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 					}
 					if coversContentSHANorm(e.Lines, content, ln) {
 						exactNorm[normWant]++
+						bumpUsed(usedPerEditNorm, e.ID, normWant)
 						break
 					}
 				}
@@ -1084,9 +1133,12 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			if content != "" && (e == nil || isNonAITool(e.Tool)) {
 				shaKey := sha256HexStr([]byte(content))
 				if driftUsed[shaKey] < driftBudget[shaKey] {
-					if ai := pickEdit(sessionEdits, ln, content, sinceNanos, maxNanos, false, false); ai != nil && !isNonAITool(ai.Tool) {
+					if ai := pickDriftEdit(sessionEdits, content, sinceNanos, maxNanos, false, recPerEdit, usedPerEdit); ai != nil {
 						e = ai
 						driftUsed[shaKey]++
+						// Mirror the per-edit norm budget so the same recorded line
+						// can't also be claimed via the normalized drift below.
+						bumpUsed(usedPerEditNorm, ai.ID, sha256HexNormStr(content))
 						// An exact-sha drift also consumes the line's NORMALIZED
 						// budget: the two drift budgets count the same AI
 						// recordings (every exact line has a norm), so without
@@ -1108,7 +1160,7 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 				if e == nil {
 					normKey := sha256HexNormStr(content)
 					if driftUsedNorm[normKey] < driftBudgetNorm[normKey] {
-						if ai := pickEdit(sessionEdits, ln, content, sinceNanos, maxNanos, false, true); ai != nil && !isNonAITool(ai.Tool) {
+						if ai := pickDriftEdit(sessionEdits, content, sinceNanos, maxNanos, true, recPerEditNorm, usedPerEditNorm); ai != nil {
 							e = ai
 							driftUsedNorm[normKey]++
 						}
@@ -1140,6 +1192,25 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 
 	inheritBlankLineAttribution(resolved)
 	coalesceDuplicateBlocks(resolved)
+
+	// Move detection: when the same content is ADDED by an AI tool and DELETED in
+	// the SAME commit, git scores it as -old/+new but it is a line MOVE — the AI
+	// that re-added the content also removed it from its old position. Credit such
+	// deletions to that tool instead of Human. Keyed by exact line content with a
+	// consume-once budget; blank/whitespace lines are excluded (too ambiguous —
+	// they appear everywhere). attributeDeletedLine consults this below.
+	movedAI := map[string]*moveAttr{}
+	for i := range resolved {
+		p := &resolved[i]
+		if p.tool == "" || authorTypeFor(p.tool) != "AI" || strings.TrimSpace(p.content) == "" {
+			continue
+		}
+		if m, ok := movedAI[p.content]; ok {
+			m.remaining++
+		} else {
+			movedAI[p.content] = &moveAttr{tool: p.tool, model: p.model, genType: p.genType, remaining: 1}
+		}
+	}
 
 	note := &Note{
 		Schema:      2,
@@ -1196,7 +1267,7 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		if len(delLines) > 0 {
 			delEdits := deletionEditsForFile(curFileEntry.Path)
 			remSHA, remNorm := removedHashMultisets(delEdits)
-			curFileEntry.acc = append(curFileEntry.acc, attributeDeletedLines(delLines, delEdits, sinceNanos, maxNanos, remSHA, remNorm, &note.Totals, &note.ByGenType)...)
+			curFileEntry.acc = append(curFileEntry.acc, attributeDeletedLines(delLines, delEdits, sinceNanos, maxNanos, remSHA, remNorm, &note.Totals, &note.ByGenType, movedAI)...)
 		}
 		curFileEntry.Deleted = len(delLines)
 		note.Totals.DeletedLines += curFileEntry.Deleted
@@ -1302,7 +1373,7 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		fe := FileEntry{Path: path, Type: string(kind), Deleted: len(delLines)}
 		delEdits := deletionEditsForFile(path)
 		remSHA, remNorm := removedHashMultisets(delEdits)
-		acc := attributeDeletedLines(delLines, delEdits, sinceNanos, maxNanos, remSHA, remNorm, &note.Totals, &note.ByGenType)
+		acc := attributeDeletedLines(delLines, delEdits, sinceNanos, maxNanos, remSHA, remNorm, &note.Totals, &note.ByGenType, movedAI)
 		fe.Lines = collapseToRanges(acc)
 		note.Files = append(note.Files, fe)
 		note.Totals.DeletedLines += fe.Deleted
@@ -1529,9 +1600,10 @@ func pickEditForRemovedLine(edits []store.Edit, content string, minNanos, maxNan
 // edit's, or "human") is returned alongside so the caller can bump
 // by_gen_type after inheritBlankDeletedLineAttribution has had a chance to
 // reassign blank lines.
-func attributeDeletedLine(d DeletedLine, sessionEdits []store.Edit, sinceNanos, maxNanos int64, remainingSHA, remainingNorm map[int64]map[string]int, totals *Totals) (LineEntry, store.GenType) {
+func attributeDeletedLine(d DeletedLine, sessionEdits []store.Edit, sinceNanos, maxNanos int64, remainingSHA, remainingNorm map[int64]map[string]int, totals *Totals, movedAI map[string]*moveAttr) (LineEntry, store.GenType) {
 	le := LineEntry{Line: d.LineNum, Type: "delete", AuthorType: "Human"}
 	gt := store.GenTypeHuman
+	matched := false
 	if e := pickEditForRemovedLine(sessionEdits, d.Content, sinceNanos, maxNanos, remainingSHA, remainingNorm); e != nil {
 		if at := authorTypeFor(e.Tool); at == "AI" {
 			le.AuthorType = at
@@ -1540,6 +1612,25 @@ func attributeDeletedLine(d DeletedLine, sessionEdits []store.Edit, sinceNanos, 
 				le.Model = strPtr(e.Model.String)
 			}
 			gt = e.GenType
+			if gtStr := string(gt); gtStr != "" && gtStr != string(store.GenTypeUnknown) {
+				le.GenType = strPtr(gtStr)
+			}
+			totals.AIDeletedLines++
+			matched = true
+		}
+	}
+	// Move detection: the deleted content was re-added by an AI tool in this same
+	// commit (a line move/reorder), so the AI caused this deletion too. Only when
+	// the line wasn't already matched to a recorded AI removal above.
+	if !matched && strings.TrimSpace(d.Content) != "" {
+		if m, ok := movedAI[d.Content]; ok && m.remaining > 0 {
+			m.remaining--
+			le.AuthorType = "AI"
+			le.Tool = string(m.tool)
+			if m.model != "" {
+				le.Model = strPtr(m.model)
+			}
+			gt = m.genType
 			if gtStr := string(gt); gtStr != "" && gtStr != string(store.GenTypeUnknown) {
 				le.GenType = strPtr(gtStr)
 			}
@@ -1553,11 +1644,11 @@ func attributeDeletedLine(d DeletedLine, sessionEdits []store.Edit, sinceNanos, 
 // attributeDeletedLine), runs inheritBlankDeletedLineAttribution so blank
 // deleted lines pick up an adjacent AI-attributed deletion's attribution, and
 // finally bumps by_gen_type for each line's (possibly reassigned) gen_type.
-func attributeDeletedLines(delLines []DeletedLine, sessionEdits []store.Edit, sinceNanos, maxNanos int64, remainingSHA, remainingNorm map[int64]map[string]int, totals *Totals, byGenType *ByGenType) []LineEntry {
+func attributeDeletedLines(delLines []DeletedLine, sessionEdits []store.Edit, sinceNanos, maxNanos int64, remainingSHA, remainingNorm map[int64]map[string]int, totals *Totals, byGenType *ByGenType, movedAI map[string]*moveAttr) []LineEntry {
 	entries := make([]LineEntry, len(delLines))
 	gts := make([]store.GenType, len(delLines))
 	for i, d := range delLines {
-		entries[i], gts[i] = attributeDeletedLine(d, sessionEdits, sinceNanos, maxNanos, remainingSHA, remainingNorm, totals)
+		entries[i], gts[i] = attributeDeletedLine(d, sessionEdits, sinceNanos, maxNanos, remainingSHA, remainingNorm, totals, movedAI)
 	}
 	inheritBlankDeletedLineAttribution(delLines, entries, gts, totals)
 	for _, gt := range gts {
@@ -1692,6 +1783,49 @@ func pickEdit(edits []store.Edit, ln int, content string, minNanos, maxNanos int
 		return e
 	}
 	return humanFallback
+}
+
+// pickDriftEdit chooses the AI edit for a line whose content matches a recorded
+// AI line but at a DIFFERENT position (drift). Unlike pickEdit it ignores line
+// numbers (drift moved them) and, crucially, respects each edit's recorded
+// occurrence count: among the AI edits that recorded this content, it returns the
+// newest one that still has an unconsumed occurrence (decrementing it), so when
+// several edits authored identical content the committed lines are distributed by
+// recorded count instead of all going to the newest edit. Falls back to the
+// newest match when every edit's budget is spent (so a line is still attributed
+// rather than dropped). rec/used are keyed by edit ID then content hash.
+func pickDriftEdit(edits []store.Edit, content string, minNanos, maxNanos int64, useNorm bool, rec, used map[int64]map[string]int) *store.Edit {
+	key := sha256HexStr([]byte(content))
+	if useNorm {
+		key = sha256HexNormStr(content)
+	}
+	var fallback *store.Edit
+	for i := range edits {
+		e := &edits[i]
+		if e.TimestampNanos <= minNanos || e.TimestampNanos > maxNanos || isNonAITool(e.Tool) {
+			continue
+		}
+		var matched bool
+		if useNorm {
+			matched = coversContentSHANorm(e.Lines, content, 0)
+		} else {
+			matched = coversContentSHA(e.Lines, content, 0)
+		}
+		if !matched {
+			continue
+		}
+		if fallback == nil {
+			fallback = e
+		}
+		if used[e.ID][key] < rec[e.ID][key] {
+			if used[e.ID] == nil {
+				used[e.ID] = map[string]int{}
+			}
+			used[e.ID][key]++
+			return e
+		}
+	}
+	return fallback
 }
 
 // coversLine reports whether any edit line covers post-image line n BY POSITION.

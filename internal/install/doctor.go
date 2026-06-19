@@ -90,7 +90,10 @@ func (d *doctor) binary() {
 			"run `blamely install` again to re-copy the binary")
 		return
 	}
-	if st.Mode()&0o111 == 0 {
+	// Windows has no Unix execute bit — Mode()&0o111 is always 0 for regular
+	// files there, so this check (and its `chmod +x` advice) is meaningless and
+	// would always false-positive. Existence is all that matters on Windows.
+	if runtime.GOOS != "windows" && st.Mode()&0o111 == 0 {
 		d.warn("stable binary path", fmt.Sprintf("%s (not executable)", p),
 			"chmod +x "+p)
 		return
@@ -113,7 +116,9 @@ func (d *doctor) gitHook() {
 	if st, err := os.Stat(hookFile); err != nil {
 		d.bad("post-commit script", fmt.Sprintf("missing (%s)", hookFile),
 			"`blamely install` re-writes this file")
-	} else if st.Mode()&0o111 == 0 {
+	} else if runtime.GOOS != "windows" && st.Mode()&0o111 == 0 {
+		// See binary(): no Unix execute bit on Windows, so skip this check there.
+		// Git for Windows runs hooks via its bundled sh regardless of the bit.
 		d.warn("post-commit script", fmt.Sprintf("%s not executable", hookFile),
 			"chmod +x "+hookFile)
 	} else {

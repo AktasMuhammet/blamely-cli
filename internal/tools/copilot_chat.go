@@ -30,6 +30,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,7 +42,26 @@ import (
 )
 
 const copilotChatPollInterval = 2 * time.Second
-const copilotChatStaleCutoff = 24 * time.Hour
+
+// copilotChatStaleCutoff is how old a chat session file may be before the watcher
+// ignores it (both in the scan and in evictStale). Defaults to 24h — long enough
+// to still catch edits made while the daemon was offline — but configurable via
+// BLAMELY_CHAT_STALE_HOURS for machines with a very large session history that
+// want to scan even fewer files. Resolved once at process start.
+var copilotChatStaleCutoff = resolveChatStaleCutoff()
+
+func resolveChatStaleCutoff() time.Duration {
+	const def = 24 * time.Hour
+	raw := strings.TrimSpace(os.Getenv("BLAMELY_CHAT_STALE_HOURS"))
+	if raw == "" {
+		return def
+	}
+	h, err := strconv.ParseFloat(raw, 64)
+	if err != nil || h <= 0 {
+		return def // ignore garbage / non-positive values, keep the safe default
+	}
+	return time.Duration(h * float64(time.Hour))
+}
 
 // Adaptive polling: the idle base cadence is fine when nothing is happening, but
 // it makes a freshly-typed chat edit take up to a couple seconds to show up. So
@@ -231,6 +251,16 @@ func (w *chatSessionWatcher) scanRoot(root string, state map[string]*sessionStat
 		// Only chatSessions/*.jsonl. The chatEditingSessions sibling directory
 		// has different content we don't currently parse.
 		if !strings.HasSuffix(p, ".jsonl") || !strings.Contains(p, string(filepath.Separator)+"chatSessions"+string(filepath.Separator)) {
+			return nil
+		}
+		// Skip stale sessions. A user with many workspaces accumulates hundreds of
+		// old chatSessions files (often multi-MB), but only a handful are ever
+		// active. Parsing them all on the first scan and stat-ing them every poll
+		// makes live detection slow and late — badly so on Windows. Use the
+		// dirent's mtime (already gathered by the walk, no extra stat) to skip
+		// anything older than the stale cutoff. A reopened old chat gets a fresh
+		// mtime and is picked up again automatically; evictStale drops its state.
+		if info, ierr := d.Info(); ierr == nil && time.Since(info.ModTime()) > copilotChatStaleCutoff {
 			return nil
 		}
 		if mtime := w.handleSessionFile(p, state, mu, sink); mtime.After(latest) {

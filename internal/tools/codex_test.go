@@ -421,6 +421,53 @@ func TestProcessCodexLine_WrappedFormat_UpdateFileUnifiedDiff(t *testing.T) {
 	}
 }
 
+// Regression: a Codex apply_patch that ONLY deletes lines (a hunk with '-' lines
+// and no '+' lines) must still be recorded with its removed-line hashes. The
+// update branch used to bail out when there were no added ranges, dropping the
+// whole edit — so the deletion was never recorded and fell back to Human at
+// commit time (observed on commit b7c4c2dc).
+func TestProcessCodexLine_WrappedFormat_UpdateFilePureDeletion(t *testing.T) {
+	repo := gitInitRepo(t)
+	target := filepath.Join(repo, "welcome.html")
+	// Post-deletion content on disk (the <title> line is gone).
+	finalContent := "<html>\n<head>\n</head>\n<body>\n</body>\n</html>\n"
+	if err := os.WriteFile(target, []byte(finalContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sink := &mockSink{}
+	st := &codexState{sink: sink, model: "gpt-5.5"}
+
+	// Pure-deletion hunk: one '-' line, zero '+' lines.
+	diff := "@@ -1,3 +1,2 @@\n <html>\n-<title>Welcome</title>\n <head>\n"
+	patchEnd := mustMarshalWrapped(t, "event_msg", map[string]any{
+		"type":    "patch_apply_end",
+		"success": true,
+		"changes": map[string]any{
+			target: map[string]any{"type": "update", "unified_diff": diff},
+		},
+	})
+	processCodexLine(patchEnd, st)
+	st.flush(0, 0, 0, 0, false) // simulate shutdown drain
+
+	if len(sink.events) != 1 {
+		t.Fatalf("pure deletion must record 1 event, got %d: %+v", len(sink.events), sink.events)
+	}
+	ev := sink.events[0]
+	if ev.Tool != "codex" || ev.GenType != "cli" {
+		t.Errorf("tool=%q gen_type=%q, want codex/cli", ev.Tool, ev.GenType)
+	}
+	if ev.FilePath != "welcome.html" {
+		t.Errorf("file_path = %q, want welcome.html", ev.FilePath)
+	}
+	if len(ev.Lines) != 0 {
+		t.Errorf("a pure deletion has no added lines, got %+v", ev.Lines)
+	}
+	if len(ev.RemovedLines) != 1 {
+		t.Fatalf("removed_lines = %d, want 1 (the deleted <title> line)", len(ev.RemovedLines))
+	}
+}
+
 func TestProcessCodexLine_WrappedFormat_FailedPatchIgnored(t *testing.T) {
 	sink := &mockSink{}
 	st := &codexState{sink: sink}

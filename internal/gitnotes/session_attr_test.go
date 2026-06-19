@@ -152,3 +152,59 @@ func TestBuildNote_CrossSessionDeletionIsAI(t *testing.T) {
 		t.Fatal("no delete range emitted")
 	}
 }
+
+// TestBuildNote_DuplicateContentDistributedAcrossEdits: when the SAME line
+// content is recorded by two AI edits — a (narrowed) chat that wrote it twice and
+// a later completion that wrote it once — the committed copies must be split by
+// recorded count (2 chat + 1 completion), not all claimed by the newest edit.
+// Regression for commit 0e80e5f in mix-test (chat lines mislabelled completion).
+func TestBuildNote_DuplicateContentDistributedAcrossEdits(t *testing.T) {
+	db := openTestDB(t)
+	repo := "/r"
+	now := time.Now().UnixNano()
+	const line = "  <p>cimbom</p>"
+	sha := sha256HexStr([]byte(line))
+
+	// Chat edit (older, narrowed): recorded the content twice, at lines 5 and 6.
+	if _, err := db.InsertEdit(store.Edit{
+		TimestampNanos: now - int64(5*time.Minute),
+		RepoPath:       repo, FilePath: "index.html",
+		Tool: store.ToolCopilot, Confidence: store.ConfidenceHigh, GenType: store.GenTypeChat,
+		RawMeta: sql.NullString{Valid: true, String: `{"narrowed":true}`},
+		Lines: []store.EditLine{
+			{StartLine: 5, EndLine: 5, ContentSHA: sha},
+			{StartLine: 6, EndLine: 6, ContentSHA: sha},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Completion edit (newer, full): recorded the content once, at line 9.
+	if _, err := db.InsertEdit(store.Edit{
+		TimestampNanos: now - int64(1*time.Minute),
+		RepoPath:       repo, FilePath: "index.html",
+		Tool: store.ToolCopilot, Confidence: store.ConfidenceHigh, GenType: store.GenTypeCompletion,
+		Lines: []store.EditLine{
+			{StartLine: 9, EndLine: 9, ContentSHA: sha},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Commit adds the content at line 9 (exact-matches completion) and lines
+	// 20,21 (drifted — match no recorded position, must go to chat by budget).
+	added := []AddedLine{
+		{File: "index.html", LineNum: 9, Content: line},
+		{File: "index.html", LineNum: 20, Content: line},
+		{File: "index.html", LineNum: 21, Content: line},
+	}
+	note, err := buildNote(db, repo, "newsha", now, added, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("buildNote: %v", err)
+	}
+	if note.ByGenType.Chat != 2 {
+		t.Errorf("by_gen_type chat: want 2, got %d", note.ByGenType.Chat)
+	}
+	if note.ByGenType.Completion != 1 {
+		t.Errorf("by_gen_type completion: want 1, got %d (newest edit wrongly claimed duplicates)", note.ByGenType.Completion)
+	}
+}

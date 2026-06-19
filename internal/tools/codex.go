@@ -500,12 +500,16 @@ func emitCodexPatchApplyEvents(payload json.RawMessage, when time.Time, st *code
 			suggested = int64(len(full))
 		case "update":
 			ranges, n := UnifiedDiffAddedRanges(change.UnifiedDiff)
-			if len(ranges) == 0 {
+			removed = toDaemonRemovedLines(UnifiedDiffRemovedLineHashes(change.UnifiedDiff))
+			// A pure-deletion hunk has removed lines but no added ranges. Don't
+			// drop it — otherwise a Codex apply_patch that only deletes lines
+			// records nothing, and the deletion falls back to Human at commit
+			// time. Skip only when the hunk has neither adds nor removes.
+			if len(ranges) == 0 && len(removed) == 0 {
 				continue
 			}
 			lines = toDaemonLineRanges(ranges)
 			suggested = n
-			removed = toDaemonRemovedLines(UnifiedDiffRemovedLineHashes(change.UnifiedDiff))
 		case "delete":
 			// A removed file carries no added lines — fingerprint its content
 			// as removed so commit-time attribution credits codex for the

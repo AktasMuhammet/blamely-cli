@@ -21,7 +21,13 @@ import (
 // VS Code-family editor; the id stays the source-of-record for detect/uninstall.
 //
 //	https://open-vsx.org/extension/blamely/blamely  (Open VSX — Antigravity/Cursor gallery; our install source)
-const blamelyExtensionID = "Blamely.blamely"
+//
+// The publisher and name are both lowercase in the manifest (and in the Open VSX
+// URL above), so the canonical id is "blamely.blamely". Detection lowercases
+// before comparing, but `--uninstall-extension` is matched case-sensitively by
+// several Code-OSS forks, so the case here must match what the editor records or
+// uninstall silently no-ops and the extension is left behind.
+const blamelyExtensionID = "blamely.blamely"
 
 // openVSXLatestAPI returns metadata (including the .vsix download URL) for the
 // latest published Blamely release on Open VSX.
@@ -249,7 +255,15 @@ func UninstallEditorExtensions(labels []string) error {
 		if !ok {
 			continue
 		}
-		if err := exec.Command(cliPath, "--uninstall-extension", blamelyExtensionID).Run(); err != nil && firstErr == nil {
+		// Uninstall by the exact id the editor reports rather than our constant:
+		// `--uninstall-extension` is case-sensitive on some forks, so passing the
+		// listed id guarantees a match even if the manifest case ever drifts. An
+		// empty result means it's already gone — skip it.
+		exactID := installedExtensionID(cliPath, blamelyExtensionID)
+		if exactID == "" {
+			continue
+		}
+		if err := exec.Command(cliPath, "--uninstall-extension", exactID).Run(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -282,15 +296,25 @@ func findEditorCLI(t editorExtensionTarget) (string, bool) {
 }
 
 func extensionInstalled(cliPath, id string) bool {
+	return installedExtensionID(cliPath, id) != ""
+}
+
+// installedExtensionID returns the extension id exactly as the editor's CLI
+// lists it (case preserved), or "" if it isn't installed. The match is
+// case-insensitive, so callers can pass our canonical id and still get back the
+// editor's own casing — which uninstall needs because `--uninstall-extension`
+// is case-sensitive on some Code-OSS forks.
+func installedExtensionID(cliPath, id string) string {
 	out, err := exec.Command(cliPath, "--list-extensions").Output()
 	if err != nil {
-		return false
+		return ""
 	}
 	target := strings.ToLower(id)
 	for _, line := range strings.Split(string(out), "\n") {
-		if strings.ToLower(strings.TrimSpace(line)) == target {
-			return true
+		got := strings.TrimSpace(line)
+		if strings.ToLower(got) == target {
+			return got
 		}
 	}
-	return false
+	return ""
 }
