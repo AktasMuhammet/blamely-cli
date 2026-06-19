@@ -39,7 +39,7 @@ var cursorHookEvents = []string{"postToolUse"}
 
 // InstallCursorHook merges blamely's record command into every Cursor hook
 // event (postToolUse + preToolUse) in ~/.cursor/hooks.json. Idempotent.
-// Preserves all unrelated keys (including other tools' hooks like git-ai).
+// Preserves all unrelated keys (including other tools' hooks like other-tool).
 func InstallCursorHook(binaryPath string) (added bool, hooksPath string, err error) {
 	hooksPath, err = config.CursorHooksPath()
 	if err != nil {

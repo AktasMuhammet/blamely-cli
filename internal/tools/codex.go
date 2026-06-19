@@ -18,6 +18,7 @@ import (
 	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/daemon"
 	"github.com/blamely/blamely/internal/gitutil"
+	"github.com/blamely/blamely/internal/store"
 )
 
 // CodexWatcher tails ~/.codex/sessions/**/*.jsonl and emits attribution events
@@ -36,6 +37,10 @@ import (
 type CodexWatcher struct {
 	// SessionsDir overrides the default ~/.codex/sessions location for tests.
 	SessionsDir string
+	// DB, when set, persists each session file's read offset so a daemon restart
+	// resumes instead of replaying the whole file (re-emitting every edit). Nil in
+	// tests → replay-from-start, as before.
+	DB *store.DB
 }
 
 func (c *CodexWatcher) Name() string { return "codex" }
@@ -74,7 +79,7 @@ func (c *CodexWatcher) Run(ctx context.Context, sink daemon.Sink) error {
 			tCtx, cancel := context.WithCancel(ctx)
 			tailers[path] = cancel
 			go func(p string) {
-				if err := tailCodexSession(tCtx, p, sink); err != nil && tCtx.Err() == nil {
+				if err := tailCodexSession(tCtx, p, sink, c.DB, c.Name()); err != nil && tCtx.Err() == nil {
 					log.Printf("codex tail %s: %v", p, err)
 				}
 			}(path)
@@ -118,23 +123,60 @@ func findCodexSessionFiles(dir string) []string {
 // tailCodexSession streams new JSONL events from `path` and emits an Event
 // for every detected file mutation. Carries forward the latest seen model
 // and usage block so apply_patch calls inherit them.
-func tailCodexSession(ctx context.Context, path string, sink daemon.Sink) error {
+func tailCodexSession(ctx context.Context, path string, sink daemon.Sink, db *store.DB, watcherName string) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
 	}
 	defer f.Close()
 
-	// On startup we replay the file from the beginning so we don't miss edits
-	// that happened before the daemon started. Production deployments could
-	// also stash a per-file offset in the DB, but v1 keeps it simple.
+	// Resume from the persisted offset so a daemon restart doesn't replay the
+	// whole file and re-emit every edit. Without a DB / saved watermark we replay
+	// from the beginning (so we don't miss edits made while the daemon was down).
+	var startOffset int64
+	if db != nil {
+		if wm, ok := db.LoadWatermark(watcherName, path); ok {
+			if fi, e := f.Stat(); e == nil && wm.ByteOffset <= fi.Size() {
+				if _, e := f.Seek(wm.ByteOffset, io.SeekStart); e == nil {
+					startOffset = wm.ByteOffset
+				}
+			}
+		}
+	}
 	reader := bufio.NewReaderSize(f, 1<<16)
 
 	state := &codexState{sink: sink}
+
+	offset := startOffset
+	savedOffset := startOffset
+	lastSave := time.Now()
+	// saveWM persists the resume point — but ONLY when nothing is buffered. Codex
+	// buffers apply_patch events until a `response.complete` flush; advancing the
+	// watermark past an unflushed buffer would lose those edits if the daemon
+	// crashed before the flush. So the watermark only ever moves past flushed
+	// content; a crash mid-turn re-reads (and re-buffers) that turn, never drops it.
+	saveWM := func(force bool) {
+		if db == nil || offset == savedOffset || len(state.pending) > 0 {
+			return
+		}
+		if !force && time.Since(lastSave) < 500*time.Millisecond {
+			return
+		}
+		var size, mt int64
+		if fi, e := f.Stat(); e == nil {
+			size, mt = fi.Size(), fi.ModTime().UnixNano()
+		}
+		if err := db.SaveWatermark(watcherName, path, store.Watermark{ByteOffset: offset, Size: size, MtimeNanos: mt}); err == nil {
+			savedOffset, lastSave = offset, time.Now()
+		}
+	}
 	// Drain any patches we buffered without seeing a closing `response.complete`
-	// (file rotated / daemon shutting down). Better to have token-less rows
-	// than to lose the attribution.
-	defer state.flush(0, 0, 0, 0, false)
+	// (file rotated / daemon shutting down): flush them, then persist the now-empty
+	// buffer's offset. Better token-less rows than lost attribution.
+	defer func() {
+		state.flush(0, 0, 0, 0, false)
+		saveWM(true)
+	}()
 
 	for {
 		line, err := readLineGrowing(ctx, reader, f)
@@ -144,10 +186,18 @@ func tailCodexSession(ctx context.Context, path string, sink daemon.Sink) error 
 			}
 			return err
 		}
+		// Logical consumed offset = file read position minus what bufio has
+		// buffered-but-not-yet-returned. Tracks complete lines only (readLineGrowing
+		// seeks back over a partial trailing line), so it never splits a record.
+		if pos, e := f.Seek(0, io.SeekCurrent); e == nil {
+			offset = pos - int64(reader.Buffered())
+		}
 		if len(line) == 0 || line[0] != '{' {
+			saveWM(false)
 			continue
 		}
 		processCodexLine(line, state)
+		saveWM(false)
 	}
 }
 

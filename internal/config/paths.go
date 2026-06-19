@@ -7,26 +7,27 @@ import (
 )
 
 const (
-	dirName            = ".blamely"
-	dbFileName         = "db.sqlite"
-	portFileName       = "daemon.port"
-	socketFileName     = "daemon.sock"
-	stateFileName      = "state.json"
-	hooksDirName       = "git-hooks"
-	logFileName        = "daemon.log"
-	excludeFileName    = "exclude"
-	claudeDirName      = ".claude"
-	claudeSettings     = "settings.json"
-	codexDirName       = ".codex"
-	codexSessions      = "sessions"
-	codexConfig        = "config.toml"
-	cursorDirName      = ".cursor"
-	cursorHooks        = "hooks.json"
-	copilotDirName     = ".copilot"
-	copilotHooksSubdir = "hooks"
-	copilotHookFile    = "blamely.json"
-	geminiDirName      = ".gemini"
-	geminiSettings     = "settings.json"
+	dirName             = ".blamely"
+	dbFileName          = "db.sqlite"
+	portFileName        = "daemon.port"
+	socketFileName      = "daemon.sock"
+	stateFileName       = "state.json"
+	hooksDirName        = "git-hooks"
+	logFileName         = "daemon.log"
+	excludeFileName     = "exclude"
+	claudeDirName       = ".claude"
+	claudeSettings      = "settings.json"
+	codexDirName        = ".codex"
+	codexSessions       = "sessions"
+	codexConfig         = "config.toml"
+	cursorDirName       = ".cursor"
+	cursorHooks         = "hooks.json"
+	copilotDirName      = ".copilot"
+	copilotHooksSubdir  = "hooks"
+	copilotHookFile     = "blamely.json"
+	copilotSessionState = "session-state"
+	geminiDirName       = ".gemini"
+	geminiSettings      = "settings.json"
 )
 
 func Home() (string, error) {
@@ -141,6 +142,17 @@ func CopilotHooksDir() (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, copilotDirName, copilotHooksSubdir), nil
+}
+
+// CopilotSessionStateDir is ~/.copilot/session-state, where the Copilot CLI
+// writes one <session-id>/events.jsonl per session (the source of per-turn
+// model + output-token telemetry).
+func CopilotSessionStateDir() (string, error) {
+	home, err := Home()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, copilotDirName, copilotSessionState), nil
 }
 
 func CopilotBlamelyHookPath() (string, error) {

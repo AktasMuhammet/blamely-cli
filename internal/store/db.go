@@ -182,6 +182,39 @@ var migrations = []string{
 	// backslash rows; the daemon re-caches them on the next edit (and the
 	// /snapshot HEAD fallback covers the gap until then).
 	/* 22 */ `DELETE FROM file_snapshots WHERE INSTR(file_path, '\') > 0`,
+	// Migration 23: watcher_watermarks — each file-tailing watcher's resume point
+	// per source (transcript/log file), so a daemon restart continues where it
+	// left off instead of re-parsing whole files and re-emitting historical edits
+	// as duplicate /edit rows. size + mtime_nanos detect rotation/truncation;
+	// extra is a small per-watcher JSON blob (e.g. tegOffset, nextReqIdx).
+	// "offset" is a SQL keyword, so the column is byte_offset.
+	/* 23 */ `CREATE TABLE IF NOT EXISTS watcher_watermarks (
+		watcher       TEXT    NOT NULL,
+		source        TEXT    NOT NULL,
+		byte_offset   INTEGER NOT NULL DEFAULT 0,
+		size          INTEGER NOT NULL DEFAULT 0,
+		mtime_nanos   INTEGER NOT NULL DEFAULT 0,
+		extra         TEXT,
+		updated_nanos INTEGER NOT NULL,
+		PRIMARY KEY (watcher, source)
+	)`,
+	// Migration 24: session_usage — per-session, per-model CUMULATIVE token totals
+	// reported by a tool at session end (e.g. the Copilot CLI's session.shutdown
+	// modelMetrics). These are a session-level metric, deliberately separate from
+	// the per-edit `edits` token columns: they cover a whole session's spend
+	// (including non-edit turns) and must not be attributed to any single edit.
+	/* 24 */ `CREATE TABLE IF NOT EXISTS session_usage (
+		session_id         TEXT    NOT NULL,
+		tool               TEXT    NOT NULL,
+		model              TEXT    NOT NULL,
+		input_tokens       INTEGER NOT NULL DEFAULT 0,
+		output_tokens      INTEGER NOT NULL DEFAULT 0,
+		cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+		cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+		reasoning_tokens   INTEGER NOT NULL DEFAULT 0,
+		updated_nanos      INTEGER NOT NULL,
+		PRIMARY KEY (session_id, tool, model)
+	)`,
 }
 
 func (db *DB) migrate() error {

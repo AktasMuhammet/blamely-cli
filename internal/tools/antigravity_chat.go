@@ -69,6 +69,8 @@ const antigravityChatStaleCutoff = 24 * time.Hour
 type AntigravityGeminiWatcher struct {
 	// Roots overrides the brain/ scan roots for tests.
 	Roots []string
+	// DB, when set, persists per-file read offsets across daemon restarts.
+	DB *store.DB
 }
 
 func (w *AntigravityGeminiWatcher) Name() string { return "antigravity-gemini" }
@@ -78,7 +80,7 @@ func (w *AntigravityGeminiWatcher) Run(ctx context.Context, sink daemon.Sink) er
 	if len(roots) == 0 {
 		roots = defaultAntigravityBrainRoots()
 	}
-	return (&antigravityTranscriptWatcher{roots: roots}).run(ctx, sink)
+	return (&antigravityTranscriptWatcher{roots: roots, name: w.Name(), db: w.DB}).run(ctx, sink)
 }
 
 func defaultAntigravityBrainRoots() []string {
@@ -93,6 +95,8 @@ func defaultAntigravityBrainRoots() []string {
 
 type antigravityTranscriptWatcher struct {
 	roots []string
+	name  string
+	db    *store.DB
 }
 
 // transcriptFileState is the per-file bookkeeping carried between scans.
@@ -109,6 +113,10 @@ type transcriptFileState struct {
 	// trigger a DB open on every step indefinitely.
 	model         string
 	modelAttempts int
+
+	// savedOffset is the last offset persisted to the watermark store; the scan
+	// only re-saves when the offset advances past it.
+	savedOffset int64
 
 	// createdFromContent holds the resolved abs path of files we've already
 	// recorded from a write_to_file tool-call's actual AI content. The matching
@@ -173,6 +181,7 @@ func (w *antigravityTranscriptWatcher) handleTranscriptFile(path string, state m
 	if !ok {
 		st = &transcriptFileState{seen: map[int]bool{}, createdFromContent: map[string]bool{}}
 		state[path] = st
+		w.loadWatermark(path, st, info) // resume across daemon restarts
 	}
 	if info.Size() < st.offset {
 		st.offset = 0
@@ -181,6 +190,8 @@ func (w *antigravityTranscriptWatcher) handleTranscriptFile(path string, state m
 	startOffset := st.offset
 	prime := startOffset == 0
 	mu.Unlock()
+
+	defer w.saveWatermark(path, st, mu, info)
 
 	if info.Size() <= startOffset {
 		return
@@ -199,20 +210,60 @@ func (w *antigravityTranscriptWatcher) handleTranscriptFile(path string, state m
 	// a while — that's a historical transcript from a past session, not a live
 	// edit. A transcript still being actively appended to is live.
 	emit := !prime || time.Since(info.ModTime()) <= 2*antigravityChatPollInterval
+	// Advance the offset only over complete (newline-terminated) lines; a partial
+	// trailing line is left unconsumed for the next scan so the persisted offset
+	// never strands past a half-written record.
+	consumed := startOffset
 	for {
 		line, rerr := r.ReadString('\n')
-		if line != "" {
-			w.handleLine(path, line, st, mu, sink, emit)
-		}
 		if rerr != nil {
 			break
 		}
+		w.handleLine(path, line, st, mu, sink, emit)
+		consumed += int64(len(line))
 	}
-	newOffset, _ := f.Seek(0, 1)
 	mu.Lock()
-	st.offset = newOffset
+	st.offset = consumed
 	st.lastTouch = time.Now()
 	mu.Unlock()
+}
+
+// loadWatermark seeds st.offset from the persisted resume point so a daemon
+// restart continues instead of re-parsing the whole transcript. No-op without a
+// DB / saved watermark, or if the saved offset is past EOF (rotated file).
+func (w *antigravityTranscriptWatcher) loadWatermark(path string, st *transcriptFileState, info os.FileInfo) {
+	if w.db == nil {
+		return
+	}
+	wm, ok := w.db.LoadWatermark(w.name, path)
+	if !ok || wm.ByteOffset > info.Size() {
+		return
+	}
+	st.offset = wm.ByteOffset
+	st.savedOffset = wm.ByteOffset
+}
+
+// saveWatermark persists st.offset when it advances — a cheap no-op otherwise.
+func (w *antigravityTranscriptWatcher) saveWatermark(path string, st *transcriptFileState, mu *sync.Mutex, info os.FileInfo) {
+	if w.db == nil {
+		return
+	}
+	mu.Lock()
+	if st.offset == st.savedOffset {
+		mu.Unlock()
+		return
+	}
+	off := st.offset
+	st.savedOffset = off
+	mu.Unlock()
+
+	if err := w.db.SaveWatermark(w.name, path, store.Watermark{
+		ByteOffset: off,
+		Size:       info.Size(),
+		MtimeNanos: info.ModTime().UnixNano(),
+	}); err != nil {
+		log.Printf("%s: save watermark %s: %v", w.name, path, err)
+	}
 }
 
 func (w *antigravityTranscriptWatcher) handleLine(path, line string, st *transcriptFileState, mu *sync.Mutex, sink daemon.Sink, emit bool) {

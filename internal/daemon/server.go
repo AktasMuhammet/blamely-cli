@@ -45,7 +45,7 @@ type Server struct {
 	// preChatSnaps holds file content PUT by the VS Code plugin right before a
 	// chat apply. Keyed by "repo\x00file". The chat watcher consumes the entry
 	// (deletes on first read) so it's only used once per apply. Guarded by mu.
-	preChatMu   sync.Mutex
+	preChatMu    sync.Mutex
 	preChatSnaps map[string]string
 }
 
@@ -118,6 +118,12 @@ func Run(ctx context.Context) error {
 		return err
 	}
 	defer db.Close()
+
+	// Drop watermark rows for sources untouched in 60 days (deleted/rotated
+	// session & log files) so the table doesn't grow without bound. Best-effort.
+	if n, err := db.PruneWatermarks(time.Now().Add(-60 * 24 * time.Hour).UnixNano()); err == nil && n > 0 {
+		log.Printf("pruned %d stale watcher watermark(s)", n)
+	}
 
 	s := &Server{db: db}
 

@@ -78,10 +78,10 @@ func TestInstallCursorHook_PreservesExisting(t *testing.T) {
   "version": 1,
   "hooks": {
     "postToolUse": [
-      { "command": "/Users/x/.git-ai/bin/git-ai checkpoint cursor --hook-input stdin" }
+      { "command": "/Users/x/.other-tool/bin/other-tool checkpoint cursor --hook-input stdin" }
     ],
     "preToolUse": [
-      { "command": "/Users/x/.git-ai/bin/git-ai checkpoint cursor --hook-input stdin" }
+      { "command": "/Users/x/.other-tool/bin/other-tool checkpoint cursor --hook-input stdin" }
     ]
   }
 }`
@@ -109,7 +109,7 @@ func TestUninstallCursorHook_RemovesOurs_KeepsOthers(t *testing.T) {
   "version": 1,
   "hooks": {
     "postToolUse": [
-      { "command": "/Users/x/.git-ai/bin/git-ai checkpoint cursor --hook-input stdin" },
+      { "command": "/Users/x/.other-tool/bin/other-tool checkpoint cursor --hook-input stdin" },
       { "command": "/bin/blamely record cursor" }
     ]
   }
@@ -130,8 +130,8 @@ func TestUninstallCursorHook_RemovesOurs_KeepsOthers(t *testing.T) {
 		t.Fatalf("expected 1 entry after uninstall, got %d", len(post))
 	}
 	entry, _ := post[0].(map[string]any)
-	if cmd, _ := entry["command"].(string); !containsSubstr(cmd, "git-ai") {
-		t.Errorf("git-ai hook was removed, got %q", cmd)
+	if cmd, _ := entry["command"].(string); !containsSubstr(cmd, "other-tool") {
+		t.Errorf("other-tool hook was removed, got %q", cmd)
 	}
 }
 

@@ -90,11 +90,21 @@ type rawChatRequest struct {
 }
 
 type chatResult struct {
-	Usage chatUsage `json:"usage"`
+	Usage    chatUsage     `json:"usage"`
+	Metadata *chatMetadata `json:"metadata"`
 }
 
 type chatUsage struct {
 	PromptTokens     int64 `json:"promptTokens"`
+	CompletionTokens int64 `json:"completionTokens"`
+}
+
+// chatMetadata is the current VS Code chat shape (Copilot/Cursor): per-request
+// token counts live in result.metadata as promptTokens/outputTokens (older
+// builds used result.usage.promptTokens/completionTokens — kept as a fallback).
+type chatMetadata struct {
+	PromptTokens     int64 `json:"promptTokens"`
+	OutputTokens     int64 `json:"outputTokens"`
 	CompletionTokens int64 `json:"completionTokens"`
 }
 
@@ -182,8 +192,21 @@ func (cs *chatSession) applyLine(cl chatLine) {
 			var res chatResult
 			if json.Unmarshal(cl.V, &res) == nil {
 				if r := cs.req(n); r != nil {
-					r.promptTokens = res.Usage.PromptTokens
-					r.completionTokens = res.Usage.CompletionTokens
+					// Prefer the current metadata shape; fall back to the legacy
+					// usage block for older session files.
+					pt, ct := res.Usage.PromptTokens, res.Usage.CompletionTokens
+					if m := res.Metadata; m != nil {
+						if m.PromptTokens > 0 {
+							pt = m.PromptTokens
+						}
+						if m.OutputTokens > 0 {
+							ct = m.OutputTokens
+						} else if m.CompletionTokens > 0 {
+							ct = m.CompletionTokens
+						}
+					}
+					r.promptTokens = pt
+					r.completionTokens = ct
 				}
 			}
 		}
@@ -361,4 +384,29 @@ func ReadChatSessionLatestUsage(path string) (*TranscriptUsage, error) {
 		}, nil
 	}
 	return nil, nil
+}
+
+// ReadChatSessionRequestUsage returns the model + token usage for a SPECIFIC chat
+// request (turn) index, or nil if that request has no usage. Used by the chat
+// watcher to credit a turn's prompt/output tokens to the edit it produced.
+func ReadChatSessionRequestUsage(path string, reqIdx int) (*TranscriptUsage, error) {
+	if path == "" || reqIdx < 0 {
+		return nil, nil
+	}
+	cs, err := parseChatSession(path)
+	if err != nil {
+		return nil, err
+	}
+	if reqIdx >= len(cs.requests) {
+		return nil, nil
+	}
+	r := cs.requests[reqIdx]
+	if r.promptTokens == 0 && r.completionTokens == 0 {
+		return nil, nil
+	}
+	return &TranscriptUsage{
+		Model:        cs.model,
+		InputTokens:  r.promptTokens,
+		OutputTokens: r.completionTokens,
+	}, nil
 }

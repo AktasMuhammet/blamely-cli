@@ -15,6 +15,7 @@ import (
 	"github.com/blamely/blamely/internal/gitnotes"
 	"github.com/blamely/blamely/internal/install"
 	"github.com/blamely/blamely/internal/report"
+	"github.com/blamely/blamely/internal/store"
 	"github.com/blamely/blamely/internal/tools"
 )
 
@@ -122,25 +123,36 @@ func cmdDaemon() *cobra.Command {
 			// editor.action.inlineSuggest.commit command and AnActionListener
 			// APIs respectively, both of which POST directly to /edit.
 			daemon.Watchers = []daemon.Watcher{
-				&tools.CodexWatcher{},
-				// Cursor: file-history presence signal + log events + chat panel.
-				// These three are independent of Copilot and must not share state.
+				// Cursor: file-history presence signal (emit is a deliberate no-op —
+				// see CursorWatcher.emit — so no replay/duplicate on restart) + logs.
 				&tools.CursorWatcher{},
 				&tools.CursorLogWatcher{},
-				&tools.CursorChatWatcher{},
-				// Copilot: storage-touch signal + chat panel (VS Code only) + logs.
-				// CopilotChatWatcher watches Code/workspaceStorage; CursorChatWatcher
-				// watches Cursor/workspaceStorage. They never overlap.
+				// Copilot: storage-touch signal (primes on first scan, no replay) + logs.
 				&tools.CopilotWatcher{},
-				&tools.CopilotChatWatcher{},
 				&tools.CopilotLogWatcher{},
-				// Antigravity IDE's bundled Gemini agent: no CLI hook fires
-				// (it never goes through Gemini CLI's BeforeTool/AfterTool
-				// framework), so this tails the agent's own transcript logs.
-				&tools.AntigravityGeminiWatcher{},
 				// Claude Desktop's "cowork" sandbox has no PostToolUse hook; this
 				// tails its undocumented logs to attribute its file edits/deletes.
 				&tools.ClaudeDesktopWatcher{},
+			}
+			// DB-backed watchers persist their resume state (watcher_watermarks) so a
+			// daemon restart doesn't re-parse/re-emit history. CopilotChatWatcher
+			// watches Code/workspaceStorage; CursorChatWatcher watches
+			// Cursor/workspaceStorage — they never overlap. CodexWatcher tails
+			// ~/.codex session JSONL (per-file byte offset).
+			daemon.DBWatcherFactories = []func(*store.DB) daemon.Watcher{
+				func(db *store.DB) daemon.Watcher { return &tools.CodexWatcher{DB: db} },
+				func(db *store.DB) daemon.Watcher { return &tools.CursorChatWatcher{DB: db} },
+				// Copilot Chat is recorded in REAL TIME from the extension's append-only
+				// transcript stream (GitHub.copilot-chat/transcripts), enriched with
+				// model + tokens read from the sibling chatSessions file. This replaces
+				// the old CopilotChatWatcher (which read the lazily-flushed chatSessions
+				// directly and lagged minutes behind, attributing edits to Human); it's
+				// retired here so the same edit isn't recorded twice (double-counted tokens).
+				func(db *store.DB) daemon.Watcher { return &tools.CopilotTranscriptWatcher{DB: db} },
+				func(db *store.DB) daemon.Watcher { return &tools.AntigravityGeminiWatcher{DB: db} },
+				// Session-level (not per-edit) metric: the Copilot CLI's cumulative
+				// per-model token totals from each session's terminal shutdown event.
+				func(db *store.DB) daemon.Watcher { return &tools.CopilotCliUsageWatcher{DB: db} },
 			}
 			return daemon.Run(cmd.Context())
 		},
@@ -242,7 +254,12 @@ func cmdInstall() *cobra.Command {
 		Use:   "install",
 		Short: "Install Blamely (Claude hook, global git hook, daemon agent)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return install.Run(!skipPlugins)
+			if err := install.Run(!skipPlugins); err != nil {
+				return err
+			}
+			// Show the channel's release notes (best-effort; never fails install).
+			install.PrintWhatsNew()
+			return nil
 		},
 	}
 	c.Flags().BoolVar(&skipPlugins, "skip-plugins", false,
@@ -284,13 +301,17 @@ func cmdInstallJetbrainsZip() *cobra.Command {
 }
 
 func cmdUninstall() *cobra.Command {
-	return &cobra.Command{
+	var keepDB bool
+	c := &cobra.Command{
 		Use:   "uninstall",
-		Short: "Reverse `blamely install`",
+		Short: "Reverse `blamely install` (keeps your config.json and exclude list)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return install.Uninstall()
+			return install.Uninstall(keepDB)
 		},
 	}
+	c.Flags().BoolVar(&keepDB, "keep-db", false,
+		"preserve the attribution database (~/.blamely/db.sqlite); by default it's removed")
+	return c
 }
 
 func cmdRecord() *cobra.Command {

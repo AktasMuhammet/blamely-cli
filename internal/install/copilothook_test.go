@@ -61,22 +61,22 @@ func TestInstallCopilotHook_CreatesFile(t *testing.T) {
 
 func TestInstallCopilotHook_DoesNotTouchOtherToolsFile(t *testing.T) {
 	home := setupFakeCopilotHome(t, "")
-	// Drop a sibling git-ai hook file that should be left alone.
-	gitAIPath := filepath.Join(home, ".copilot", "hooks", "git-ai.json")
-	gitAIContent := `{"hooks":{"PostToolUse":[{"command":"/Users/x/.git-ai/bin/git-ai checkpoint github-copilot --hook-input stdin","type":"command"}]}}`
-	if err := os.WriteFile(gitAIPath, []byte(gitAIContent), 0o644); err != nil {
+	// Drop a sibling other-tool hook file that should be left alone.
+	otherToolPath := filepath.Join(home, ".copilot", "hooks", "other-tool.json")
+	otherToolContent := `{"hooks":{"PostToolUse":[{"command":"/Users/x/.other-tool/bin/other-tool checkpoint github-copilot --hook-input stdin","type":"command"}]}}`
+	if err := os.WriteFile(otherToolPath, []byte(otherToolContent), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	if _, _, err := InstallCopilotHook("/bin/blamely"); err != nil {
 		t.Fatal(err)
 	}
-	data, err := os.ReadFile(gitAIPath)
+	data, err := os.ReadFile(otherToolPath)
 	if err != nil {
-		t.Fatalf("git-ai file disappeared: %v", err)
+		t.Fatalf("other-tool file disappeared: %v", err)
 	}
-	if string(data) != gitAIContent {
-		t.Errorf("git-ai file was modified:\nwant: %s\ngot:  %s", gitAIContent, data)
+	if string(data) != otherToolContent {
+		t.Errorf("other-tool file was modified:\nwant: %s\ngot:  %s", otherToolContent, data)
 	}
 }
 

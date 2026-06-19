@@ -81,13 +81,13 @@ func TestInstallGeminiHook_PreservesExisting(t *testing.T) {
     "AfterTool": [
       {
         "matcher": "*",
-        "hooks": [{"type":"command","command":"/Users/x/.git-ai/bin/git-ai checkpoint gemini --hook-input stdin"}]
+        "hooks": [{"type":"command","command":"/Users/x/.other-tool/bin/other-tool checkpoint gemini --hook-input stdin"}]
       }
     ],
     "BeforeTool": [
       {
         "matcher": "*",
-        "hooks": [{"type":"command","command":"/Users/x/.git-ai/bin/git-ai checkpoint gemini --hook-input stdin"}]
+        "hooks": [{"type":"command","command":"/Users/x/.other-tool/bin/other-tool checkpoint gemini --hook-input stdin"}]
       }
     ]
   }
@@ -116,7 +116,7 @@ func TestInstallGeminiHook_PreservesExisting(t *testing.T) {
 	grp, _ := after[0].(map[string]any)
 	inner, _ := grp["hooks"].([]any)
 	if len(inner) != 2 {
-		t.Errorf("expected 2 hooks inside the matcher (git-ai + blamely), got %d", len(inner))
+		t.Errorf("expected 2 hooks inside the matcher (other-tool + blamely), got %d", len(inner))
 	}
 }
 
@@ -128,7 +128,7 @@ func TestUninstallGeminiHook_RemovesOurs_KeepsOthers(t *testing.T) {
       {
         "matcher": "*",
         "hooks": [
-          {"type":"command","command":"/Users/x/.git-ai/bin/git-ai checkpoint gemini --hook-input stdin"},
+          {"type":"command","command":"/Users/x/.other-tool/bin/other-tool checkpoint gemini --hook-input stdin"},
           {"type":"command","command":"/bin/blamely record gemini"}
         ]
       }
@@ -156,8 +156,8 @@ func TestUninstallGeminiHook_RemovesOurs_KeepsOthers(t *testing.T) {
 		t.Fatalf("expected 1 remaining hook, got %d", len(inner))
 	}
 	hm, _ := inner[0].(map[string]any)
-	if cmd, _ := hm["command"].(string); !containsSubstr(cmd, "git-ai") {
-		t.Errorf("git-ai hook was lost: %q", cmd)
+	if cmd, _ := hm["command"].(string); !containsSubstr(cmd, "other-tool") {
+		t.Errorf("other-tool hook was lost: %q", cmd)
 	}
 }
 

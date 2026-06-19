@@ -180,7 +180,7 @@ hooks = true
 [[hooks.PostToolUse]]
 
 [[hooks.PostToolUse.hooks]]
-command = "/Users/x/.git-ai/bin/git-ai checkpoint codex --hook-input stdin"
+command = "/Users/x/.other-tool/bin/other-tool checkpoint codex --hook-input stdin"
 type = "command"
 
 [hooks.state."/Users/x/.codex/config.toml:post_tool_use:0:0"]
@@ -202,7 +202,7 @@ trusted_hash = "sha256:deadbeef"
 	hooks, _ := root["hooks"].(map[string]any)
 	post, _ := hooks["PostToolUse"].([]any)
 	if len(post) != 2 {
-		t.Fatalf("expected 2 groups (git-ai + blamely), got %d", len(post))
+		t.Fatalf("expected 2 groups (other-tool + blamely), got %d", len(post))
 	}
 	// hooks.state.* must survive
 	state, _ := hooks["state"].(map[string]any)
@@ -218,7 +218,7 @@ hooks = true
 [[hooks.PostToolUse]]
 
 [[hooks.PostToolUse.hooks]]
-command = "/Users/x/.git-ai/bin/git-ai checkpoint codex --hook-input stdin"
+command = "/Users/x/.other-tool/bin/other-tool checkpoint codex --hook-input stdin"
 type = "command"
 
 [[hooks.PostToolUse]]
@@ -248,8 +248,8 @@ type = "command"
 	grp, _ := post[0].(map[string]any)
 	inner, _ := grp["hooks"].([]any)
 	hm, _ := inner[0].(map[string]any)
-	if cmd, _ := hm["command"].(string); !containsSubstr(cmd, "git-ai") {
-		t.Errorf("git-ai hook was lost, got %q", cmd)
+	if cmd, _ := hm["command"].(string); !containsSubstr(cmd, "other-tool") {
+		t.Errorf("other-tool hook was lost, got %q", cmd)
 	}
 }
 

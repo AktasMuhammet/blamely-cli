@@ -54,7 +54,7 @@ func RecordCopilotFromStdin(r io.Reader) error {
 		p.SessionID = p.ConversationID
 	}
 
-	filePath, ranges, suggested := extractCopilotRanges(p)
+	filePath, ranges, suggested, removed, newFullContent := extractCopilotRanges(p)
 	if filePath == "" {
 		// Copilot removes files either with a dedicated delete tool (a bare
 		// path) or via its terminal tool (`rm`). Neither produces an edit
@@ -88,6 +88,15 @@ func RecordCopilotFromStdin(r io.Reader) error {
 		}
 	}
 
+	// Whole-file overwrite (Write): it carries no "before" content, so diff the
+	// new content against the daemon's cached snapshot to detect removed lines —
+	// otherwise a Copilot CLI overwrite that drops lines loses the deletion.
+	if newFullContent != nil {
+		if snapshot, ok := fetchSnapshot(repoPath, rel); ok {
+			removed = append(removed, RemovedLineHashes(snapshot, *newFullContent)...)
+		}
+	}
+
 	gen := copilotGenType(p.ToolName)
 	payload := daemon.EditPayload{
 		Tool:           "copilot",
@@ -98,6 +107,7 @@ func RecordCopilotFromStdin(r io.Reader) error {
 		Model:          p.Model,
 		SuggestedLines: suggested,
 		Lines:          toDaemonRanges(ranges),
+		RemovedLines:   toDaemonRemovedLines(removed),
 		RawMeta: fmt.Sprintf(`{"session_id":%q,"tool":%q,"transcript_path":%q,"source":"copilot_hook"}`,
 			p.SessionID, p.ToolName, p.TranscriptPath),
 	}
@@ -109,11 +119,31 @@ func RecordCopilotFromStdin(r io.Reader) error {
 	return postToDaemon(payload)
 }
 
+// copilotAddedRanges returns PER-LINE content_sha ranges for newStr — the form
+// commit-time attribution needs to match added lines (a single block range
+// without per-line shas never matches, so the lines fall to Human). If oldStr is
+// present it narrows to the genuinely-changed lines; otherwise every non-blank
+// new line is credited. Positions are placeholders — matching is by content_sha,
+// so we don't need to locate the text in the file (LocateNewString can fail when
+// the on-disk file already moved on).
+func copilotAddedRanges(oldStr, newStr string) ([]LineRange, int64) {
+	if strings.TrimSpace(newStr) == "" {
+		return nil, 0
+	}
+	if strings.TrimSpace(oldStr) == "" {
+		r := perLineShaRangesFromContent(newStr)
+		return r, int64(countLines(newStr))
+	}
+	return narrowToChangedLines(oldStr, newStr, LineRange{Start: 1, End: countLines(newStr)})
+}
+
 // extractCopilotRanges is intentionally permissive: it accepts Copilot's native
 // agent tool shapes (str_replace_editor, create_file, insert_edit_into_file) as
 // well as Claude-compatible shapes (Edit/Write/MultiEdit) and a generic fallback
-// that tries any payload with a recognisable file path + content field.
-func extractCopilotRanges(p copilotHookPayload) (string, []LineRange, int64) {
+// that tries any payload with a recognisable file path + content field. Every add
+// path emits per-line content_sha (via copilotAddedRanges / perLineSha) so an
+// AI-added line attributes to copilot instead of falling to Human.
+func extractCopilotRanges(p copilotHookPayload) (string, []LineRange, int64, []DeletedLineHash, *string) {
 	switch p.ToolName {
 	// ── GitHub Copilot agent / chat tools ────────────────────────────────────
 	// These are the tool names Copilot sends from its chat panel in VS Code and
@@ -131,110 +161,89 @@ func extractCopilotRanges(p copilotHookPayload) (string, []LineRange, int64) {
 			Content string `json:"content"`
 		}
 		if err := json.Unmarshal(p.ToolInput, &in); err != nil || in.Path == "" {
-			return "", nil, 0
+			return "", nil, 0, nil, nil
 		}
 		body := in.NewStr
 		if body == "" {
 			body = in.Content
 		}
+		removed := RemovedLineHashes(in.OldStr, body)
 		if strings.TrimSpace(body) == "" && in.OldStr != "" {
-			return in.Path, nil, int64(countLines(in.OldStr))
+			return in.Path, nil, int64(countLines(in.OldStr)), removed, nil
 		}
-		lr, _ := LocateNewString(in.Path, body)
-		if lr == nil {
-			return in.Path, nil, CountAddedLines(in.OldStr, body)
-		}
-		ranges, suggested := narrowToChangedLines(in.OldStr, body, *lr)
-		return in.Path, ranges, suggested
+		ranges, suggested := copilotAddedRanges(in.OldStr, body)
+		return in.Path, ranges, suggested, removed, nil
 
 	case "create_file":
-		// Payload: {path, content}
+		// Payload: {path, content} — new file, nothing removed.
 		var in struct {
 			Path    string `json:"path"`
 			Content string `json:"content"`
 		}
 		if err := json.Unmarshal(p.ToolInput, &in); err != nil || in.Path == "" {
-			return "", nil, 0
+			return "", nil, 0, nil, nil
 		}
-		suggested := int64(countLines(in.Content))
-		lr, _ := LineRangeForWholeFile(in.Path)
-		if lr == nil {
-			return in.Path, nil, suggested
-		}
-		return in.Path, lr, suggested
+		return in.Path, perLineShaRangesFromContent(in.Content), int64(countLines(in.Content)), nil, nil
 
 	case "insert_edit_into_file":
-		// Payload: {path, code, explanation?}
+		// Payload: {path, code, explanation?} — pure insertion, nothing removed.
 		var in struct {
 			Path string `json:"path"`
 			Code string `json:"code"`
 		}
 		if err := json.Unmarshal(p.ToolInput, &in); err != nil || in.Path == "" {
-			return "", nil, 0
+			return "", nil, 0, nil, nil
 		}
-		suggested := int64(countLines(in.Code))
-		lr, _ := LocateNewString(in.Path, in.Code)
-		if lr == nil {
-			return in.Path, nil, suggested
-		}
-		return in.Path, []LineRange{*lr}, suggested
+		return in.Path, perLineShaRangesFromContent(in.Code), int64(countLines(in.Code)), nil, nil
 
 	// ── Claude-compatible shapes (also used by some Copilot variants) ─────────
 
 	case "Edit":
 		var in editInput
 		if err := json.Unmarshal(p.ToolInput, &in); err != nil || in.FilePath == "" {
-			return "", nil, 0
+			return "", nil, 0, nil, nil
 		}
+		removed := RemovedLineHashes(in.OldString, in.NewString)
 		if strings.TrimSpace(in.NewString) == "" && in.OldString != "" {
-			return in.FilePath, nil, int64(countLines(in.OldString))
+			return in.FilePath, nil, int64(countLines(in.OldString)), removed, nil
 		}
-		lr, _ := LocateNewString(in.FilePath, in.NewString)
-		if lr == nil {
-			return in.FilePath, nil, CountAddedLines(in.OldString, in.NewString)
-		}
-		ranges, suggested := narrowToChangedLines(in.OldString, in.NewString, *lr)
-		return in.FilePath, ranges, suggested
+		ranges, suggested := copilotAddedRanges(in.OldString, in.NewString)
+		return in.FilePath, ranges, suggested, removed, nil
 
 	case "Write":
 		var in writeInput
 		if err := json.Unmarshal(p.ToolInput, &in); err != nil || in.FilePath == "" {
-			return "", nil, 0
+			return "", nil, 0, nil, nil
 		}
-		suggested := int64(countLines(in.Content))
-		lr, _ := LineRangeForWholeFile(in.FilePath)
-		if lr == nil {
-			return in.FilePath, nil, suggested
-		}
-		return in.FilePath, lr, suggested
+		// Whole-file overwrite: per-line shas for the new content; removed lines
+		// are computed by the caller against the cached snapshot (newFullContent).
+		return in.FilePath, perLineShaRangesFromContent(in.Content), int64(countLines(in.Content)), nil, &in.Content
 
 	case "MultiEdit":
 		var in multiEditInput
 		if err := json.Unmarshal(p.ToolInput, &in); err != nil || in.FilePath == "" {
-			return "", nil, 0
+			return "", nil, 0, nil, nil
 		}
 		var suggested int64
 		var out []LineRange
+		var removed []DeletedLineHash
 		for _, ed := range in.Edits {
+			removed = append(removed, RemovedLineHashes(ed.OldString, ed.NewString)...)
 			if strings.TrimSpace(ed.NewString) == "" && ed.OldString != "" {
 				suggested += int64(countLines(ed.OldString))
 				continue
 			}
-			lr, err := LocateNewString(in.FilePath, ed.NewString)
-			if err != nil || lr == nil {
-				suggested += CountAddedLines(ed.OldString, ed.NewString)
-				continue
-			}
-			narrowed, narrowSuggest := narrowToChangedLines(ed.OldString, ed.NewString, *lr)
+			narrowed, narrowSuggest := copilotAddedRanges(ed.OldString, ed.NewString)
 			out = append(out, narrowed...)
 			suggested += narrowSuggest
 		}
-		return in.FilePath, out, suggested
+		return in.FilePath, out, suggested, removed, nil
 
 	default:
 		// Generic fallback: try multiple field-name conventions. Copilot uses
 		// "path"; Claude/older hooks use "file_path". Content body may be in
-		// "new_string", "new_str", "content", or "code".
+		// "new_string", "new_str", "content", or "code"; an old body (for
+		// removed-line detection) in "old_string" or "old_str".
 		var generic struct {
 			FilePath  string `json:"file_path"`
 			Path      string `json:"path"`
@@ -242,16 +251,18 @@ func extractCopilotRanges(p copilotHookPayload) (string, []LineRange, int64) {
 			NewStr    string `json:"new_str"`
 			Content   string `json:"content"`
 			Code      string `json:"code"`
+			OldString string `json:"old_string"`
+			OldStr    string `json:"old_str"`
 		}
 		if err := json.Unmarshal(p.ToolInput, &generic); err != nil {
-			return "", nil, 0
+			return "", nil, 0, nil, nil
 		}
 		fp := generic.FilePath
 		if fp == "" {
 			fp = generic.Path
 		}
 		if fp == "" {
-			return "", nil, 0
+			return "", nil, 0, nil, nil
 		}
 		body := generic.NewString
 		if body == "" {
@@ -263,29 +274,27 @@ func extractCopilotRanges(p copilotHookPayload) (string, []LineRange, int64) {
 		if body == "" {
 			body = generic.Code
 		}
-		suggested := int64(countLines(body))
-		if body != "" {
-			if lr, _ := LocateNewString(fp, body); lr != nil {
-				return fp, []LineRange{*lr}, suggested
-			}
+		old := generic.OldString
+		if old == "" {
+			old = generic.OldStr
 		}
-		return fp, nil, suggested
+		removed := RemovedLineHashes(old, body)
+		ranges, suggested := copilotAddedRanges(old, body)
+		return fp, ranges, suggested, removed, nil
 	}
 }
 
 func copilotGenType(toolName string) string {
-	// Copilot's native agent/chat tool names — always produced by the chat panel.
-	switch toolName {
-	case "str_replace_editor", "create_file", "insert_edit_into_file":
-		return "chat"
-	}
+	// RecordCopilotFromStdin is the GitHub Copilot *CLI's* PostToolUse hook, so
+	// every edit it sees is a command-line agent action → "cli" (same as Codex),
+	// NOT inline tab-completion. Inline completions never fire this hook (the
+	// editor plugin records those), and VS Code's Copilot Chat panel is handled by
+	// the transcript watcher — so "completion" is never correct here.
 	t := strings.ToLower(toolName)
-	if strings.Contains(t, "chat") || strings.Contains(t, "ask") || strings.Contains(t, "panel") ||
-		strings.Contains(t, "insert") || strings.Contains(t, "create") {
+	if strings.Contains(t, "chat") || strings.Contains(t, "ask") || strings.Contains(t, "panel") {
 		return "chat"
 	}
-	// Default for inline tab-completion tools (Edit/Write/Apply etc.).
-	return "completion"
+	return "cli"
 }
 
 // emitCopilotMarker is a fallback for payloads where we couldn't extract a

@@ -28,21 +28,32 @@ const detachedProcess = 0x08000000 | 0x00000008
 // it while the uninstaller is still alive would kill the uninstaller too. The
 // leading ping ensures this process is gone first, leaving the daemon as the
 // only remaining blamely.exe.
-func removeInstalledBinary(p string) error {
-	if _, err := os.Stat(p); os.IsNotExist(err) {
+//
+// extraFiles (db.sqlite, daemon.log, …) are deleted in the SAME script: the
+// still-running daemon holds them open, so they can only be removed AFTER the
+// taskkill — os.Remove from this still-live process would fail with a sharing
+// violation on Windows.
+func removeInstalledBinary(p string, extraFiles []string) error {
+	if _, err := os.Stat(p); os.IsNotExist(err) && len(extraFiles) == 0 {
 		return nil
 	}
 	binDir := filepath.Dir(p)
 	exeName := filepath.Base(p) // blamely.exe — the daemon's image name too
+	// del the binary + every runtime/data file (each best-effort).
+	dels := fmt.Sprintf(`del /f /q "%s" >nul 2>&1`, p)
+	for _, f := range extraFiles {
+		dels += fmt.Sprintf(` & del /f /q "%s" >nul 2>&1`, f)
+	}
 	// `ping -n N` is a portable sleep (no `timeout` dependency, which fails when
 	// stdin isn't a console). Sequence: wait ~2s for THIS process to exit and
 	// release its image lock; kill the still-running daemon (now the only
-	// blamely.exe left); wait ~1s for Windows to release the daemon's lock; then
-	// force-delete the exe and rmdir the now-empty bin folder. All output
-	// suppressed; failures are ignored since this runs unattended after we exit.
+	// blamely.exe left, and the holder of db.sqlite/daemon.log); wait ~1s for
+	// Windows to release those locks; then force-delete the exe + data files and
+	// rmdir the now-empty bin folder. All output suppressed; failures ignored
+	// since this runs unattended after we exit.
 	script := fmt.Sprintf(
-		`ping 127.0.0.1 -n 3 >nul & taskkill /f /im "%s" >nul 2>&1 & ping 127.0.0.1 -n 2 >nul & del /f /q "%s" >nul 2>&1 & rmdir "%s" >nul 2>&1`,
-		exeName, p, binDir,
+		`ping 127.0.0.1 -n 3 >nul & taskkill /f /im "%s" >nul 2>&1 & ping 127.0.0.1 -n 2 >nul & %s & rmdir "%s" >nul 2>&1`,
+		exeName, dels, binDir,
 	)
 	cmd := exec.Command("cmd", "/c", script)
 	cmd.SysProcAttr = &syscall.SysProcAttr{

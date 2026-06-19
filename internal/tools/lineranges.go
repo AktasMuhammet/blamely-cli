@@ -259,7 +259,9 @@ func narrowToChangedLines(oldStr, newStr string, full LineRange) ([]LineRange, i
 		return rs
 	}
 
-	changed := AddedOrChangedRanges([]byte(oldStr), []byte(newStr))
+	// LCS diff (not multiset) so an AI move/reorder within the replaced region is
+	// credited at the line's new position rather than dropped as "unchanged".
+	changed := addedOrMovedLineRanges([]byte(oldStr), []byte(newStr))
 	if len(changed) == 0 {
 		// No genuinely-new lines vs old_string. Credit the whole located span,
 		// still line-by-line so it can't be matched positionally.
@@ -339,6 +341,86 @@ func AddedOrChangedRanges(oldContent, newContent []byte) []LineRange {
 	}
 	if curStart != 0 {
 		out = append(out, LineRange{Start: curStart, End: len(newLines)})
+	}
+	return out
+}
+
+// addedOrMovedLineRanges returns the 1-based line ranges in newContent that an
+// LCS (longest-common-subsequence) line diff does NOT match against oldContent —
+// i.e. genuinely new lines AND lines the AI MOVED/reordered. This is the
+// narrowing primitive for whole-file/region rewrites.
+//
+// It differs from AddedOrChangedRanges (multiset) in exactly the move case: the
+// multiset diff counts content occurrences, so a line that merely changed
+// position (same content, count unchanged) is treated as "covered" and dropped —
+// which silently drops AI moves (e.g. the agent relocates an <h1> down the file),
+// leaving the moved line to fall through to Human at commit time. LCS preserves
+// order, so a relocated line breaks the common subsequence and is correctly
+// reported at its new position, while lines that only SHIFTED (same content, same
+// relative order, due to inserts/deletes above) stay in the subsequence and are
+// NOT over-credited.
+//
+// Falls back to the multiset diff for very large inputs to bound the O(n*m) DP.
+func addedOrMovedLineRanges(oldContent, newContent []byte) []LineRange {
+	oldLines := bytes.Split(oldContent, []byte{'\n'})
+	newLines := bytes.Split(newContent, []byte{'\n'})
+	if n := len(oldLines); n > 0 && len(oldLines[n-1]) == 0 {
+		oldLines = oldLines[:n-1]
+	}
+	if n := len(newLines); n > 0 && len(newLines[n-1]) == 0 {
+		newLines = newLines[:n-1]
+	}
+	n, m := len(oldLines), len(newLines)
+	// Bound memory/time: above ~3k×3k lines fall back to the multiset diff.
+	if n == 0 || m == 0 || n*m > 9_000_000 {
+		return AddedOrChangedRanges(oldContent, newContent)
+	}
+
+	// dp[i][j] = LCS length of oldLines[i:] and newLines[j:].
+	dp := make([][]int, n+1)
+	for i := range dp {
+		dp[i] = make([]int, m+1)
+	}
+	for i := n - 1; i >= 0; i-- {
+		for j := m - 1; j >= 0; j-- {
+			if bytes.Equal(oldLines[i], newLines[j]) {
+				dp[i][j] = dp[i+1][j+1] + 1
+			} else if dp[i+1][j] >= dp[i][j+1] {
+				dp[i][j] = dp[i+1][j]
+			} else {
+				dp[i][j] = dp[i][j+1]
+			}
+		}
+	}
+	// Walk the DP: a newLine matched in the LCS is unchanged; the rest are
+	// added/moved.
+	matched := make([]bool, m)
+	i, j := 0, 0
+	for i < n && j < m {
+		if bytes.Equal(oldLines[i], newLines[j]) {
+			matched[j] = true
+			i++
+			j++
+		} else if dp[i+1][j] >= dp[i][j+1] {
+			i++
+		} else {
+			j++
+		}
+	}
+	var out []LineRange
+	curStart := 0
+	for k := 0; k < m; k++ {
+		if !matched[k] {
+			if curStart == 0 {
+				curStart = k + 1
+			}
+		} else if curStart != 0 {
+			out = append(out, LineRange{Start: curStart, End: k})
+			curStart = 0
+		}
+	}
+	if curStart != 0 {
+		out = append(out, LineRange{Start: curStart, End: m})
 	}
 	return out
 }

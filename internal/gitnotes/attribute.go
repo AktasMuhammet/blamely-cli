@@ -1116,7 +1116,11 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			p := perLine{file: file, line: ln, content: content, tool: "", genType: store.GenTypeHuman}
 			// Explicit clipboard paste: keep Human, skip AI matching entirely so the
 			// pasted line isn't claimed by a content match to AI code elsewhere.
+			// Label it with the copypaste tool (still Human in the AI/Human split)
+			// so the note distinguishes pasted code from typed code instead of
+			// collapsing both into bare Human.
 			if pastedLines[ln] {
+				p.tool = store.ToolCopyPaste
 				resolved = append(resolved, p)
 				continue
 			}
@@ -1267,6 +1271,10 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		if len(delLines) > 0 {
 			delEdits := deletionEditsForFile(curFileEntry.Path)
 			remSHA, remNorm := removedHashMultisets(delEdits)
+			// Credit a whole-file AI Write that produced the committed content with
+			// this file's deletions, even when it recorded no removed lines (its
+			// record-time "before" snapshot was stale). See synthesizeWriteRemovals.
+			synthesizeWriteRemovals(repoPath, sha, curFileEntry.Path, delEdits, delLines, remSHA, remNorm)
 			curFileEntry.acc = append(curFileEntry.acc, attributeDeletedLines(delLines, delEdits, sinceNanos, maxNanos, remSHA, remNorm, &note.Totals, &note.ByGenType, movedAI)...)
 		}
 		curFileEntry.Deleted = len(delLines)
@@ -1373,6 +1381,10 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		fe := FileEntry{Path: path, Type: string(kind), Deleted: len(delLines)}
 		delEdits := deletionEditsForFile(path)
 		remSHA, remNorm := removedHashMultisets(delEdits)
+		// Deletion-only files (an AI Write that just removed lines, no additions)
+		// reach this path instead of flushFile — apply the same Write-removal
+		// synthesis so those deletions attribute to the AI, not Human.
+		synthesizeWriteRemovals(repoPath, sha, path, delEdits, delLines, remSHA, remNorm)
 		acc := attributeDeletedLines(delLines, delEdits, sinceNanos, maxNanos, remSHA, remNorm, &note.Totals, &note.ByGenType, movedAI)
 		fe.Lines = collapseToRanges(acc)
 		note.Files = append(note.Files, fe)
@@ -1526,6 +1538,98 @@ func mergeEditsByTimeDesc(a, b []store.Edit) []store.Edit {
 // from these multisets as deleted lines in this commit are matched, so each
 // recorded removal can attribute at most one deleted line — mirroring how
 // claimedSHA prevents an added line's content_sha from over-attributing.
+// committedLineSHAs returns the multiset of non-blank line content_shas for the
+// file as it exists at sha, hashed the same way edits record added lines
+// (TrimRight "\r", blank lines skipped). nil on any git error.
+func committedLineSHAs(repoPath, sha, path string) map[string]int {
+	out, err := exec.Command("git", "-C", repoPath, "show", sha+":"+path).Output()
+	if err != nil {
+		return nil
+	}
+	lines := strings.Split(string(out), "\n")
+	if n := len(lines); n > 0 && lines[n-1] == "" {
+		lines = lines[:n-1]
+	}
+	m := map[string]int{}
+	for _, ln := range lines {
+		text := strings.TrimRight(ln, "\r")
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		m[sha256HexStr([]byte(text))]++
+	}
+	return m
+}
+
+// editContentSHAs is the multiset of non-blank content_shas an edit recorded as
+// added lines.
+func editContentSHAs(e *store.Edit) map[string]int {
+	m := map[string]int{}
+	for _, l := range e.Lines {
+		if l.ContentSHA != "" {
+			m[l.ContentSHA]++
+		}
+	}
+	return m
+}
+
+func sameSHAMultiset(a, b map[string]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// synthesizeWriteRemovals credits a whole-file AI Write with this file's
+// committed deletions when it recorded none of its own. A Write overwrites the
+// whole file, so removed lines are detected by diffing the new content against a
+// cached "before" snapshot at record time — but that snapshot can be stale (an
+// intermediate write already advanced it), so a Write that truly removed lines
+// may have recorded zero. When an AI edit's recorded content EXACTLY equals the
+// committed file, that edit definitively produced the commit, so the commit's
+// deletions (already known from the git diff) are its removals. We add them to
+// the edit's removed-line budget; the consume-once matcher then attributes each
+// deleted line to that tool instead of letting it fall to Human.
+//
+// The exact full-content match is the safety gate: a narrowed/partial edit, or a
+// human edit made after the Write, won't match, so we never over-credit.
+func synthesizeWriteRemovals(repoPath, sha, path string, delEdits []store.Edit, delLines []DeletedLine, remSHA, remNorm map[int64]map[string]int) {
+	if len(delLines) == 0 {
+		return
+	}
+	committed := committedLineSHAs(repoPath, sha, path)
+	if len(committed) == 0 {
+		return
+	}
+	for i := range delEdits {
+		e := &delEdits[i]
+		if isNonAITool(e.Tool) || len(e.RemovedLines) > 0 || len(e.Lines) == 0 {
+			continue
+		}
+		if !sameSHAMultiset(editContentSHAs(e), committed) {
+			continue
+		}
+		if remSHA[e.ID] == nil {
+			remSHA[e.ID] = map[string]int{}
+		}
+		if remNorm[e.ID] == nil {
+			remNorm[e.ID] = map[string]int{}
+		}
+		for _, d := range delLines {
+			if strings.TrimSpace(d.Content) == "" {
+				continue
+			}
+			remSHA[e.ID][sha256HexStr([]byte(d.Content))]++
+			remNorm[e.ID][sha256HexNormStr(d.Content)]++
+		}
+	}
+}
+
 func removedHashMultisets(edits []store.Edit) (remainingSHA, remainingNorm map[int64]map[string]int) {
 	remainingSHA = map[int64]map[string]int{}
 	remainingNorm = map[int64]map[string]int{}

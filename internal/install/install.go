@@ -3,6 +3,7 @@ package install
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -12,15 +13,15 @@ import (
 )
 
 // Run is the orchestrator behind `blamely install`. It:
-//   1. Detects which AI tools are present on the machine.
-//   2. Resolves the absolute path of the running blamely binary.
-//   3. Merges a `blamely record <tool>` PostToolUse hook into each detected
-//      tool's settings file (Claude, Cursor, Codex, Copilot). Existing hooks
-//      from the user or other tools are preserved.
-//   4. Sets `git config --global core.hooksPath` to the Blamely hooks dir and
-//      writes a post-commit script that calls `blamely attribute`.
-//   5. Registers the daemon under launchd / systemd --user / Scheduled Tasks.
-//   6. Persists a state.json so `uninstall` can fully reverse the install.
+//  1. Detects which AI tools are present on the machine.
+//  2. Resolves the absolute path of the running blamely binary.
+//  3. Merges a `blamely record <tool>` PostToolUse hook into each detected
+//     tool's settings file (Claude, Cursor, Codex, Copilot). Existing hooks
+//     from the user or other tools are preserved.
+//  4. Sets `git config --global core.hooksPath` to the Blamely hooks dir and
+//     writes a post-commit script that calls `blamely attribute`.
+//  5. Registers the daemon under launchd / systemd --user / Scheduled Tasks.
+//  6. Persists a state.json so `uninstall` can fully reverse the install.
 //
 // installPlugins gates step 3.5: downloading/installing the VS Code-family and
 // JetBrains IDE plugins from their marketplaces. Local dev installs default to
@@ -301,7 +302,39 @@ func Run(installPlugins bool) error {
 	return nil
 }
 
-func Uninstall() error {
+// runtimeArtifacts lists the files Uninstall removes from ~/.blamely. config.json
+// (user config) and exclude (the exclusion list) are deliberately NOT included —
+// they're kept across reinstalls. The attribution DB is included unless keepDB.
+func runtimeArtifacts(keepDB bool) []string {
+	var files []string
+	add := func(p string, err error) {
+		if err == nil && p != "" {
+			files = append(files, p)
+		}
+	}
+	add(config.LogFile())    // daemon.log
+	add(config.SocketFile()) // daemon.sock (unix)
+	add(config.PortFile())   // daemon.port (windows)
+	add(config.StateFile())  // state.json
+	if dir, err := config.BlamelyDir(); err == nil {
+		files = append(files, filepath.Join(dir, "blamely.db")) // legacy, pre-db.sqlite
+	}
+	if !keepDB {
+		if db, err := config.DBPath(); err == nil {
+			// db.sqlite plus its WAL sidecars.
+			for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+				files = append(files, db+suffix)
+			}
+		}
+	}
+	return files
+}
+
+// Uninstall reverses `blamely install`. It removes hooks, editor/IDE plugins, the
+// daemon agent, the PATH entry, the binary, and runtime files (logs, sockets,
+// state) — and the attribution DB unless keepDB. config.json and the exclude list
+// are always preserved.
+func Uninstall(keepDB bool) error {
 	s, err := LoadState()
 	if err != nil {
 		return err
@@ -379,23 +412,32 @@ func Uninstall() error {
 		report(fmt.Sprintf("removed PATH entry from %s", rcPath), err)
 	}
 
-	// Remove the stable binary copy. On Windows the running blamely.exe can't
-	// delete itself (the image is locked), so removeInstalledBinary schedules a
-	// detached cleanup that runs once this process exits.
+	// Remove the stable binary copy AND the runtime/data files (logs, sockets,
+	// state, and the DB unless keepDB). On Windows the running blamely.exe can't
+	// delete itself or the files the daemon holds open, so removeInstalledBinary
+	// schedules a detached cleanup that taskkills the daemon and deletes them all
+	// once this process exits. On Unix they're unlinked immediately.
+	artifacts := runtimeArtifacts(keepDB)
 	if p, err := InstalledBinaryPath(); err == nil {
-		report("removed binary "+p, removeInstalledBinary(p))
-	}
-	// Wipe state.json last.
-	if statePath, err := config.StateFile(); err == nil {
-		_ = os.Remove(statePath)
+		report("removed binary "+p, removeInstalledBinary(p, artifacts))
+	} else {
+		// No binary path (unexpected) — still clean up the runtime files directly.
+		for _, f := range artifacts {
+			_ = os.Remove(f)
+		}
 	}
 
 	if firstErr != nil {
 		return firstErr
 	}
 	fmt.Println()
-	fmt.Println("Blamely uninstalled. SQLite database at ~/.blamely/db.sqlite was left in place.")
-	fmt.Println("Remove it manually if you want to wipe all attribution history.")
+	if keepDB {
+		fmt.Println("Blamely uninstalled. Removed the binary, logs, and runtime files.")
+		fmt.Println("Kept the attribution database (db.sqlite), your config.json, and exclude list.")
+	} else {
+		fmt.Println("Blamely uninstalled. Removed the binary, logs, runtime files, and attribution database.")
+		fmt.Println("Kept only your config.json and exclude list (re-run with --keep-db to preserve history next time).")
+	}
 	return nil
 }
 
@@ -458,4 +500,3 @@ func printNextSteps(d *Detected) {
 	fmt.Println("  · `blamely status` shows the daemon health.")
 	fmt.Println("  · `blamely uninstall` reverses every change above.")
 }
-

@@ -412,3 +412,104 @@ func TestResolveChatStaleCutoff(t *testing.T) {
 		})
 	}
 }
+
+// TestChatWatcher_ResumesFromWatermarkAcrossRestart verifies the Phase-1
+// persistence: after a "restart" (fresh in-memory state, same DB), the watcher
+// resumes from the saved byte offset — it doesn't re-emit already-seen events,
+// and it still picks up newly-appended ones.
+func TestChatWatcher_ResumesFromWatermarkAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenAt(filepath.Join(dir, "wm.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	wsRoot := filepath.Join(dir, "workspaceStorage")
+	sessDir := filepath.Join(wsRoot, "h1", "chatSessions")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(sessDir, "s.jsonl")
+	// Each kind=2 response-append line emits one (low-confidence) chat event.
+	line := func(i int) string {
+		return `{"kind":2,"k":["requests",0,"response"],"v":[{"value":"r` + string(rune('0'+i)) + `"}]}`
+	}
+	if err := os.WriteFile(p, []byte(line(1)+"\n"+line(2)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	scan := func() int {
+		sink := &mockSink{}
+		var mu sync.Mutex
+		w := &chatSessionWatcher{tool: store.ToolCopilot, roots: []string{wsRoot}, name: "copilot-chat", db: db}
+		w.scanRoot(wsRoot, map[string]*sessionState{}, &mu, sink) // fresh state = simulated restart
+		return len(sink.events)
+	}
+
+	if n := scan(); n != 2 {
+		t.Fatalf("initial scan: emitted %d events, want 2", n)
+	}
+	if n := scan(); n != 0 {
+		t.Fatalf("restart with no new data: emitted %d events, want 0 (watermark not resumed)", n)
+	}
+
+	f, err := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(line(3) + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	if n := scan(); n != 1 {
+		t.Fatalf("after append: emitted %d events, want 1 (only the new line)", n)
+	}
+}
+
+// TestChatWatcher_PartialTrailingLineNotLost verifies the Phase-3 fix: a session
+// file caught mid-write (incomplete trailing line) must not advance the offset
+// past that line — when the line completes on a later scan it's read whole and
+// emitted exactly once, never skipped. Before the fix the offset jumped to EOF
+// and the completing line was lost.
+func TestChatWatcher_PartialTrailingLineNotLost(t *testing.T) {
+	dir := t.TempDir()
+	wsRoot := filepath.Join(dir, "workspaceStorage")
+	sessDir := filepath.Join(wsRoot, "h1", "chatSessions")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(sessDir, "s.jsonl")
+	line := func(v string) string {
+		return `{"kind":2,"k":["requests",0,"response"],"v":[{"value":"` + v + `"}]}`
+	}
+	// One complete line + a partial line with NO trailing newline (mid-write).
+	if err := os.WriteFile(p, []byte(line("a")+"\n"+line("b")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	state := map[string]*sessionState{}
+	w := &chatSessionWatcher{tool: store.ToolCopilot, roots: []string{wsRoot}, name: "copilot-chat"} // db nil → in-memory
+
+	s1 := &mockSink{}
+	w.scanRoot(wsRoot, state, &mu, s1)
+	if len(s1.events) != 1 {
+		t.Fatalf("first scan: emitted %d, want 1 (partial line must not be processed)", len(s1.events))
+	}
+
+	// Complete the partial line. Same state map = same daemon run.
+	f, err := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.WriteString("\n")
+	f.Close()
+
+	s2 := &mockSink{}
+	w.scanRoot(wsRoot, state, &mu, s2)
+	if len(s2.events) != 1 {
+		t.Fatalf("after completing the line: emitted %d, want 1 (line lost or duplicated)", len(s2.events))
+	}
+}

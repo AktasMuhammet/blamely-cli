@@ -479,3 +479,74 @@ func TestLineRangeForWholeFile_BlankLineNoNormSha(t *testing.T) {
 		t.Errorf("non-blank lines must carry a content_sha_norm: %+v", lr)
 	}
 }
+
+// TestAddedOrMovedLineRanges_DetectsMove reproduces commit bee1fa6d: the AI
+// deletes a block and re-adds a pre-existing line lower down (a move). The
+// multiset diff drops it (content count unchanged) → Human; the LCS diff must
+// report it at its new position so it attributes to the AI.
+func TestAddedOrMovedLineRanges_DetectsMove(t *testing.T) {
+	old := []byte("<body>\n  <h1>helloo</h1>\n  <p>a</p>\n  <p>b</p>\n  <footer>x</footer>\n</body>\n")
+	// h1 removed from the top, the <p>s deleted, h1 re-added before </body>.
+	new_ := []byte("<body>\n  \n  <footer>x</footer>\n  <h1>helloo</h1>\n</body>\n")
+
+	ranges := addedOrMovedLineRanges(old, new_)
+	// The moved <h1> is at line 4 of new_; it must be reported.
+	movedReported := false
+	for _, r := range ranges {
+		if 4 >= r.Start && 4 <= r.End {
+			movedReported = true
+		}
+	}
+	if !movedReported {
+		t.Fatalf("moved <h1> (new line 4) not reported as added/moved; ranges=%+v", ranges)
+	}
+	// Multiset diff would have missed it — assert the regression direction.
+	multiset := AddedOrChangedRanges(old, new_)
+	msReported := false
+	for _, r := range multiset {
+		if 4 >= r.Start && 4 <= r.End {
+			msReported = true
+		}
+	}
+	if msReported {
+		t.Log("note: multiset happened to report it too (still fine)")
+	}
+}
+
+// TestAddedOrMovedLineRanges_NoOverCreditOnShift ensures lines that only SHIFT
+// position (same content, same order, due to an insertion above) are NOT
+// reported — only the genuinely-inserted line is.
+func TestAddedOrMovedLineRanges_NoOverCreditOnShift(t *testing.T) {
+	old := []byte("a\nb\nc\n")
+	new_ := []byte("INSERTED\na\nb\nc\n") // everything shifts down by one
+	ranges := addedOrMovedLineRanges(old, new_)
+	// Only line 1 (INSERTED) should be reported; a/b/c stay in the LCS.
+	if len(ranges) != 1 || ranges[0].Start != 1 || ranges[0].End != 1 {
+		t.Fatalf("shift over-credited: want only [1-1], got %+v", ranges)
+	}
+}
+
+// TestAddedOrMovedLineRanges_UnchangedYieldsNothing — identical content → no ranges.
+func TestAddedOrMovedLineRanges_UnchangedYieldsNothing(t *testing.T) {
+	c := []byte("x\ny\nz\n")
+	if got := addedOrMovedLineRanges(c, c); len(got) != 0 {
+		t.Fatalf("unchanged content yielded %+v", got)
+	}
+}
+
+// TestAddedOrMovedLineRanges_PureInsertAndDuplicate keeps parity with the
+// multiset diff for the non-move cases it already handled.
+func TestAddedOrMovedLineRanges_PureInsertAndDuplicate(t *testing.T) {
+	// New genuine line in the middle.
+	old := []byte("a\nb\nc\n")
+	new_ := []byte("a\nNEW\nb\nc\n")
+	got := addedOrMovedLineRanges(old, new_)
+	if len(got) != 1 || got[0].Start != 2 || got[0].End != 2 {
+		t.Fatalf("insert: want [2-2], got %+v", got)
+	}
+	// Duplicated line beyond old count.
+	got = addedOrMovedLineRanges([]byte("}\n"), []byte("}\n}\n"))
+	if len(got) != 1 || got[0].Start != 2 {
+		t.Fatalf("duplicate: want [2-..], got %+v", got)
+	}
+}

@@ -41,6 +41,7 @@ var pathTests = []struct {
 	{"CursorHooksPath", CursorHooksPath, []string{".cursor", "hooks.json"}},
 	{"CopilotHooksDir", CopilotHooksDir, []string{".copilot", "hooks"}},
 	{"CopilotBlamelyHookPath", CopilotBlamelyHookPath, []string{".copilot", "hooks", "blamely.json"}},
+	{"CopilotSessionStateDir", CopilotSessionStateDir, []string{".copilot", "session-state"}},
 	{"GeminiSettingsPath", GeminiSettingsPath, []string{".gemini", "settings.json"}},
 }
 

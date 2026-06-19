@@ -12,7 +12,7 @@ import (
 
 // GitHub Copilot's hooks framework loads any JSON file from ~/.copilot/hooks/.
 // Blamely owns the file ~/.copilot/hooks/blamely.json. Other tools (e.g.,
-// git-ai) drop their own JSON file alongside ours and are never touched.
+// other-tool) drop their own JSON file alongside ours and are never touched.
 //
 // File shape:
 //   {
@@ -34,7 +34,7 @@ var copilotHookEvents = []string{"PostToolUse", "PreToolUse"}
 
 // InstallCopilotHook writes (or merges) blamely's record command into every
 // Copilot hook event in ~/.copilot/hooks/blamely.json. Idempotent. Doesn't
-// touch sibling files from other tools (e.g. git-ai.json).
+// touch sibling files from other tools (e.g. other-tool.json).
 func InstallCopilotHook(binaryPath string) (added bool, hookPath string, err error) {
 	hookPath, err = config.CopilotBlamelyHookPath()
 	if err != nil {

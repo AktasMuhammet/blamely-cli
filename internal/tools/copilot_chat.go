@@ -88,6 +88,10 @@ const (
 type CopilotChatWatcher struct {
 	// Roots overrides the workspaceStorage scan roots for tests.
 	Roots []string
+	// DB, when set, persists per-file read offsets so a daemon restart resumes
+	// where it left off instead of re-parsing whole session files (and re-emitting
+	// historical edits as duplicates). Nil in tests → in-memory only, as before.
+	DB *store.DB
 }
 
 func (c *CopilotChatWatcher) Name() string { return "copilot-chat" }
@@ -97,7 +101,7 @@ func (c *CopilotChatWatcher) Run(ctx context.Context, sink daemon.Sink) error {
 	if len(roots) == 0 {
 		roots = defaultCopilotChatRoots()
 	}
-	return (&chatSessionWatcher{tool: store.ToolCopilot, roots: roots}).run(ctx, sink)
+	return (&chatSessionWatcher{tool: store.ToolCopilot, roots: roots, name: c.Name(), db: c.DB}).run(ctx, sink)
 }
 
 // defaultCopilotChatRoots returns the VS Code workspaceStorage paths for the
@@ -177,6 +181,18 @@ func defaultCopilotChatRoots() []string {
 type chatSessionWatcher struct {
 	tool  store.Tool
 	roots []string
+	// name is the watcher's stable id ("copilot-chat"/"cursor-chat"), used as the
+	// watermark key. db, when set, persists per-file offsets across daemon
+	// restarts; nil → in-memory only (tests, or a daemon without a DB handle).
+	name string
+	db   *store.DB
+}
+
+// chatWatermarkExtra is the per-file cursor state persisted alongside the byte
+// offset, so a restart resumes textEditGroup scanning exactly where it stopped.
+type chatWatermarkExtra struct {
+	TegOffset  int64 `json:"teg_offset"`
+	NextReqIdx int   `json:"next_req_idx"`
 }
 
 // sessionState is the per-file bookkeeping carried between scans.
@@ -194,6 +210,16 @@ type sessionState struct {
 	tegOffset  int64
 	nextReqIdx int
 	seenEdits  map[string]bool
+	// seenReqTokens tracks which chat requests (turns) have already had their
+	// token usage attached to an emitted edit, so a turn that edits multiple
+	// files credits its prompt/output tokens to exactly ONE edit (not once per
+	// file) — keeping the note's token totals from multiplying.
+	seenReqTokens map[int]bool
+
+	// loaded marks that a persisted watermark was applied when this state was
+	// first created, so handleSessionFile only saves when something advanced.
+	savedOffset int64
+	savedTeg    int64
 }
 
 func (w *chatSessionWatcher) run(ctx context.Context, sink daemon.Sink) error {
@@ -285,6 +311,11 @@ func (w *chatSessionWatcher) handleSessionFile(path string, state map[string]*se
 	if !ok {
 		st = &sessionState{}
 		state[path] = st
+		// First time we see this file this run: resume from the persisted
+		// watermark so a restart doesn't re-parse the whole file or re-emit its
+		// historical edits. The shrink guard below still handles a rotated file
+		// whose saved offset now exceeds its size.
+		w.loadWatermark(path, st, info)
 	}
 	// Reset the streaming offset if the file shrank — VS Code periodically
 	// rewrites a session as a fresh snapshot, which would otherwise strand the
@@ -295,6 +326,10 @@ func (w *chatSessionWatcher) handleSessionFile(path string, state map[string]*se
 	startOffset := st.offset
 	prime := startOffset == 0
 	mu.Unlock()
+
+	// Persist the resume point on the way out (only if something advanced), so
+	// the next scan / a daemon restart continues from here.
+	defer w.saveWatermark(path, st, mu, info)
 
 	// textEditGroup detection runs on every scan via its own mtime gate —
 	// independent of the append-offset so it survives snapshot rewrites.
@@ -315,21 +350,83 @@ func (w *chatSessionWatcher) handleSessionFile(path string, state map[string]*se
 	}
 	r := bufio.NewReaderSize(f, 1<<16)
 	now := time.Now()
+	// Advance the offset only over COMPLETE (newline-terminated) lines. A partial
+	// trailing line (the file was caught mid-write) is left unconsumed so the next
+	// scan re-reads it whole — otherwise the offset (which we now also persist)
+	// would strand past a half-written record and corrupt/skip it on resume.
+	consumed := startOffset
 	for {
-		line, err := r.ReadString('\n')
-		if line != "" {
+		line, rerr := r.ReadString('\n')
+		if rerr == nil {
 			w.handleLine(path, line, st, sink, prime, now, info.ModTime())
+			consumed += int64(len(line))
+			continue
 		}
-		if err != nil {
-			break
-		}
+		break // EOF/error: 'line' (if any) is an incomplete trailing line — skip it.
 	}
-	newOffset, _ := f.Seek(0, 1)
 	mu.Lock()
-	st.offset = newOffset
+	st.offset = consumed
 	st.lastTouch = now
 	mu.Unlock()
 	return mtime
+}
+
+// loadWatermark seeds st from the persisted resume point for this file, so a
+// daemon restart continues instead of re-parsing the whole session. No-op when
+// there's no DB or no saved watermark (st stays zero → prime from the start).
+func (w *chatSessionWatcher) loadWatermark(path string, st *sessionState, info os.FileInfo) {
+	if w.db == nil {
+		return
+	}
+	wm, ok := w.db.LoadWatermark(w.name, path)
+	if !ok {
+		return
+	}
+	// Don't trust an offset past EOF (file rotated/truncated since the save) — the
+	// shrink guard would reset it anyway; re-prime from the start instead.
+	if wm.ByteOffset > info.Size() {
+		return
+	}
+	st.offset = wm.ByteOffset
+	var ex chatWatermarkExtra
+	if wm.Extra != "" {
+		_ = json.Unmarshal([]byte(wm.Extra), &ex)
+	}
+	st.tegOffset = ex.TegOffset
+	st.nextReqIdx = ex.NextReqIdx
+	if wm.MtimeNanos > 0 {
+		// Resume the textEditGroup mtime gate so an unchanged file isn't re-scanned.
+		st.tegMtime = time.Unix(0, wm.MtimeNanos)
+	}
+	st.savedOffset = st.offset
+	st.savedTeg = st.tegOffset
+}
+
+// saveWatermark persists the resume point if it advanced since the last save —
+// a cheap no-op when nothing changed or there's no DB.
+func (w *chatSessionWatcher) saveWatermark(path string, st *sessionState, mu *sync.Mutex, info os.FileInfo) {
+	if w.db == nil {
+		return
+	}
+	mu.Lock()
+	if st.offset == st.savedOffset && st.tegOffset == st.savedTeg {
+		mu.Unlock()
+		return
+	}
+	off, teg, nri := st.offset, st.tegOffset, st.nextReqIdx
+	st.savedOffset = off
+	st.savedTeg = teg
+	mu.Unlock()
+
+	exb, _ := json.Marshal(chatWatermarkExtra{TegOffset: teg, NextReqIdx: nri})
+	if err := w.db.SaveWatermark(w.name, path, store.Watermark{
+		ByteOffset: off,
+		Size:       info.Size(),
+		MtimeNanos: info.ModTime().UnixNano(),
+		Extra:      string(exb),
+	}); err != nil {
+		log.Printf("%s: save watermark %s: %v", w.name, path, err)
+	}
 }
 
 // scanTextEdits incrementally scans the bytes appended to the session file
@@ -381,8 +478,15 @@ func (w *chatSessionWatcher) scanTextEdits(path string, st *sessionState, mu *sy
 		}
 	}
 	br := bufio.NewReaderSize(f, 1<<16)
+	// Advance tegOffset only over complete (newline-terminated) lines so a partial
+	// trailing line is re-read whole next scan (the offset is persisted now).
+	consumed := startOffset
 	for {
 		line, rerr := br.ReadString('\n')
+		if rerr != nil {
+			break // incomplete trailing line — leave unconsumed
+		}
+		consumed += int64(len(line))
 		trimmed := strings.TrimRight(line, "\r\n")
 		if len(trimmed) > 0 && trimmed[0] == '{' {
 			var cl chatLine
@@ -453,13 +557,9 @@ func (w *chatSessionWatcher) scanTextEdits(path string, st *sessionState, mu *sy
 				}
 			}
 		}
-		if rerr != nil {
-			break
-		}
 	}
-	newOffset, _ := f.Seek(0, 1)
 	mu.Lock()
-	st.tegOffset = newOffset
+	st.tegOffset = consumed
 	st.nextReqIdx = nextReqIdx
 	mu.Unlock()
 }
@@ -671,6 +771,36 @@ func (w *chatSessionWatcher) recordTextEditGroup(teg *textEditGroupPart, model, 
 		RawMeta: fmt.Sprintf(`{"source":"copilot_chat_textedit","tool":%q,"chat_session_path":%q,"narrowed":%t}`,
 			string(w.tool), sessionPath, narrowed),
 	}
+	// Attach this turn's token usage (prompt/output) to the FIRST edit it
+	// produces, so the git note's per-tool token totals include chat-panel
+	// edits (Copilot/Cursor) — not just hook-driven tools. Crediting only the
+	// first edit per request avoids multiplying a turn's tokens across the
+	// several files it may have touched.
+	mu.Lock()
+	if st.seenReqTokens == nil {
+		st.seenReqTokens = map[int]bool{}
+	}
+	creditTokens := !st.seenReqTokens[reqIdx]
+	if creditTokens {
+		st.seenReqTokens[reqIdx] = true
+	}
+	mu.Unlock()
+	if creditTokens {
+		if u, _ := ReadChatSessionRequestUsage(sessionPath, reqIdx); u != nil {
+			if ev.Model == "" {
+				ev.Model = u.Model
+			}
+			if u.InputTokens > 0 {
+				v := u.InputTokens
+				ev.InputTokens = &v
+			}
+			if u.OutputTokens > 0 {
+				v := u.OutputTokens
+				ev.OutputTokens = &v
+			}
+		}
+	}
+
 	if err := sink.Record(ev); err != nil {
 		log.Printf("%s-chat textedit sink: %v", w.tool, err)
 	} else {
@@ -696,7 +826,11 @@ func chatNarrowedPositions(snapshot string, startLine, endLine int, newText stri
 		oldSection = []byte(strings.Join(lines[startLine-1:last], "\n"))
 	}
 	var positions []int
-	for _, r := range AddedOrChangedRanges(oldSection, []byte(newText)) {
+	// LCS diff (not multiset): a whole-file rewrite that MOVES a line (same
+	// content, new position) must still credit the AI for the relocated line.
+	// Multiset narrowing drops it (content count unchanged), which sent moved
+	// lines to Human at commit time.
+	for _, r := range addedOrMovedLineRanges(oldSection, []byte(newText)) {
 		for p := r.Start; p <= r.End; p++ {
 			positions = append(positions, p)
 		}

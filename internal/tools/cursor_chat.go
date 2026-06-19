@@ -12,10 +12,10 @@ import (
 	"path/filepath"
 	"runtime"
 
+	"context"
 	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/daemon"
 	"github.com/blamely/blamely/internal/store"
-	"context"
 )
 
 // CursorChatWatcher implements daemon.Watcher for Cursor's built-in chat panel.
@@ -23,6 +23,8 @@ import (
 type CursorChatWatcher struct {
 	// Roots overrides the workspaceStorage scan roots for tests.
 	Roots []string
+	// DB, when set, persists per-file read offsets across daemon restarts.
+	DB *store.DB
 }
 
 func (c *CursorChatWatcher) Name() string { return "cursor-chat" }
@@ -32,7 +34,7 @@ func (c *CursorChatWatcher) Run(ctx context.Context, sink daemon.Sink) error {
 	if len(roots) == 0 {
 		roots = defaultCursorChatRoots()
 	}
-	return (&chatSessionWatcher{tool: store.ToolCursor, roots: roots}).run(ctx, sink)
+	return (&chatSessionWatcher{tool: store.ToolCursor, roots: roots, name: c.Name(), db: c.DB}).run(ctx, sink)
 }
 
 // defaultCursorChatRoots returns the Cursor workspaceStorage paths for the

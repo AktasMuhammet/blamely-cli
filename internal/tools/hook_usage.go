@@ -27,6 +27,12 @@ func readHookUsage(opt hookUsageOptions) *TranscriptUsage {
 			return u
 		}
 	case "copilot":
+		// Copilot CLI: model + output tokens come from its own session events
+		// log (~/.copilot/session-state/<id>/events.jsonl), which the generic
+		// transcript/chat readers below can't parse.
+		if u, _ := ReadCopilotCliUsage(opt.sessionID); u != nil {
+			return u
+		}
 		if u, _ := ReadTranscriptUsage(opt.transcriptPath); u != nil {
 			return u
 		}

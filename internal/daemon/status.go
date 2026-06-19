@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/blamely/blamely/internal/store"
 )
 
 // healthClient returns an HTTP client and target URL for the daemon's /health
@@ -75,5 +77,49 @@ func PrintStatus() error {
 		return nil
 	}
 	fmt.Printf("daemon: HEALTHY on %s\n", addr)
+	printSessionUsage()
 	return nil
+}
+
+// printSessionUsage shows recent per-session, per-model CUMULATIVE token totals
+// (e.g. the Copilot CLI's session.shutdown metrics). Best-effort: a missing/locked
+// DB or empty table just prints nothing. These are session-level — they cover a
+// whole session's spend and are NOT the same as per-edit/commit attribution.
+func printSessionUsage() {
+	db, err := store.Open()
+	if err != nil {
+		return
+	}
+	defer db.Close()
+	rows, err := db.RecentSessionUsage(10)
+	if err != nil || len(rows) == 0 {
+		return
+	}
+	fmt.Println("\nSession token usage (live, cumulative per session — not per-edit):")
+	for _, r := range rows {
+		u := r.Usage
+		fmt.Printf("  %-8s  %-8s  %-14s  in %s · out %s · cache_r %s · cache_w %s · reason %s\n",
+			shortID(r.SessionID), r.Tool, r.Model,
+			compactNum(u.InputTokens), compactNum(u.OutputTokens),
+			compactNum(u.CacheReadTokens), compactNum(u.CacheWriteTokens), compactNum(u.ReasoningTokens))
+	}
+}
+
+func shortID(s string) string {
+	if len(s) > 8 {
+		return s[:8]
+	}
+	return s
+}
+
+// compactNum renders a token count as e.g. 73.3k / 1.4k / 418.
+func compactNum(n int64) string {
+	switch {
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	case n >= 1_000:
+		return fmt.Sprintf("%.1fk", float64(n)/1_000)
+	default:
+		return fmt.Sprintf("%d", n)
+	}
 }
