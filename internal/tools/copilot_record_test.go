@@ -170,3 +170,25 @@ func TestCountLines(t *testing.T) {
 		}
 	}
 }
+
+// An add via the Copilot CLI "edit" tool (generic fallback) must carry per-line
+// content_sha so the added lines attribute to copilot, not Human (regression for
+// commit 579e3dc: 5 added lines showed Human).
+func TestExtractCopilotRanges_AddCarriesPerLineSha(t *testing.T) {
+	raw, _ := json.Marshal(map[string]any{
+		"path":       "/tmp/index.html",
+		"new_string": "  <p>1</p>\n  <p>2</p>\n  <p>3</p>",
+	})
+	_, ranges, suggested, _, _ := extractCopilotRanges(copilotHookPayload{ToolName: "edit", ToolInput: raw})
+	if len(ranges) != 3 || suggested != 3 {
+		t.Fatalf("want 3 ranges/suggested, got %d ranges suggested=%d", len(ranges), suggested)
+	}
+	for i, r := range ranges {
+		if r.ContentSHA == "" || r.ContentSHANorm == "" {
+			t.Fatalf("range %d missing per-line content_sha: %+v", i, r)
+		}
+	}
+	if ranges[0].ContentSHA != sha256Hex([]byte("  <p>1</p>")) {
+		t.Errorf("range[0] content_sha mismatch")
+	}
+}
