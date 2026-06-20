@@ -173,12 +173,23 @@ func printFileHeader(w io.Writer, f gitnotes.FileEntry) {
 
 // formatAttribution renders one range's authorship as a single colored token:
 // "human" in blue for human-typed/pasted lines, or "<tool> · <model> ·
+// toolLabel maps an internal tool id to its user-facing label. Only copypaste
+// is special-cased — the stored id "copypaste" reads as "Copy&Paste" in every
+// report surface; AI tool ids render as-is. Centralised so the label is
+// identical across the terminal, dashboard, and HTML renderers.
+func toolLabel(tool string) string {
+	if tool == "copypaste" {
+		return "Copy&Paste"
+	}
+	return tool
+}
+
 // <gen_type>" in green for AI-attributed lines (model/gen_type dimmed, omitted
 // when unknown). Deletions (no AuthorType) render as a dim "—".
 func formatAttribution(l gitnotes.RangeEntry) string {
 	switch {
 	case l.Tool != "":
-		s := green(l.Tool)
+		s := green(toolLabel(l.Tool))
 		var extra []string
 		if l.Model != nil && *l.Model != "" {
 			extra = append(extra, *l.Model)

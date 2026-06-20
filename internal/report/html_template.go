@@ -139,6 +139,24 @@ body{
 .tmeta{display:flex;align-items:center;gap:14px;font-size:11px;color:var(--dim);flex-wrap:wrap}
 .tpill{color:var(--tc);background:color-mix(in srgb,var(--tc) 13%,transparent);padding:2px 8px;border-radius:6px;font-weight:600}
 .ttok .ar{color:var(--faint);font-weight:600}.ttok .tdim{color:var(--faint)}
+/* by_tool legend tooltip (pure CSS, no JS) */
+.tip{position:relative;display:inline-flex;align-items:center}
+.tipq{width:13px;height:13px;border-radius:50%;border:1px solid var(--border2);color:var(--faint);
+  font-size:9px;font-weight:700;line-height:1;display:inline-flex;align-items:center;justify-content:center;
+  cursor:help;font-family:var(--sans);font-style:normal}
+.tip:hover .tipq{color:var(--dim);border-color:var(--dim)}
+.tipbox{position:absolute;top:calc(100% + 9px);left:0;width:250px;padding:12px 13px;border-radius:11px;
+  background:var(--bg);border:1px solid var(--border2);box-shadow:0 14px 38px -10px rgba(0,0,0,.82);z-index:30;
+  opacity:0;visibility:hidden;pointer-events:none;transform:translateY(-4px);transition:opacity .14s ease,transform .14s ease}
+.tip:hover .tipbox{opacity:1;visibility:visible;transform:translateY(0)}
+.tipbox .th{font-size:11px;color:var(--dim);letter-spacing:.02em;margin-bottom:10px}
+.tiprow{display:flex;align-items:flex-start;gap:9px;font-size:11.5px;line-height:1.4}
+.tiprow+.tiprow{margin-top:9px}
+.tiprow .sw{width:9px;height:9px;border-radius:3px;flex-shrink:0;margin-top:3px}
+.tiprow b{font-weight:600;color:var(--text)}.tiprow span{color:var(--dim)}
+.sw-ai{background:linear-gradient(135deg,var(--acc2),var(--acc))}
+.sw-human{background:var(--blue)}
+.sw-paste{background:var(--amber)}
 /* files */
 .frow{display:flex;align-items:center;gap:10px;padding:12px 4px;border-top:1px solid var(--border)}
 .frow:first-child{border-top:none}
@@ -264,7 +282,7 @@ body{
 
     {{if .Tools}}
     <div class="card">
-      <div class="ct"><div class="l"><span class="dot"></span><span class="t">Tools</span></div><span class="r mono">usage</span></div>
+      <div class="ct"><div class="l"><span class="dot"></span><span class="t">Tools</span><span class="tip"><span class="tipq">i</span><span class="tipbox"><span class="th">How blamely attributes each line</span><div class="tiprow"><span class="sw sw-ai"></span><span><b>AI</b> — written by an AI tool (Copilot, Cursor, Claude, Codex, Gemini)</span></div><div class="tiprow"><span class="sw sw-human"></span><span><b>Human</b> — typed by you</span></div><div class="tiprow"><span class="sw sw-paste"></span><span><b>Copy&amp;Paste</b> — pasted from the clipboard; counts as human, tracked as its own bucket</span></div></span></span></div><span class="r mono">usage</span></div>
       <div class="tlist">
         {{range .Tools}}
         <div class="trow t-{{.Name}}">

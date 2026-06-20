@@ -304,13 +304,13 @@ func cmdUninstall() *cobra.Command {
 	var keepDB bool
 	c := &cobra.Command{
 		Use:   "uninstall",
-		Short: "Reverse `blamely install` (keeps your config.json and exclude list)",
+		Short: "Reverse `blamely install` (removes the entire ~/.blamely directory)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return install.Uninstall(keepDB)
 		},
 	}
 	c.Flags().BoolVar(&keepDB, "keep-db", false,
-		"preserve the attribution database (~/.blamely/db.sqlite); by default it's removed")
+		"keep the attribution database (~/.blamely/db.sqlite); everything else is still removed")
 	return c
 }
 

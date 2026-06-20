@@ -1227,10 +1227,16 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 	// Aggregate per-tool and build files/lines.
 	type toolAgg struct {
 		lines      int
-		confidence store.Confidence
-		model      string
-		tokens     Tokens
-		hasTokens  bool
+		// acceptedLines counts only lines whose source edit reported a suggestion
+		// (SuggestedLines > 0 — i.e. inline completions). It's the "accepted"
+		// half of the suggested/accepted acceptance metric, so it must NOT include
+		// chat/cli lines (which are applied directly, never "suggested"): counting
+		// those made accepted_lines exceed suggested_lines, which is impossible.
+		acceptedLines int
+		confidence    store.Confidence
+		model         string
+		tokens        Tokens
+		hasTokens     bool
 	}
 	agg := map[store.Tool]*toolAgg{}
 	seenEditTokens := map[int64]bool{}
@@ -1336,6 +1342,12 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 				seenEditSuggested[editID] = true
 				suggestedPerTool[p.tool] += p.edit.SuggestedLines
 			}
+			// "Accepted" counts only lines from a suggesting (completion) edit, so
+			// it stays ≤ suggested_lines. Per edit, lines-in-commit ≤ its
+			// SuggestedLines, so the summed accepted ≤ summed suggested.
+			if p.edit.SuggestedLines > 0 {
+				a.acceptedLines++
+			}
 		}
 
 		entry := LineEntry{
@@ -1437,9 +1449,11 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			Model: strPtr(a.model),
 		}
 		// suggested/accepted are AI-only metrics. Clipboard-paste lines
-		// have no model proposal to compare against.
+		// have no model proposal to compare against. accepted counts only
+		// completion lines (a.acceptedLines), not chat/cli, so it never exceeds
+		// suggested_lines.
 		if !isNonAITool(tool) {
-			t.AcceptedLines = a.lines
+			t.AcceptedLines = a.acceptedLines
 			t.SuggestedLines = suggestedPerTool[tool]
 		}
 		if a.hasTokens {
@@ -1489,13 +1503,17 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		note.Totals.Models[p.model]++
 	}
 
-	// Populate by_gen_type from the resolved per-line data.
-	// `copypaste` keeps living under by_tool — it's a distinct bucket and
-	// would double-count if also classified here.
+	// Populate by_gen_type from the resolved per-line data. Every resolved
+	// line is counted exactly once. `copypaste` lines carry gen_type=human
+	// (set as the per-line default and never overwritten for a paste), so
+	// they roll up to by_gen_type.human — consistent with totals.human_lines,
+	// which also counts them. This is NOT a double count with by_tool: by_tool
+	// and by_gen_type are independent breakdowns of the same lines, and a
+	// pasted line belongs in by_tool["copypaste"] AND by_gen_type.human, the
+	// same way an AI line is in both by_tool[<tool>] and by_gen_type[<kind>].
+	// Skipping copypaste here is what made by_gen_type undercount the human
+	// share while totals stayed correct.
 	for _, p := range resolved {
-		if p.tool == store.ToolCopyPaste {
-			continue
-		}
 		bumpGenType(&note.ByGenType, p.genType)
 	}
 	// Deleted lines were already bucketed into by_gen_type per-line above

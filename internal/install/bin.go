@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/blamely/blamely/internal/config"
 )
@@ -54,6 +55,12 @@ func CopyBinary(src string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Reap binaries renamed aside by earlier in-place upgrades whose daemon has
+	// since exited — keeps ~/.blamely/bin from accumulating blamely.exe.old-*
+	// copies on Windows. Best-effort; a copy still locked by a live daemon is
+	// skipped and reaped on a later run.
+	cleanStaleBinaryBackups(dst)
+
 	if same, _ := sameFile(src, dst); same {
 		// Already the stable copy (e.g. re-running `install` from
 		// ~/.blamely/bin). Still self-heal: a binary downloaded straight into
@@ -88,14 +95,46 @@ func CopyBinary(src string) (string, error) {
 	if err := os.Chmod(tmpPath, 0o755); err != nil {
 		return "", err
 	}
-	if err := os.Rename(tmpPath, dst); err != nil {
-		return "", fmt.Errorf("rename to %s: %w", dst, err)
+	if err := placeBinary(tmpPath, dst); err != nil {
+		return "", err
 	}
 	// Make the stable copy Gatekeeper-safe on macOS (strip quarantine +
 	// ad-hoc re-sign) so the daemon agent and git hook can launch it without a
 	// "Killed: 9". No-op on Linux/Windows. Best-effort — never block install.
 	_ = prepareInstalledBinary(dst)
 	return dst, nil
+}
+
+// placeBinary moves tmpPath onto dst, replacing whatever is there. On Windows
+// the dst binary may be locked by the still-running (old) daemon, so a direct
+// replace fails with a sharing violation — but Windows DOES allow renaming a
+// running image aside. So on failure we move the locked dst out of the way
+// (dst.old-<ts>) and retry; the renamed-aside copy is reaped by
+// cleanStaleBinaryBackups on a later install once its daemon has exited. On Unix
+// the first rename replaces atomically and the fallback never runs.
+func placeBinary(tmpPath, dst string) error {
+	if err := os.Rename(tmpPath, dst); err == nil {
+		return nil
+	}
+	aside := fmt.Sprintf("%s.old-%d", dst, time.Now().UnixNano())
+	if mvErr := os.Rename(dst, aside); mvErr != nil {
+		return fmt.Errorf("rename to %s: %w", dst, mvErr)
+	}
+	if err := os.Rename(tmpPath, dst); err != nil {
+		_ = os.Rename(aside, dst) // roll back so we never leave dst missing
+		return fmt.Errorf("rename to %s: %w", dst, err)
+	}
+	return nil
+}
+
+// cleanStaleBinaryBackups removes <dst>.old-* copies left by earlier in-place
+// upgrades (see placeBinary). Best-effort: a copy still locked by a not-yet-
+// exited daemon is skipped and reaped on a later run.
+func cleanStaleBinaryBackups(dst string) {
+	matches, _ := filepath.Glob(dst + ".old-*")
+	for _, m := range matches {
+		_ = os.Remove(m)
+	}
 }
 
 func sameFile(a, b string) (bool, error) {

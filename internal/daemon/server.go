@@ -201,6 +201,13 @@ func Run(ctx context.Context) error {
 		log.Printf("listening on 127.0.0.1:%d", addr.Port)
 	}
 
+	// Record our PID so `blamely uninstall` can kill this exact process directly
+	// (a racy by-image-name taskkill on Windows otherwise left the daemon alive
+	// holding the binary, so uninstall removed the files but the process kept
+	// running). Best-effort: a missing PID file just falls back to that taskkill.
+	_ = writePidFile()
+	defer removePidFile()
+
 	s.http = &http.Server{
 		Handler:           accessLog(mux),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -589,6 +596,20 @@ func writePortFile(port int) error {
 
 func removePortFile() {
 	if p, err := config.PortFile(); err == nil {
+		_ = os.Remove(p)
+	}
+}
+
+func writePidFile() error {
+	p, err := config.PidFile()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(p, []byte(fmt.Sprintf("%d", os.Getpid())), 0o644)
+}
+
+func removePidFile() {
+	if p, err := config.PidFile(); err == nil {
 		_ = os.Remove(p)
 	}
 }

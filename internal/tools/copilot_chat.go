@@ -151,10 +151,14 @@ func defaultCopilotChatRoots() []string {
 	if err != nil {
 		return nil
 	}
+	// Copilot runs in stock VS Code AND in the Insiders build, each with its own
+	// user-data dir ("Code" / "Code - Insiders"). Scan both.
 	switch runtime.GOOS {
 	case "darwin":
+		base := filepath.Join(home, "Library", "Application Support")
 		return []string{
-			filepath.Join(home, "Library", "Application Support", "Code", "User", "workspaceStorage"),
+			filepath.Join(base, "Code", "User", "workspaceStorage"),
+			filepath.Join(base, "Code - Insiders", "User", "workspaceStorage"),
 		}
 	case "windows":
 		appData := os.Getenv("APPDATA")
@@ -163,10 +167,13 @@ func defaultCopilotChatRoots() []string {
 		}
 		return []string{
 			filepath.Join(appData, "Code", "User", "workspaceStorage"),
+			filepath.Join(appData, "Code - Insiders", "User", "workspaceStorage"),
 		}
 	default:
+		base := filepath.Join(home, ".config")
 		return []string{
-			filepath.Join(home, ".config", "Code", "User", "workspaceStorage"),
+			filepath.Join(base, "Code", "User", "workspaceStorage"),
+			filepath.Join(base, "Code - Insiders", "User", "workspaceStorage"),
 		}
 	}
 }

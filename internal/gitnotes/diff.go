@@ -8,7 +8,44 @@ import (
 	"strings"
 
 	"github.com/blamely/blamely/internal/config"
+	"github.com/blamely/blamely/internal/tools"
 )
+
+// linesSimilar reports whether a removed line (del) and an added line (add) at
+// the same position in a hunk are a line MODIFICATION — the same line reworked —
+// rather than a real deletion plus an unrelated addition. True when they're
+// whitespace/format-equal, or share enough text (common prefix + suffix ≥ ~half
+// their combined length) that the add is clearly an edit of the del. This lets a
+// hunk that deletes lines and adds DIFFERENT ones still report the deletions
+// (matching `git --stat`), while a genuine reword stays collapsed to one
+// authored line so simple edits aren't double-counted as +1/-1.
+func linesSimilar(del, add string) bool {
+	d := tools.NormalizeLineText(strings.TrimRight(del, "\r"))
+	a := tools.NormalizeLineText(strings.TrimRight(add, "\r"))
+	if d == a {
+		return true // identical or whitespace/format-only change
+	}
+	if d == "" || a == "" {
+		return false // one blank, the other not — not a modification
+	}
+	affix := commonAffixLen(d, a)
+	// shared fraction = 2*affix / (len(d)+len(a)) ≥ 0.5  ⇔  4*affix ≥ len(d)+len(a)
+	return 4*affix >= len(d)+len(a)
+}
+
+// commonAffixLen returns the combined length of the longest common prefix and
+// the longest common suffix of a and b (bytewise; the two never overlap).
+func commonAffixLen(a, b string) int {
+	p := 0
+	for p < len(a) && p < len(b) && a[p] == b[p] {
+		p++
+	}
+	s := 0
+	for s < len(a)-p && s < len(b)-p && a[len(a)-1-s] == b[len(b)-1-s] {
+		s++
+	}
+	return p + s
+}
 
 // AddedLine is one line that was added (or modified) by the commit.
 // LineNum is the 1-based line number in the POST-commit file.
@@ -182,14 +219,35 @@ func parseDiff(r io.Reader, excl *config.ExcludeList) (*CommitChange, error) {
 		if len(hunkAdds) < n {
 			n = len(hunkAdds)
 		}
-		// Paired adds (modifications) — emit add side, drop delete side.
-		// All added lines are counted, including blank/whitespace-only ones:
-		// a blank line the author wrote is still a line they authored, and
-		// counting it keeps the note's totals consistent with `git show --stat`.
+		// Positionally pair the first n deletes with the first n adds. The add
+		// side is ALWAYS counted (content the author wrote, blank lines included —
+		// keeps totals consistent with `git show --stat`). The delete side is
+		// dropped ONLY when the pair is a genuine MODIFICATION — the same line
+		// reworked — judged by content similarity (linesSimilar). When the two are
+		// dissimilar, the old line was really removed and a DIFFERENT one added at
+		// that spot, so the delete is counted too. This stops an unrelated
+		// delete+add in one hunk from hiding the deletion (it used to read as a
+		// modification and silently drop every paired delete).
 		for i := 0; i < n; i++ {
 			a := hunkAdds[i]
+			d := hunkDels[i]
+			aContent := strings.TrimRight(a.content, "\r")
+			dContent := strings.TrimRight(d.content, "\r")
+			// Byte-identical line on both sides: it appears as -/+ ONLY because its
+			// trailing newline changed — the "\ No newline at end of file"
+			// transition that git emits when a line is appended after the old last
+			// line (so the previously-last line gains a newline). Nothing was
+			// authored or removed here, so count NEITHER side; otherwise the
+			// unchanged line is falsely reported as an addition.
+			if dContent == aContent {
+				continue
+			}
 			if curFile != "" {
-				out.Added = append(out.Added, AddedLine{File: curFile, LineNum: a.line, Content: strings.TrimRight(a.content, "\r")})
+				out.Added = append(out.Added, AddedLine{File: curFile, LineNum: a.line, Content: aContent})
+			}
+			// Dissimilar → a real delete + add; similar → modification (drop delete).
+			if curDelFile != "" && !linesSimilar(d.content, a.content) {
+				out.Deleted[curDelFile] = append(out.Deleted[curDelFile], DeletedLine{LineNum: d.line, Content: dContent})
 			}
 		}
 		// Excess deletes — lines removed without a same-position replacement.

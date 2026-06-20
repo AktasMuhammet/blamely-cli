@@ -555,7 +555,7 @@ func fileRanges(f gitnotes.FileEntry) []htmlRange {
 // rangeAttr renders one range's authorship and whether it's AI-attributed.
 func rangeAttr(l gitnotes.RangeEntry) (string, bool) {
 	if l.Tool != "" && l.Tool != "human" {
-		s := l.Tool
+		s := toolLabel(l.Tool)
 		var extra []string
 		if l.Model != nil && *l.Model != "" {
 			extra = append(extra, *l.Model)

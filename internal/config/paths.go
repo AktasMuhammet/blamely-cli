@@ -10,6 +10,7 @@ const (
 	dirName             = ".blamely"
 	dbFileName          = "db.sqlite"
 	portFileName        = "daemon.port"
+	pidFileName         = "daemon.pid"
 	socketFileName      = "daemon.sock"
 	stateFileName       = "state.json"
 	hooksDirName        = "git-hooks"
@@ -60,6 +61,17 @@ func PortFile() (string, error) {
 		return "", err
 	}
 	return filepath.Join(d, portFileName), nil
+}
+
+// PidFile is where the running daemon records its OS process id, so `blamely
+// uninstall` can terminate that exact process synchronously instead of relying
+// on a racy by-image-name taskkill.
+func PidFile() (string, error) {
+	d, err := BlamelyDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, pidFileName), nil
 }
 
 func SocketFile() (string, error) {

@@ -83,7 +83,7 @@ func TestRemoveInstalledBinary_RemovesBinaryAndExtras(t *testing.T) {
 		}
 	}
 
-	if err := removeInstalledBinary(bin, []string{db}); err != nil {
+	if err := removeInstalledBinary(bin, []string{db}, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(bin); !os.IsNotExist(err) {
@@ -97,5 +97,35 @@ func TestRemoveInstalledBinary_RemovesBinaryAndExtras(t *testing.T) {
 	}
 	if _, err := os.Stat(cfg); err != nil {
 		t.Error("config.json must be preserved (not in the remove list)")
+	}
+}
+
+// TestRemoveInstalledBinary_PurgeWipesWholeTree verifies --purge removes the
+// entire ~/.blamely tree, config.json and exclude included. Unix-only: on
+// Windows removeInstalledBinary defers to a detached cleanup that runs after the
+// process exits, so there's nothing to assert synchronously.
+func TestRemoveInstalledBinary_PurgeWipesWholeTree(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("purge removal is asynchronous on Windows")
+	}
+	root := t.TempDir()
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(binDir, "blamely")
+	cfg := filepath.Join(root, "config.json")
+	exclude := filepath.Join(root, "exclude")
+	for _, f := range []string{bin, cfg, exclude} {
+		if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := removeInstalledBinary(bin, nil, root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Error("--purge must remove the entire ~/.blamely tree (config.json + exclude included)")
 	}
 }

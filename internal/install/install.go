@@ -5,12 +5,38 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/daemon"
 )
+
+// killRunningDaemon terminates the live daemon SYNCHRONOUSLY during uninstall,
+// AFTER the respawn mechanism (Scheduled Task / Startup .vbs / LaunchAgent /
+// systemd unit) is removed so it can't come back. Doing it here, in-process,
+// rather than leaving it to the racy detached `taskkill` is what stops the
+// "files removed but the daemon kept running (and kept bin/blamely.exe locked,
+// so the dir survived)" failure on Windows.
+//
+// Two complementary kills, both best-effort:
+//  1. By exact PID from the daemon's PID file — catches a daemon running from a
+//     renamed/dev binary that an image-name match would miss.
+//  2. killOtherDaemonProcesses — by image name, excluding our own PID, so a
+//     daemon with no PID file (older build) is still reaped. This is the
+//     reliable one for a normal install (the daemon IS blamely.exe).
+func killRunningDaemon() {
+	if p, err := config.PidFile(); err == nil {
+		if data, err := os.ReadFile(p); err == nil {
+			pid, perr := strconv.Atoi(strings.TrimSpace(string(data)))
+			if perr == nil && pid > 0 && pid != os.Getpid() {
+				_ = killProcess(pid)
+			}
+		}
+	}
+	killOtherDaemonProcesses()
+}
 
 // Run is the orchestrator behind `blamely install`. It:
 //  1. Detects which AI tools are present on the machine.
@@ -315,6 +341,7 @@ func runtimeArtifacts(keepDB bool) []string {
 	add(config.LogFile())    // daemon.log
 	add(config.SocketFile()) // daemon.sock (unix)
 	add(config.PortFile())   // daemon.port (windows)
+	add(config.PidFile())    // daemon.pid
 	add(config.StateFile())  // state.json
 	if dir, err := config.BlamelyDir(); err == nil {
 		files = append(files, filepath.Join(dir, "blamely.db")) // legacy, pre-db.sqlite
@@ -404,26 +431,69 @@ func Uninstall(keepDB bool) error {
 		report(fmt.Sprintf("removed Blamely plugin from %d JetBrains IDE(s)", len(jetbrainsDirs)),
 			UninstallJetBrainsPlugins(jetbrainsDirs))
 	}
-	if s.LaunchAgentInstalled {
-		report("removed daemon agent", UninstallDaemonAgent())
-	}
+	// Always attempt removal, not just when state says we installed it: a
+	// daemon agent registered outside `blamely install` (the Windows installer's
+	// own Scheduled Task / Startup .vbs, a manual setup, or a pre-state install)
+	// won't be in LaunchAgentInstalled, and a surviving daemon keeps the binary
+	// locked so the cleanup below can't delete the bin dir. UninstallDaemonAgent
+	// is idempotent and returns nil when nothing is registered — same
+	// self-sufficient approach as the editor/JetBrains removal above.
+	report("removed daemon agent", UninstallDaemonAgent())
+
+	// Now that the respawn mechanism (Scheduled Task / Startup .vbs / LaunchAgent
+	// / systemd unit) is gone, kill the still-running daemon by its recorded PID.
+	// This is synchronous and exact, so the binary is unlocked before the cleanup
+	// below runs — fixing "uninstall removed the files but the process kept
+	// running" on Windows, where the by-image-name taskkill could lose the race.
+	killRunningDaemon()
 	if s.PathEntryAdded {
 		rcPath, _, err := UninstallPathEntry(s.PathRcFile)
 		report(fmt.Sprintf("removed PATH entry from %s", rcPath), err)
 	}
 
 	// Remove the stable binary copy AND the runtime/data files (logs, sockets,
-	// state, and the DB unless keepDB). On Windows the running blamely.exe can't
-	// delete itself or the files the daemon holds open, so removeInstalledBinary
-	// schedules a detached cleanup that taskkills the daemon and deletes them all
-	// once this process exits. On Unix they're unlinked immediately.
+	// state, and the DB unless keepDB). With --purge, the WHOLE ~/.blamely tree
+	// goes — config.json and exclude included. On Windows the running blamely.exe
+	// can't delete itself or the files the daemon holds open, so
+	// removeInstalledBinary schedules a detached cleanup that taskkills the daemon
+	// and deletes them all once this process exits. On Unix they're unlinked
+	// immediately.
 	artifacts := runtimeArtifacts(keepDB)
-	if p, err := InstalledBinaryPath(); err == nil {
-		report("removed binary "+p, removeInstalledBinary(p, artifacts))
+	purgeRoot := ""
+	if keepDB {
+		// Keep ONLY the attribution database. Everything else under ~/.blamely —
+		// config.json and the exclude list included — is removed, so add them to
+		// the delete list (the directory survives because db.sqlite remains).
+		if p, e := config.ConfigFile(); e == nil {
+			artifacts = append(artifacts, p)
+		}
+		if p, e := config.ExcludeFile(); e == nil {
+			artifacts = append(artifacts, p)
+		}
 	} else {
-		// No binary path (unexpected) — still clean up the runtime files directly.
+		// Default: wipe the entire ~/.blamely tree — binary, database, config,
+		// exclude, everything.
+		if dir, derr := config.BlamelyDir(); derr == nil {
+			purgeRoot = dir
+		}
+	}
+	if p, err := InstalledBinaryPath(); err == nil {
+		// On Windows the binary/dir removal is DEFERRED to a detached cleanup that
+		// runs once this process exits (a running .exe can't delete its own image),
+		// so don't claim it's already gone — that's why the old "removed binary" ✓
+		// printed while the file was still on disk.
+		label := "removed binary " + p
+		if runtime.GOOS == "windows" {
+			label = "scheduled removal of " + p
+		}
+		report(label, removeInstalledBinary(p, artifacts, purgeRoot))
+	} else {
+		// No binary path (unexpected) — still clean up directly.
 		for _, f := range artifacts {
 			_ = os.Remove(f)
+		}
+		if purgeRoot != "" {
+			_ = os.RemoveAll(purgeRoot)
 		}
 	}
 
@@ -431,12 +501,22 @@ func Uninstall(keepDB bool) error {
 		return firstErr
 	}
 	fmt.Println()
-	if keepDB {
-		fmt.Println("Blamely uninstalled. Removed the binary, logs, and runtime files.")
-		fmt.Println("Kept the attribution database (db.sqlite), your config.json, and exclude list.")
-	} else {
-		fmt.Println("Blamely uninstalled. Removed the binary, logs, runtime files, and attribution database.")
-		fmt.Println("Kept only your config.json and exclude list (re-run with --keep-db to preserve history next time).")
+	// The daemon is already stopped (killed synchronously above). On Windows the
+	// final binary + directory deletion runs in a detached helper that fires the
+	// moment this process exits and releases its own image — about a second. Phrase
+	// it as "clearing on exit" rather than claiming it's already gone.
+	deferred := runtime.GOOS == "windows"
+	switch {
+	case keepDB && deferred:
+		fmt.Println("Blamely uninstalled and the daemon stopped. Clearing ~/.blamely (keeping")
+		fmt.Println("the attribution database) on exit.")
+	case keepDB:
+		fmt.Println("Blamely uninstalled. Removed everything under ~/.blamely except the")
+		fmt.Println("attribution database (db.sqlite).")
+	case deferred:
+		fmt.Println("Blamely uninstalled and the daemon stopped. Clearing ~/.blamely on exit.")
+	default:
+		fmt.Println("Blamely uninstalled. Removed the entire ~/.blamely directory.")
 	}
 	return nil
 }

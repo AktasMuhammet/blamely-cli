@@ -133,15 +133,17 @@ func TestParseDiff_InPlaceModification(t *testing.T) {
 		"--- a/foo.go",
 		"+++ b/foo.go",
 		"@@ -4,1 +4,1 @@",
-		"-old",
-		"+new",
+		"-count = 1",
+		"+count = 2",
 		"",
 	}, "\n")
 	c, err := parseDiff(strings.NewReader(diff), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantAdded := []AddedLine{{File: "foo.go", LineNum: 4, Content: "new"}}
+	// The two lines are similar (a reworded value), so it's a modification: the
+	// add is counted, the paired delete is dropped.
+	wantAdded := []AddedLine{{File: "foo.go", LineNum: 4, Content: "count = 2"}}
 	if !reflect.DeepEqual(c.Added, wantAdded) {
 		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)
 	}
@@ -166,8 +168,8 @@ func TestParseDiff_ModificationAfterLineShift(t *testing.T) {
 		"+new2",
 		// In-place replacement at pre-image line 4 → post-image line 6.
 		"@@ -4,1 +6,1 @@",
-		"-oldX",
-		"+newX",
+		"-y = 4",
+		"+y = 6",
 		"",
 	}, "\n")
 	c, err := parseDiff(strings.NewReader(diff), nil)
@@ -177,7 +179,7 @@ func TestParseDiff_ModificationAfterLineShift(t *testing.T) {
 	wantAdded := []AddedLine{
 		{File: "foo.go", LineNum: 2, Content: "new1"},
 		{File: "foo.go", LineNum: 3, Content: "new2"},
-		{File: "foo.go", LineNum: 6, Content: "newX"},
+		{File: "foo.go", LineNum: 6, Content: "y = 6"},
 	}
 	if !reflect.DeepEqual(c.Added, wantAdded) {
 		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)
@@ -194,24 +196,25 @@ func TestParseDiff_ReplaceMoreWithFewer(t *testing.T) {
 		"diff --git a/foo.go b/foo.go",
 		"--- a/foo.go",
 		"+++ b/foo.go",
-		// 3 lines removed, 1 added — 1 modification + 2 net deletes.
+		// 3 lines removed, 1 added — the add reworks the first del (similar), so
+		// that pair is a modification (delete dropped); the other 2 are net deletes.
 		"@@ -10,3 +10,1 @@",
-		"-oldA",
-		"-oldB",
-		"-oldC",
-		"+new",
+		"-value = 1",
+		"-removedB",
+		"-removedC",
+		"+value = 2",
 		"",
 	}, "\n")
 	c, err := parseDiff(strings.NewReader(diff), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantAdded := []AddedLine{{File: "foo.go", LineNum: 10, Content: "new"}}
+	wantAdded := []AddedLine{{File: "foo.go", LineNum: 10, Content: "value = 2"}}
 	if !reflect.DeepEqual(c.Added, wantAdded) {
 		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)
 	}
-	// First del (line 10) is paired with the add and dropped. Lines 11, 12 remain.
-	wantDel := []DeletedLine{{LineNum: 11, Content: "oldB"}, {LineNum: 12, Content: "oldC"}}
+	// First del (line 10) is similar to the add → dropped. Lines 11, 12 remain.
+	wantDel := []DeletedLine{{LineNum: 11, Content: "removedB"}, {LineNum: 12, Content: "removedC"}}
 	if got := c.Deleted["foo.go"]; !reflect.DeepEqual(got, wantDel) {
 		t.Errorf("Deleted: want %v, got %v", wantDel, got)
 	}
@@ -225,8 +228,8 @@ func TestParseDiff_ReplaceFewerWithMore(t *testing.T) {
 		"--- a/foo.go",
 		"+++ b/foo.go",
 		"@@ -10,1 +10,3 @@",
-		"-old",
-		"+newA",
+		"-n = 1",
+		"+n = 2",
 		"+newB",
 		"+newC",
 		"",
@@ -235,8 +238,10 @@ func TestParseDiff_ReplaceFewerWithMore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// First del/add pair is a modification (n = 1 → n = 2, similar); the other
+	// two adds are net additions. No deletions.
 	wantAdded := []AddedLine{
-		{File: "foo.go", LineNum: 10, Content: "newA"},
+		{File: "foo.go", LineNum: 10, Content: "n = 2"},
 		{File: "foo.go", LineNum: 11, Content: "newB"},
 		{File: "foo.go", LineNum: 12, Content: "newC"},
 	}
@@ -248,30 +253,89 @@ func TestParseDiff_ReplaceFewerWithMore(t *testing.T) {
 	}
 }
 
-// TestParseDiff_WhitespaceOnlyModificationSymmetric: a whitespace-only `+`
-// paired with a `-` is a modification. The `+` side is now counted (we count
-// all added lines, blank ones included), and the `-` side is still consumed by
-// the positional pairing so it does NOT produce a phantom deletion.
-func TestParseDiff_WhitespaceOnlyModificationSymmetric(t *testing.T) {
+// TestParseDiff_WhitespaceOnlyModification: a reindent (tabs/spaces only) is a
+// modification — the two lines are whitespace-normalized-equal, so the add is
+// counted and the paired delete is dropped (no phantom deletion).
+func TestParseDiff_WhitespaceOnlyModification(t *testing.T) {
 	diff := strings.Join([]string{
 		"diff --git a/foo.go b/foo.go",
 		"--- a/foo.go",
 		"+++ b/foo.go",
 		"@@ -7,1 +7,1 @@",
-		"-old",
-		"+   ", // whitespace-only — counted as an add, and still pairs.
+		"-  return x", // 2-space indent
+		"+    return x", // 4-space indent — same line, reindented.
 		"",
 	}, "\n")
 	c, err := parseDiff(strings.NewReader(diff), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantAdded := []AddedLine{{File: "foo.go", LineNum: 7, Content: "   "}}
+	wantAdded := []AddedLine{{File: "foo.go", LineNum: 7, Content: "    return x"}}
 	if !reflect.DeepEqual(c.Added, wantAdded) {
 		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)
 	}
 	if got := c.Deleted["foo.go"]; len(got) != 0 {
-		t.Errorf("Deleted: want empty (paired with whitespace add), got %v", got)
+		t.Errorf("Deleted: want empty (whitespace-only modification), got %v", got)
+	}
+}
+
+// TestParseDiff_NoNewlineAtEofIsNotAnAdd reproduces "append a line after a file
+// whose last line had no trailing newline": git shows the old last line as
+// -/+ (it gained a newline) plus the genuinely new line. The re-added,
+// byte-identical line must NOT be counted as an addition — only the new line is.
+func TestParseDiff_NoNewlineAtEofIsNotAnAdd(t *testing.T) {
+	diff := strings.Join([]string{
+		"diff --git a/foo.txt b/foo.txt",
+		"--- a/foo.txt",
+		"+++ b/foo.txt",
+		"@@ -1,1 +1,2 @@",
+		"-last line",
+		"\\ No newline at end of file",
+		"+last line",
+		"+a brand new appended line",
+		"\\ No newline at end of file",
+		"",
+	}, "\n")
+	c, err := parseDiff(strings.NewReader(diff), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only the genuinely new line is an add; the re-added identical line is not.
+	wantAdded := []AddedLine{{File: "foo.txt", LineNum: 2, Content: "a brand new appended line"}}
+	if !reflect.DeepEqual(c.Added, wantAdded) {
+		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)
+	}
+	if got := c.Deleted["foo.txt"]; len(got) != 0 {
+		t.Errorf("Deleted: want empty (newline-only change), got %v", got)
+	}
+}
+
+// TestParseDiff_DissimilarReplaceCountsDeletion is the content-aware pairing
+// (option 3): a hunk that deletes a line and adds a COMPLETELY DIFFERENT line at
+// the same spot is a real delete + add, not a modification — so the delete is
+// reported, matching `git --stat`. Previously the positional pairing silently
+// dropped it.
+func TestParseDiff_DissimilarReplaceCountsDeletion(t *testing.T) {
+	diff := strings.Join([]string{
+		"diff --git a/foo.go b/foo.go",
+		"--- a/foo.go",
+		"+++ b/foo.go",
+		"@@ -3,1 +3,1 @@",
+		"-hello1, hello2",
+		"+something entirely unrelated here",
+		"",
+	}, "\n")
+	c, err := parseDiff(strings.NewReader(diff), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAdded := []AddedLine{{File: "foo.go", LineNum: 3, Content: "something entirely unrelated here"}}
+	if !reflect.DeepEqual(c.Added, wantAdded) {
+		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)
+	}
+	wantDel := []DeletedLine{{LineNum: 3, Content: "hello1, hello2"}}
+	if got := c.Deleted["foo.go"]; !reflect.DeepEqual(got, wantDel) {
+		t.Errorf("Deleted: want %v (dissimilar replace), got %v", wantDel, got)
 	}
 }
 
@@ -337,14 +401,14 @@ func TestParseDiff_FileBoundaryFlushesHunk(t *testing.T) {
 		"--- a/a.go",
 		"+++ b/a.go",
 		"@@ -1,1 +1,1 @@",
-		"-oldA",
-		"+newA",
+		"-a = 1",
+		"+a = 2",
 		"diff --git a/b.go b/b.go",
 		"--- a/b.go",
 		"+++ b/b.go",
 		"@@ -1,1 +1,1 @@",
-		"-oldB",
-		"+newB",
+		"-b = 1",
+		"+b = 2",
 		"",
 	}, "\n")
 	c, err := parseDiff(strings.NewReader(diff), nil)
@@ -352,8 +416,8 @@ func TestParseDiff_FileBoundaryFlushesHunk(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantAdded := []AddedLine{
-		{File: "a.go", LineNum: 1, Content: "newA"},
-		{File: "b.go", LineNum: 1, Content: "newB"},
+		{File: "a.go", LineNum: 1, Content: "a = 2"},
+		{File: "b.go", LineNum: 1, Content: "b = 2"},
 	}
 	if !reflect.DeepEqual(c.Added, wantAdded) {
 		t.Errorf("Added: want %v, got %v", wantAdded, c.Added)

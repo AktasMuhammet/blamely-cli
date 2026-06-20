@@ -370,7 +370,7 @@ func fileRangesBody(note *gitnotes.Note) []string {
 // faint dash for unattributed deletions.
 func termRangeAttr(l gitnotes.RangeEntry) string {
 	if l.Tool != "" && l.Tool != "human" {
-		s := green(l.Tool)
+		s := green(toolLabel(l.Tool))
 		var extra []string
 		if l.Model != nil && *l.Model != "" {
 			extra = append(extra, *l.Model)

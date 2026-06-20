@@ -7,8 +7,32 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"syscall"
 )
+
+// killProcess terminates a specific PID (and its child tree) on Windows by PID
+// alone — no IMAGENAME filter. Targeting the exact PID is both reliable (taskkill
+// filter wildcards are finicky and an exact image name misses a renamed/dev
+// daemon) and safe to call from the uninstaller: it's the daemon's PID, read
+// from the daemon's own PID file, never our own (killRunningDaemon guards
+// against pid == os.Getpid()). /T also reaps the daemon's child processes.
+func killProcess(pid int) error {
+	return exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid)).Run()
+}
+
+// killOtherDaemonProcesses synchronously kills every blamely.exe EXCEPT this
+// uninstaller. `/FI "PID ne <self>"` is what makes `/IM blamely.exe` safe to call
+// from a process that is itself blamely.exe — it spares us while reaping the
+// daemon (and any leftover daemons from earlier upgrades), by the real, exact
+// image name, with no PID-file or filter-wildcard dependency. /T takes child
+// trees. Synchronous (Run waits), so the daemon is dead before the detached bin
+// cleanup runs — the fix for "uninstall removed the files but blamely kept
+// running and kept the dir locked".
+func killOtherDaemonProcesses() {
+	self := "PID ne " + strconv.Itoa(os.Getpid())
+	_ = exec.Command("taskkill", "/F", "/T", "/IM", "blamely.exe", "/FI", self).Run()
+}
 
 // detachedProcess is CREATE_NO_WINDOW | DETACHED_PROCESS so the cleanup shell
 // keeps running after this process (and its console) exits.
@@ -33,29 +57,75 @@ const detachedProcess = 0x08000000 | 0x00000008
 // still-running daemon holds them open, so they can only be removed AFTER the
 // taskkill — os.Remove from this still-live process would fail with a sharing
 // violation on Windows.
-func removeInstalledBinary(p string, extraFiles []string) error {
-	if _, err := os.Stat(p); os.IsNotExist(err) && len(extraFiles) == 0 {
+//
+// purgeRoot, when non-empty, is ~/.blamely: --purge wipes the whole tree
+// (config.json, exclude, and everything else) instead of just the bin dir and
+// the listed data files.
+func removeInstalledBinary(p string, extraFiles []string, purgeRoot string) error {
+	if _, err := os.Stat(p); os.IsNotExist(err) && len(extraFiles) == 0 && purgeRoot == "" {
 		return nil
 	}
 	binDir := filepath.Dir(p)
 	exeName := filepath.Base(p) // blamely.exe — the daemon's image name too
-	// del the binary + every runtime/data file (each best-effort).
-	dels := fmt.Sprintf(`del /f /q "%s" >nul 2>&1`, p)
-	for _, f := range extraFiles {
-		dels += fmt.Sprintf(` & del /f /q "%s" >nul 2>&1`, f)
+	// del the runtime/data files that live in ~/.blamely (NOT in bin): logs,
+	// state, db. Each best-effort; trailing " & " so the rmdir concatenates.
+	// Skipped on purge — the single rmdir of the whole tree covers them.
+	var dels string
+	if purgeRoot == "" {
+		for _, f := range extraFiles {
+			dels += fmt.Sprintf(`del /f /q "%s" >nul 2>&1 & `, f)
+		}
 	}
 	// `ping -n N` is a portable sleep (no `timeout` dependency, which fails when
 	// stdin isn't a console). Sequence: wait ~2s for THIS process to exit and
 	// release its image lock; kill the still-running daemon (now the only
 	// blamely.exe left, and the holder of db.sqlite/daemon.log); wait ~1s for
-	// Windows to release those locks; then force-delete the exe + data files and
-	// rmdir the now-empty bin folder. All output suppressed; failures ignored
-	// since this runs unattended after we exit.
+	// Windows to release those locks; delete the ~/.blamely data files; then
+	// wipe the bin directory.
+	//
+	// rmdir /s /q removes the WHOLE bin folder, not just blamely.exe. The
+	// installer also drops sqlite3.exe (bundled for the IDE plugins), the daemon
+	// launcher (blamely-daemon.vbs), staging subdirs (.install-*), and rotated
+	// backups (blamely.exe.old-*) into this same folder — a plain del of the exe
+	// followed by a non-recursive rmdir left every one of those (and the folder)
+	// behind. The bin dir is exclusively Blamely's, so recursive removal is safe;
+	// ~/.blamely itself (config.json, exclude, a kept db) is the parent and is
+	// untouched. All output suppressed; failures ignored since this runs
+	// unattended after we exit.
+	//
+	// The kill+delete runs in THREE passes with a wait between each. Killing the
+	// daemon and deleting are best-effort and racy on Windows: a taskkill can land
+	// while the daemon is mid-shutdown, and even after it dies Windows may not have
+	// released the exe/db handles by the time rmdir runs. Crucially, `rmdir /s`
+	// deletes everything it CAN and SKIPS a locked file — leaving that file AND its
+	// parent dir behind. So if blamely.exe (this uninstaller's own image, still
+	// exiting) or sqlite3.exe (an open IDE plugin) is locked when the first rmdir
+	// runs, the bin dir survives while the rest of the tree is gone. Re-running the
+	// rmdir after a wait, several times, reaps the dir once those handles release.
+	wipeDir := binDir
+	if purgeRoot != "" {
+		wipeDir = purgeRoot // wipe the whole ~/.blamely tree
+	}
+	// taskkill the daemon by its exact image name (proven; filter wildcards are
+	// unreliable). /t reaps its child tree. This is the BACKSTOP — the synchronous
+	// killProcess(pid) above already killed the recorded daemon, including a
+	// renamed/dev one this /im can't match. Safe here: it runs only after the ping
+	// wait, once this uninstaller process has exited.
+	killClean := fmt.Sprintf(`taskkill /f /t /im "%s" >nul 2>&1 & %srmdir /s /q "%s" >nul 2>&1`, exeName, dels, wipeDir)
+	// First wait is short (~1s): the daemon is already dead (killed synchronously
+	// in killRunningDaemon), so the ONLY lock left on the bin is this uninstaller's
+	// own image, which releases the instant it exits — right after this returns.
+	// The extra passes with longer waits are just insurance against a transient
+	// handle (e.g. an editor's sqlite3 query) still open on the first try.
 	script := fmt.Sprintf(
-		`ping 127.0.0.1 -n 3 >nul & taskkill /f /im "%s" >nul 2>&1 & ping 127.0.0.1 -n 2 >nul & %s & rmdir "%s" >nul 2>&1`,
-		exeName, dels, binDir,
+		`ping 127.0.0.1 -n 2 >nul & %s & ping 127.0.0.1 -n 3 >nul & %s & ping 127.0.0.1 -n 3 >nul & %s`,
+		killClean, killClean, killClean,
 	)
 	cmd := exec.Command("cmd", "/c", script)
+	// Run the cleanup from a directory OUTSIDE the tree being deleted, so the
+	// detached process's own working directory can never hold a lock that blocks
+	// the rmdir. (Inherited CWD could otherwise sit inside ~/.blamely.)
+	cmd.Dir = os.TempDir()
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
 		CreationFlags: detachedProcess,

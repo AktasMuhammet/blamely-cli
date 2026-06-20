@@ -47,7 +47,14 @@ var copilotTranscriptStaleCutoff = copilotChatStaleCutoff
 func (c *CopilotTranscriptWatcher) Run(ctx context.Context, sink daemon.Sink) error {
 	roots := c.Roots
 	if len(roots) == 0 {
-		roots = defaultCopilotChatRoots()
+		// Copilot's transcript stream lives under the host editor's
+		// workspaceStorage — and Copilot runs in VS Code, VS Code Insiders, AND
+		// Cursor. Scan all of them (copilotChatSearchRoots = Code/Insiders +
+		// Cursor), not just stock VS Code; otherwise Copilot-in-Cursor (common on
+		// Windows) never streams. The GitHub.copilot-chat/transcripts subpath this
+		// watcher looks for is Copilot's own, so it never collides with Cursor's
+		// native chat (handled by CursorChatWatcher).
+		roots = copilotChatSearchRoots()
 	}
 
 	tailers := map[string]context.CancelFunc{}
