@@ -335,6 +335,7 @@ setting `false`. With v2 off (opt-out), behavior is the legacy engine, unchanged
 | Phase 5 note-seeding (committed authorship across commits) | ✅ CLI path | `internal/gitnotes/attribution_v2_seed.go` + `authorship.SeedHook` |
 | Gutter source — `blamely authorship <file>` (single per-line source, I4) | ✅ | CLI command; seeds + returns the working log; smoke-verified |
 | Editor-path note-seeding | ✅ | implicit in `authorship` (seeds committed authorship on query) |
+| Watcher tools → v2 (Copilot transcript / Codex / Cursor / antigravity) | ✅ | dbSink.Record feeds live edits into the working log; stale replay skipped |
 | Phase 3 **gutter** rendering flip (plugins paint from `authorship`) | ◐ | `GutterV2` overlay implemented + compiling in BOTH IDEs (flag-gated, active editor); needs an IDE run to verify icons |
 | History-rewrite robustness (amend/rebase/cherry-pick) | ✅ | notes.rewriteRef + skip-while-in-progress; real-rebase e2e |
 | Merge-conflict-resolution attribution | ☐ | Phase 5 remainder |
