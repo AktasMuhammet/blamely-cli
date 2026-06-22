@@ -105,6 +105,9 @@ func RecordCodexFromStdin(r io.Reader) error {
 		sessionID:      p.SessionID,
 		tool:           "codex",
 	})
+	// Attribution v2 (dual-run, flag-gated): mirror into the working log before the
+	// daemon POST so capture is daemon-independent. No-op when the flag is off.
+	captureV2(repoPath, rel, "codex", "cli", payload.Model)
 	return postToDaemon(payload)
 }
 

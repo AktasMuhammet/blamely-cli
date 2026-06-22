@@ -116,6 +116,9 @@ func RecordCopilotFromStdin(r io.Reader) error {
 		sessionID:      p.SessionID,
 		tool:           "copilot",
 	})
+	// Attribution v2 (dual-run, flag-gated): mirror into the working log before the
+	// daemon POST so capture is daemon-independent. No-op when the flag is off.
+	captureV2(repoPath, rel, "copilot", gen, payload.Model)
 	return postToDaemon(payload)
 }
 
