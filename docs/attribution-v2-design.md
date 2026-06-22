@@ -245,9 +245,12 @@ Every phase is behind a feature flag and leaves `main` shippable. Status as buil
   **skips while a rewrite is in progress** (`InProgressOp`) so the per-commit hook doesn't clobber
   that copy. Verified end-to-end with a real `git rebase`. Merge-conflict-resolution attribution
   and the editor-path seed remain.
-- **Phase 6 — Retire old engine. ☐** Gated on §12. Remove hash budget/drift + per-tool narrowing
-  once the new engine has soaked clean; keep `content_sha` only as a degraded unobserved-edit
-  fallback.
+- **Phase 6 — Retire old engine. ◐** The content-hash GUESSER no longer runs by default:
+  buildNote skips the content_sha/drift/per-tool matcher when v2 is on, so attribution is pure
+  v2 (working logs) + honest-Human fallback. SQLite is KEPT for metadata (tokens, coding time,
+  prompts, reporting) — it was never the attribution engine alone. The legacy matcher remains
+  behind the opt-out (BLAMELY_ATTRIBUTION_V2=0) as the reversible safety valve; physically
+  deleting it is the post-soak cleanup (docs/attribution-v2-phase6-plan.md).
 
 ---
 

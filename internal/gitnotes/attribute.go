@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blamely/blamely/internal/authorship"
 	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/daemon"
 	"github.com/blamely/blamely/internal/gitutil"
@@ -897,6 +898,13 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 	// AI-generated content from a previous session that a human copy-pastes
 	// into the current session's commit must attribute as Human.
 	editsForFile := func(file string) (sessionEdits []store.Edit, err error) {
+		// Phase 6: when Attribution v2 is on (default), the diff-based working log is
+		// the attribution source — skip the legacy content_sha matcher entirely so
+		// added lines default Human and the v2 flip sets AI. SQLite-backed METADATA
+		// (coding time, tokens, prompts) below is unaffected: it uses other queries.
+		if authorship.Enabled() {
+			return nil, nil
+		}
 		if sessionEdits, err = db.EditsForFileInSession(repoPath, file, sessionID); err != nil {
 			return nil, err
 		}
@@ -920,6 +928,11 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 	// recorded AI removal credits at most one committed deletion.
 	delEditsByFile := map[string][]store.Edit{}
 	deletionEditsForFile := func(file string) []store.Edit {
+		// Phase 6: v2 deletion log (flipDeletionsToWorkingLog) is the deletion
+		// attribution source when v2 is on; skip the legacy content_sha deletion matcher.
+		if authorship.Enabled() {
+			return nil
+		}
 		if cached, ok := delEditsByFile[file]; ok {
 			return cached
 		}

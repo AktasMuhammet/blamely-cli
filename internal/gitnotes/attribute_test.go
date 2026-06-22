@@ -174,6 +174,11 @@ func TestNullInt64(t *testing.T) {
 
 func openTestDB(t *testing.T) *store.DB {
 	t.Helper()
+	// These exercise the LEGACY content_sha attribution engine (the SQLite path).
+	// With Attribution v2 on (the default), buildNote skips that matcher, so opt out
+	// here to keep testing the legacy fallback specifically. v2's own behavior is
+	// covered by the attribution_v2_* tests (working-log driven).
+	t.Setenv("BLAMELY_ATTRIBUTION_V2", "0")
 	db, err := store.OpenAt(filepath.Join(t.TempDir(), "test.sqlite"))
 	if err != nil {
 		t.Fatalf("OpenAt: %v", err)
