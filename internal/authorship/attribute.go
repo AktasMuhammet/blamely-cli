@@ -44,6 +44,11 @@ func Attribute(prior *WorkingLog, baseline, newContent string, author Author, no
 		}
 	}
 
+	// overrode[i] records the author a CHANGED line replaced, when its type differs
+	// from the new author (a human rewriting AI code, or vice-versa) — an audit
+	// marker, not a change to who owns the line now.
+	overrode := detectOverrode(prior, matchedOld, len(oldLines), author)
+
 	if nowMS == 0 {
 		nowMS = time.Now().UnixMilli()
 	}
@@ -58,8 +63,46 @@ func Attribute(prior *WorkingLog, baseline, newContent string, author Author, no
 		BaseSHA:   base,
 		BlobSHA:   sha256Hex(newContent),
 		UpdatedMS: nowMS,
-		Lines:     coalesce(perLine),
+		Lines:     coalesce(perLine, overrode),
 	}
+}
+
+// detectOverrode finds replace pairs and, for each changed NEW line whose replaced
+// OLD line had a different-type author, records that prior author. It walks the LCS
+// alignment gap by gap (unmatched old lines [oldCursor,gapOldEnd) vs unmatched new
+// lines [i,gapNewEnd)) and pairs them positionally — deterministic and identical
+// across the Go, TS, and Kotlin ports (the golden vectors enforce it). Pure inserts
+// (empty old side of the gap) and pure deletes never produce an override.
+func detectOverrode(prior *WorkingLog, matchedOld []int, nOld int, author Author) []*Author {
+	m := len(matchedOld)
+	overrode := make([]*Author, m)
+	oldCursor := 0
+	i := 0
+	for i < m {
+		if matchedOld[i] >= 0 {
+			oldCursor = matchedOld[i] + 1
+			i++
+			continue
+		}
+		gapNewEnd := i
+		for gapNewEnd < m && matchedOld[gapNewEnd] < 0 {
+			gapNewEnd++
+		}
+		gapOldEnd := nOld
+		if gapNewEnd < m {
+			gapOldEnd = matchedOld[gapNewEnd]
+		}
+		for k := 0; i+k < gapNewEnd && oldCursor+k < gapOldEnd; k++ {
+			replaced := priorAuthorOr(prior, oldCursor+k+1)
+			if replaced.Type != author.Type {
+				p := replaced
+				overrode[i+k] = &p
+			}
+		}
+		oldCursor = gapOldEnd
+		i = gapNewEnd
+	}
+	return overrode
 }
 
 // priorAuthorOr returns the prior author of 1-based old line n, defaulting to

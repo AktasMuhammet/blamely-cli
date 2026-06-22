@@ -20,6 +20,30 @@ func typesByLine(wl *WorkingLog, n int) []AuthorType {
 	return out
 }
 
+// overrodeTypesByLine expands a working log into a per-line overrode-author-type
+// slice (nil = no override on that line).
+func overrodeTypesByLine(wl *WorkingLog, n int) []*AuthorType {
+	out := make([]*AuthorType, n)
+	for _, r := range wl.Lines {
+		if r.Overrode == nil {
+			continue
+		}
+		t := r.Overrode.Type
+		for ln := r.Start; ln <= r.End && ln <= n; ln++ {
+			tt := t
+			out[ln-1] = &tt
+		}
+	}
+	return out
+}
+
+func deref(t *AuthorType) AuthorType {
+	if t == nil {
+		return ""
+	}
+	return *t
+}
+
 func joinLines(ls ...string) string { return strings.Join(ls, "\n") }
 
 func TestAttribute_NewFileAllAI(t *testing.T) {

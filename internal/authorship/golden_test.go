@@ -30,6 +30,9 @@ type goldenCase struct {
 		GenType string     `json:"gen_type"`
 	} `json:"author"`
 	Expect []AuthorType `json:"expect"`
+	// ExpectOverrode, when present, asserts each line's overrode marker by author
+	// type ("" / null = no override). Absent → overrode not checked for that case.
+	ExpectOverrode []*AuthorType `json:"expect_overrode"`
 }
 
 func TestGoldenVectors(t *testing.T) {
@@ -67,6 +70,15 @@ func TestGoldenVectors(t *testing.T) {
 			for i := range c.Expect {
 				if got[i] != c.Expect[i] {
 					t.Errorf("line %d: got %q, want %q", i+1, got[i], c.Expect[i])
+				}
+			}
+
+			if c.ExpectOverrode != nil {
+				ov := overrodeTypesByLine(wl, len(c.ExpectOverrode))
+				for i, want := range c.ExpectOverrode {
+					if (ov[i] == nil) != (want == nil) || (ov[i] != nil && want != nil && *ov[i] != *want) {
+						t.Errorf("line %d overrode: got %v, want %v", i+1, deref(ov[i]), deref(want))
+					}
 				}
 			}
 		})

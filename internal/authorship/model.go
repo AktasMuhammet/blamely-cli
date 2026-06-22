@@ -122,16 +122,27 @@ func (w *WorkingLog) authorAtLine(n int) Author {
 }
 
 // coalesce turns a per-line author slice (index 0 = line 1) into contiguous
-// ranges, merging adjacent lines only when the full author identity matches.
-func coalesce(perLine []Author) []LineAttribution {
+// ranges, merging adjacent lines only when the full author identity AND the
+// overrode marker match (so an overriding edit stays a distinct run).
+func coalesce(perLine []Author, overrode []*Author) []LineAttribution {
 	var out []LineAttribution
 	for i, a := range perLine {
 		ln := i + 1
-		if n := len(out); n > 0 && out[n-1].End == ln-1 && out[n-1].Author.equalForCoalesce(a) {
+		ov := overrode[i]
+		if n := len(out); n > 0 && out[n-1].End == ln-1 &&
+			out[n-1].Author.equalForCoalesce(a) && overrideEqual(out[n-1].Overrode, ov) {
 			out[n-1].End = ln
 			continue
 		}
-		out = append(out, LineAttribution{Start: ln, End: ln, Author: a})
+		out = append(out, LineAttribution{Start: ln, End: ln, Author: a, Overrode: ov})
 	}
 	return out
+}
+
+// overrideEqual compares two overrode markers (nil = no override).
+func overrideEqual(a, b *Author) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
