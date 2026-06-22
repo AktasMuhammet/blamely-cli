@@ -16,6 +16,7 @@ import (
 	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/daemon"
 	"github.com/blamely/blamely/internal/gitnotes"
+	"github.com/blamely/blamely/internal/gitutil"
 	"github.com/blamely/blamely/internal/install"
 	"github.com/blamely/blamely/internal/report"
 	"github.com/blamely/blamely/internal/store"
@@ -111,6 +112,7 @@ func main() {
 	root.AddCommand(cmdRecord())
 	root.AddCommand(cmdAttribute())
 	root.AddCommand(cmdAuthorship())
+	root.AddCommand(cmdAttributionStatus())
 	root.AddCommand(cmdReport())
 	root.AddCommand(cmdBlame())
 	root.AddCommand(cmdStats())
@@ -387,6 +389,61 @@ func cmdRecord() *cobra.Command {
 // committed authorship when untracked, then prints the working log as JSON — so the
 // editor renders committed + uncommitted authorship from one place. Hidden; the
 // plugins call it only when blamely.attributionV2 is on.
+// cmdAttributionStatus reports the Attribution v2 dual-run divergence for a repo —
+// the measurable §12 soak gate. Agreement should trend to 100% with every divergent
+// commit explained as v2 correcting v1; that's the prerequisite for retiring the old
+// engine (Phase 6).
+func cmdAttributionStatus() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "attribution-status [repo]",
+		Short: "Attribution v2 dual-run divergence summary (the §12 soak gate)",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			target := "."
+			if len(args) == 1 {
+				target = args[0]
+			}
+			abs, err := filepath.Abs(target)
+			if err != nil {
+				return err
+			}
+			if wt, ok := gitutil.Toplevel(abs); ok {
+				abs = wt
+			}
+			s, err := gitnotes.ReadDivergenceSummary(abs, 10)
+			if err != nil {
+				return err
+			}
+			agreement := 100.0
+			if s.ComparedLines > 0 {
+				agreement = 100 * float64(s.ComparedLines-s.DivergentLines) / float64(s.ComparedLines)
+			}
+			fmt.Printf("Attribution v2 dual-run — %s\n", abs)
+			fmt.Printf("  commits measured:           %d\n", s.Commits)
+			fmt.Printf("  added lines compared:       %d\n", s.ComparedLines)
+			fmt.Printf("  divergent (v1 != v2):       %d  (%.2f%% agreement)\n", s.DivergentLines, agreement)
+			fmt.Printf("  files degraded to v1 (no working log): %d\n", s.NoLogFiles)
+			if s.Commits == 0 {
+				fmt.Println("  (no data yet — commit with Attribution v2 on to start the soak)")
+				return nil
+			}
+			if len(s.Recent) > 0 {
+				fmt.Println("  recent divergent commits (each should be v2 correcting v1 — inspect with `blamely blame`):")
+				for _, r := range s.Recent {
+					sha := r.Commit
+					if len(sha) > 10 {
+						sha = sha[:10]
+					}
+					fmt.Printf("    %s  divergent=%d  v1_ai=%d  v2_ai=%d\n", sha, r.Divergent, r.V1AI, r.V2AI)
+				}
+			}
+			fmt.Printf("\n§12 gate: divergence trends to 0 with every difference explained as v2-correct.\n")
+			return nil
+		},
+	}
+	return c
+}
+
 func cmdAuthorship() *cobra.Command {
 	var all bool
 	c := &cobra.Command{
