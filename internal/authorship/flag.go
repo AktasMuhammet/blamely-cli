@@ -1,19 +1,10 @@
 package authorship
 
-import (
-	"os"
-	"strings"
-)
-
 // Enabled reports whether the Attribution v2 working-log engine is active (capture,
-// note flip, seeding, GC). ON by default; opt out with BLAMELY_ATTRIBUTION_V2 set to
-// 0/false/off/no/disable(d). When on, the committed note is sourced from the
-// diff-based working log, falling back to the legacy engine for any file that has no
-// working log — so it degrades safely where v2 never captured.
+// note flip, seeding, GC, deletions). As of the v2-only beta it is ALWAYS on — the
+// legacy content_sha guesser has been retired, so there is no opt-out. The function
+// is retained (returning a constant) so the many gate call sites keep compiling; they
+// can be inlined in a later cleanup.
 func Enabled() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("BLAMELY_ATTRIBUTION_V2"))) {
-	case "0", "false", "off", "no", "disable", "disabled":
-		return false
-	}
 	return true
 }

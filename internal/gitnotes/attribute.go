@@ -1234,7 +1234,6 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			// AI produced stays Human.
 			if content != "" && (e == nil || isNonAITool(e.Tool)) {
 				shaKey := sha256HexStr([]byte(content))
-				// Copypaste budget (see above): a git-added line whose content was
 				// pasted, but which git anchored off the exact paste position, is
 				// claimed for copypaste here — before AI drift, so an AI repeat of
 				// the same content can't steal it. Still Human in the AI/Human split.

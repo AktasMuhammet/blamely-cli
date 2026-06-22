@@ -10,37 +10,21 @@ import (
 	"github.com/blamely/blamely/internal/authorship"
 )
 
-// captureV2 must be a no-op when the flag is off, and when on must derive the
-// right author (human typing vs AI) and chain edits so a human line an AI edit
-// re-emits stays Human — the field repro, now exercised through the record-path
-// helper end to end.
-func TestCaptureV2_FlagGatingAndAuthorChaining(t *testing.T) {
+// captureV2 must derive the right author (human typing vs AI) and chain edits so a
+// human line an AI edit re-emits stays Human — the field repro, exercised through the
+// record-path helper end to end. (v2 is always on now; there is no flag to gate.)
+func TestCaptureV2_AuthorChaining(t *testing.T) {
 	repo := gitInitRepo(t)
 	rel := "f.txt"
 	abs := filepath.Join(repo, rel)
-	ctx, ok := authorship.ResolveContext(filepath.Join(repo, rel)) // resolves once the file exists
-	_ = ctx
-	_ = ok
 
-	// Flag OFF → nothing is written.
-	t.Setenv("BLAMELY_ATTRIBUTION_V2", "0")
-	if err := os.WriteFile(abs, []byte("a\nb\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	captureV2(repo, rel, "claude", "chat", "")
-	ctx, ok = authorship.ResolveContext(abs)
-	if !ok {
-		t.Fatal("ResolveContext failed inside repo")
-	}
-	if wl, _ := authorship.LoadWorkingLog(ctx.RepoRoot, ctx.Branch, ctx.BaseSHA, ctx.RelPath); wl != nil {
-		t.Fatalf("flag off must write no working log, got %+v", wl)
-	}
-
-	// Flag ON.
-	t.Setenv("BLAMELY_ATTRIBUTION_V2", "1")
 	// 1) Human types two lines.
 	os.WriteFile(abs, []byte("h1\nh2\n"), 0o644)
 	captureV2(repo, rel, "", "human", "")
+	ctx, ok := authorship.ResolveContext(abs) // resolves once the file exists
+	if !ok {
+		t.Fatal("ResolveContext failed inside repo")
+	}
 	// 2) AI re-emits them and appends its own.
 	os.WriteFile(abs, []byte("h1\nh2\nai3\n"), 0o644)
 	captureV2(repo, rel, "claude", "chat", "claude-opus-4-8")
