@@ -444,6 +444,29 @@ func cmdAttributionStatus() *cobra.Command {
 	return c
 }
 
+// restrictLinesToChanged keeps only the per-line authorship for lines in `changed`
+// (the uncommitted-diff set), re-collapsing runs that share an author. An empty
+// `changed` yields no lines — the gutter shows nothing once a file has no changes.
+func restrictLinesToChanged(lines []authorship.LineAttribution, changed map[int]bool) []authorship.LineAttribution {
+	if len(changed) == 0 {
+		return nil
+	}
+	var out []authorship.LineAttribution
+	for _, r := range lines {
+		for ln := r.Start; ln <= r.End; ln++ {
+			if !changed[ln] {
+				continue
+			}
+			if n := len(out); n > 0 && out[n-1].End == ln-1 && out[n-1].Author == r.Author && out[n-1].Overrode == r.Overrode {
+				out[n-1].End = ln
+				continue
+			}
+			out = append(out, authorship.LineAttribution{Start: ln, End: ln, Author: r.Author, Overrode: r.Overrode})
+		}
+	}
+	return out
+}
+
 func cmdAuthorship() *cobra.Command {
 	var all bool
 	c := &cobra.Command{
@@ -460,17 +483,31 @@ func cmdAuthorship() *cobra.Command {
 			if !ok {
 				return nil // not inside a work tree → nothing to report
 			}
-			// --all: every tracked file's working log for the repo (gutter + status
-			// bar + sidebar repo-wide from one source, so v2 owns them all, I4).
+			// The gutter marks only the UNCOMMITTED CHANGES, not the whole file's
+			// history: intersect each file's working-log authorship with `git diff
+			// HEAD`. After a commit those lines are no longer changed → no icon.
+			restrict := func(wl *authorship.WorkingLog) {
+				if wl == nil {
+					return
+				}
+				changed := gitnotes.UncommittedAddedLines(ctx.RepoRoot, wl.File)
+				wl.Lines = restrictLinesToChanged(wl.Lines, changed)
+			}
+
+			// --all: every tracked file's working log for the repo (sidebar aggregate).
 			if all {
 				logs, lerr := authorship.ListWorkingLogs(ctx.RepoRoot, ctx.Branch, ctx.BaseSHA)
 				if lerr != nil {
 					return lerr
 				}
+				for _, wl := range logs {
+					restrict(wl)
+				}
 				return json.NewEncoder(os.Stdout).Encode(map[string]any{"files": logs})
 			}
-			// Single file: seed from committed authorship if untracked, so the gutter
-			// reflects the whole file (committed + any uncommitted edits).
+			// Single file: seed from committed authorship if untracked (so changed
+			// lines that were authored earlier still resolve), then restrict to the
+			// uncommitted changes.
 			_ = gitnotes.SeedCommittedWorkingLog(ctx.RepoRoot, ctx.Branch, ctx.BaseSHA, ctx.RelPath)
 			wl, err := authorship.LoadWorkingLog(ctx.RepoRoot, ctx.Branch, ctx.BaseSHA, ctx.RelPath)
 			if err != nil {
@@ -479,6 +516,7 @@ func cmdAuthorship() *cobra.Command {
 			if wl == nil {
 				wl = &authorship.WorkingLog{Schema: authorship.WorkingLogSchema, File: ctx.RelPath, BaseSHA: ctx.BaseSHA}
 			}
+			restrict(wl)
 			return json.NewEncoder(os.Stdout).Encode(wl)
 		},
 	}

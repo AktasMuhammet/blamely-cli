@@ -152,3 +152,43 @@ func isHex40(s string) bool {
 	}
 	return true
 }
+
+// UncommittedAddedLines returns the post-image line numbers of relPath that differ
+// from HEAD in the working tree (`git diff HEAD`), i.e. the current uncommitted
+// CHANGES. The v2 gutter intersects working-log authorship with this set so it marks
+// only changed lines (not every committed line). Empty/no diff → empty set.
+func UncommittedAddedLines(repoPath, relPath string) map[int]bool {
+	set := map[int]bool{}
+	out, err := exec.Command("git", "-C", repoPath, "diff", "HEAD", "--unified=0", "--no-color", "--", relPath).Output()
+	if err != nil {
+		return set
+	}
+	sc := bufio.NewScanner(bytes.NewReader(out))
+	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
+		if !strings.HasPrefix(line, "@@") {
+			continue
+		}
+		// @@ -a,b +c,d @@ — collect the new-side range c..c+d-1.
+		plus := strings.Index(line, "+")
+		if plus < 0 {
+			continue
+		}
+		seg := line[plus+1:]
+		if sp := strings.IndexByte(seg, ' '); sp >= 0 {
+			seg = seg[:sp]
+		}
+		start, count := 0, 1
+		if comma := strings.IndexByte(seg, ','); comma >= 0 {
+			start, _ = strconv.Atoi(seg[:comma])
+			count, _ = strconv.Atoi(seg[comma+1:])
+		} else {
+			start, _ = strconv.Atoi(seg)
+		}
+		for i := 0; i < count; i++ {
+			set[start+i] = true
+		}
+	}
+	return set
+}
