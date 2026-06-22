@@ -862,372 +862,19 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 	const sameSecondSlackNanos = int64(5 * 1e9)
 	maxNanos := commitNanos + sameSecondSlackNanos
 
-	// Group changed lines by file so we hit the DB once per file.
-	// Also carry the line content for ContentSHA-based fallback attribution
-	// (so AI edits survive line-number drift from human edits made after apply).
-	type fileLineKey struct {
-		file    string
-		lineNum int
-	}
-	lineContent := map[fileLineKey]string{}
-	byFile := map[string][]int{}
-	for _, a := range added {
-		byFile[a.File] = append(byFile[a.File], a.LineNum)
-		if a.Content != "" {
-			lineContent[fileLineKey{a.File, a.LineNum}] = a.Content
-		}
-	}
-
-	// editsForFile / deletionEditsForFile fed the legacy content_sha matcher. With
-	// Attribution v2 the only engine (Enabled() is unconditional), the diff-based
-	// working log is the source of truth — the matcher never runs — so both return
-	// nil and added/deleted lines default Human until the v2 flip sets AI. The SQLite
-	// METADATA path (coding time, tokens, prompts, conversation) is unaffected: it
-	// uses other queries in AttributeAndWrite, not these.
-	editsForFile := func(file string) ([]store.Edit, error) { return nil, nil }
+	// The legacy content_sha matcher fed off SQLite edits; with Attribution v2 the
+	// only engine it never runs. deletionEditsForFile is kept (returns nil) because
+	// the deletion-skeleton path below still calls it; flipDeletionsToWorkingLog sets
+	// the AI deletions.
 	deletionEditsForFile := func(file string) []store.Edit { return nil }
 
+	// v2-only: lay down a Human skeleton for every added line. flipNoteToWorkingLog
+	// rewrites AI lines from the working log afterward and recomputes the added-line
+	// totals; deletions default Human and flipDeletionsToWorkingLog sets their AI.
 	resolved := make([]perLine, 0, len(added))
-	sessionEditsByFile := map[string][]store.Edit{}
-	for file, lineNos := range byFile {
-		sessionEdits, err := editsForFile(file)
-		if err != nil {
-			return nil, err
-		}
-		sessionEditsByFile[file] = sessionEdits
-
-		// Explicit clipboard pastes. The editor plugin records a paste as a
-		// copypaste edit carrying the pasted lines at their exact positions (see
-		// CompletionDetector.maybeRecordPaste). A committed line that one of those
-		// covers at its exact position, with matching content, is a human paste —
-		// even if its text duplicates AI-generated content elsewhere. We pin those
-		// lines Human and exclude them from the AI budget below, so the paste no
-		// longer steals the AI original's exact-position match (which scattered the
-		// Human label onto the wrong occurrence). Exact position only: a copypaste
-		// edit never drift-claims, so it can't mislabel AI repeats elsewhere.
-		pastedLines := map[int]bool{}
-		for i := range sessionEdits {
-			e := &sessionEdits[i]
-			if e.Tool != store.ToolCopyPaste || e.TimestampNanos <= sinceNanos || e.TimestampNanos > maxNanos {
-				continue
-			}
-			for _, l := range e.Lines {
-				if l.ContentSHA == "" {
-					continue
-				}
-				content := lineContent[fileLineKey{file, l.StartLine}]
-				if content != "" && l.ContentSHA == sha256HexStr([]byte(content)) {
-					pastedLines[l.StartLine] = true
-				}
-			}
-		}
-
-		// Drift budgets. A content_sha matched at its EXACT recorded line is always
-		// trusted as AI. The position-independent "drift" fallback (an AI line the
-		// user shifted) is RATIONED: a content may be drift-attributed to AI at
-		// most as many times as some AI edit actually recorded it, minus the
-		// committed lines already matched at their exact position. This is what
-		// keeps AI-generated REPEATS — closing braces, blank-line gaps, duplicated
-		// boilerplate — attributed AI even after the file drifts across multiple
-		// applies, while genuine human copies BEYOND what the AI produced still
-		// fall through to Human (a single recorded occurrence yields a single
-		// claim, so the original stays AI and the paste stays Human).
-		// driftBudgetNorm is the same for the whitespace-normalized (autoformatter)
-		// fallback, keyed by content_sha_norm.
-		// recordedSHA/recordedNorm = how many copies of a content the AI authored.
-		// Two kinds of edits combine differently:
-		//
-		//   - FULL re-saves (a tool persisting the whole file repeatedly — an
-		//     Antigravity conversation may store a file as both a 700-line and a
-		//     190-line version) record the same lines over and over, so we take the
-		//     MAX over them: if the busiest version had a line twice, the AI
-		//     produced two copies, and a third copy in the commit is the human's.
-		//   - NARROWED deltas (a chat/agent apply that recorded only the lines
-		//     differing from the pre-chat snapshot — see copilot_chat.go) record
-		//     DISTINCT new lines, never re-recording what an earlier apply already
-		//     covered. Those SUM: an AI line re-included unchanged by a later
-		//     narrowed apply was dropped by that apply, so without summing its
-		//     earlier recording it would lose drift budget and fall to Human.
-		//
-		// So recorded = max(full edits) + sum(narrowed deltas).
-		maxFullSHA := map[string]int{}
-		sumNarrowedSHA := map[string]int{}
-		maxFullNorm := map[string]int{}
-		sumNarrowedNorm := map[string]int{}
-		for i := range sessionEdits {
-			e := &sessionEdits[i]
-			if e.TimestampNanos <= sinceNanos || e.TimestampNanos > maxNanos || isNonAITool(e.Tool) {
-				continue
-			}
-			perEditSHA := map[string]int{}
-			perEditNorm := map[string]int{}
-			for _, l := range e.Lines {
-				if l.ContentSHA != "" {
-					perEditSHA[l.ContentSHA]++
-				}
-				if l.ContentSHANorm != "" {
-					perEditNorm[l.ContentSHANorm]++
-				}
-			}
-			if editIsNarrowed(e) {
-				for k, v := range perEditSHA {
-					sumNarrowedSHA[k] += v
-				}
-				for k, v := range perEditNorm {
-					sumNarrowedNorm[k] += v
-				}
-			} else {
-				for k, v := range perEditSHA {
-					if v > maxFullSHA[k] {
-						maxFullSHA[k] = v
-					}
-				}
-				for k, v := range perEditNorm {
-					if v > maxFullNorm[k] {
-						maxFullNorm[k] = v
-					}
-				}
-			}
-		}
-		recordedSHA := map[string]int{}
-		recordedNorm := map[string]int{}
-		for k, v := range maxFullSHA {
-			recordedSHA[k] = v
-		}
-		for k, v := range sumNarrowedSHA {
-			recordedSHA[k] += v
-		}
-		for k, v := range maxFullNorm {
-			recordedNorm[k] = v
-		}
-		for k, v := range sumNarrowedNorm {
-			recordedNorm[k] += v
-		}
-		// Per-edit occurrence counts, so the drift fallback can distribute identical
-		// content across the edits that recorded it (e.g. a chat that wrote 5 copies
-		// of a line and a later completion that wrote 1) instead of letting the
-		// newest edit claim them all. usedPerEdit is seeded by the exact pass below
-		// so an occurrence consumed at its exact position isn't reused via drift.
-		recPerEdit := map[int64]map[string]int{}
-		recPerEditNorm := map[int64]map[string]int{}
-		for i := range sessionEdits {
-			e := &sessionEdits[i]
-			if e.TimestampNanos <= sinceNanos || e.TimestampNanos > maxNanos || isNonAITool(e.Tool) {
-				continue
-			}
-			for _, l := range e.Lines {
-				if l.ContentSHA != "" {
-					if recPerEdit[e.ID] == nil {
-						recPerEdit[e.ID] = map[string]int{}
-					}
-					recPerEdit[e.ID][l.ContentSHA]++
-				}
-				if l.ContentSHANorm != "" {
-					if recPerEditNorm[e.ID] == nil {
-						recPerEditNorm[e.ID] = map[string]int{}
-					}
-					recPerEditNorm[e.ID][l.ContentSHANorm]++
-				}
-			}
-		}
-		usedPerEdit := map[int64]map[string]int{}
-		usedPerEditNorm := map[int64]map[string]int{}
-		bumpUsed := func(m map[int64]map[string]int, id int64, key string) {
-			if m[id] == nil {
-				m[id] = map[string]int{}
-			}
-			m[id][key]++
-		}
-
-		exactSHA := map[string]int{}  // committed lines matched at their exact recorded position
-		exactNorm := map[string]int{} // ditto, normalized
-		for _, ln := range lineNos {
-			if pastedLines[ln] {
-				continue // explicit human paste — not an AI line, must not consume budget
-			}
-			content := lineContent[fileLineKey{file, ln}]
-			if content == "" {
-				continue
-			}
-			shaWant := sha256HexStr([]byte(content))
-			normWant := sha256HexNormStr(content)
-			for i := range sessionEdits {
-				e := &sessionEdits[i]
-				if e.TimestampNanos <= sinceNanos || e.TimestampNanos > maxNanos || isNonAITool(e.Tool) {
-					continue
-				}
-				if coversContentSHA(e.Lines, content, ln) {
-					exactSHA[shaWant]++
-					bumpUsed(usedPerEdit, e.ID, shaWant)
-					break
-				}
-			}
-			if normWant != "" {
-				for i := range sessionEdits {
-					e := &sessionEdits[i]
-					if e.TimestampNanos <= sinceNanos || e.TimestampNanos > maxNanos || isNonAITool(e.Tool) {
-						continue
-					}
-					if coversContentSHANorm(e.Lines, content, ln) {
-						exactNorm[normWant]++
-						bumpUsed(usedPerEditNorm, e.ID, normWant)
-						break
-					}
-				}
-			}
-		}
-		driftBudget := map[string]int{}
-		for sha, rec := range recordedSHA {
-			if b := rec - exactSHA[sha]; b > 0 {
-				driftBudget[sha] = b
-			}
-		}
-		driftBudgetNorm := map[string]int{}
-		for n, rec := range recordedNorm {
-			if b := rec - exactNorm[n]; b > 0 {
-				driftBudgetNorm[n] = b
-			}
-		}
-		driftUsed := map[string]int{}
-		driftUsedNorm := map[string]int{}
-
-		// Copypaste budget. Within a RUN of identical lines, git anchors the
-		// inserted block at the EARLIEST position, which need not coincide
-		// line-for-line with where the editor recorded the paste (e.g. the user
-		// pastes 4 copies at L16–L19 but git reports the added block as L15–L18,
-		// calling the user's L19 "unchanged" and inventing a "new" L15). The
-		// exact-position pin above (pastedLines) then misses the boundary line.
-		// Beyond those pins, allow a content to be claimed for copypaste as many
-		// times as a copypaste edit recorded it, minus the copies already pinned
-		// at their exact position — so the pasted COUNT is preserved regardless of
-		// which identical copy git happened to label "new". MAX over paste edits
-		// (re-records of the same paste don't add copies). Consumed before the AI
-		// drift fallback so an AI repeat generated AFTER the paste can't steal the
-		// pasted line.
-		pasteRecordedSHA := map[string]int{}
-		for i := range sessionEdits {
-			e := &sessionEdits[i]
-			if e.Tool != store.ToolCopyPaste || e.TimestampNanos <= sinceNanos || e.TimestampNanos > maxNanos {
-				continue
-			}
-			perEdit := map[string]int{}
-			for _, l := range e.Lines {
-				if l.ContentSHA != "" {
-					perEdit[l.ContentSHA]++
-				}
-			}
-			for k, v := range perEdit {
-				if v > pasteRecordedSHA[k] {
-					pasteRecordedSHA[k] = v
-				}
-			}
-		}
-		pasteExactSHA := map[string]int{}
-		for _, ln := range lineNos {
-			if !pastedLines[ln] {
-				continue
-			}
-			if c := lineContent[fileLineKey{file, ln}]; c != "" {
-				pasteExactSHA[sha256HexStr([]byte(c))]++
-			}
-		}
-		pasteBudget := map[string]int{}
-		for sha, rec := range pasteRecordedSHA {
-			if b := rec - pasteExactSHA[sha]; b > 0 {
-				pasteBudget[sha] = b
-			}
-		}
-		pasteUsed := map[string]int{}
-
-		for _, ln := range lineNos {
-			// Default: human-typed code. tool="" + gen_type=human is the
-			// canonical representation; humans aren't a tool.
-			content := lineContent[fileLineKey{file, ln}]
-			p := perLine{file: file, line: ln, content: content, tool: "", genType: store.GenTypeHuman}
-			// Explicit clipboard paste: keep Human, skip AI matching entirely so the
-			// pasted line isn't claimed by a content match to AI code elsewhere.
-			// Label it with the copypaste tool (still Human in the AI/Human split)
-			// so the note distinguishes pasted code from typed code instead of
-			// collapsing both into bare Human.
-			if pastedLines[ln] {
-				p.tool = store.ToolCopyPaste
-				resolved = append(resolved, p)
-				continue
-			}
-			// Primary: a session edit covering this line by range OR content_sha
-			// (content_sha must be at this exact line), bounded by the previous
-			// commit (intra-session separator).
-			e := pickEdit(sessionEdits, ln, content, sinceNanos, maxNanos, true, false)
-			// AI drift fallback, rationed by driftBudget. Fires when nothing matched
-			// OR only a human row matched (the AI is the real author of content it
-			// recorded — the human merely shifted the line). The budget means an AI
-			// line that drifted to a new position stays AI, including duplicated
-			// content (braces, blank-line gaps), while a human copy beyond what the
-			// AI produced stays Human.
-			if content != "" && (e == nil || isNonAITool(e.Tool)) {
-				shaKey := sha256HexStr([]byte(content))
-				// Copypaste budget (see above): a git-added line whose content was
-				// pasted, but which git anchored off the exact paste position, is
-				// claimed for copypaste here — before AI drift, so an AI repeat of
-				// the same content can't steal it. Still Human in the AI/Human split.
-				if pasteUsed[shaKey] < pasteBudget[shaKey] {
-					pasteUsed[shaKey]++
-					p.tool = store.ToolCopyPaste
-					p.genType = store.GenTypeHuman
-					resolved = append(resolved, p)
-					continue
-				}
-				if driftUsed[shaKey] < driftBudget[shaKey] {
-					if ai := pickDriftEdit(sessionEdits, content, sinceNanos, maxNanos, false, recPerEdit, usedPerEdit); ai != nil {
-						e = ai
-						driftUsed[shaKey]++
-						// Mirror the per-edit norm budget so the same recorded line
-						// can't also be claimed via the normalized drift below.
-						bumpUsed(usedPerEditNorm, ai.ID, sha256HexNormStr(content))
-						// An exact-sha drift also consumes the line's NORMALIZED
-						// budget: the two drift budgets count the same AI
-						// recordings (every exact line has a norm), so without
-						// this a content the AI wrote once could be claimed twice —
-						// once here, once via the norm fallback below — letting a
-						// human's exact duplicate of an AI line read as AI.
-						driftUsedNorm[sha256HexNormStr(content)]++
-					}
-				}
-			}
-			if e == nil && content != "" {
-				// Normalized fallback: an autoformatter reflowed this line's
-				// whitespace (reindent, trailing-whitespace, tabs/spaces) after the
-				// AI wrote it, so its exact content_sha no longer matches but its
-				// whitespace-collapsed content_sha_norm still does. Try this line's
-				// own position first, then a budgeted drift, mirroring the exact-hash
-				// fallback above.
-				e = pickEdit(sessionEdits, ln, content, sinceNanos, maxNanos, true, true)
-				if e == nil {
-					normKey := sha256HexNormStr(content)
-					if driftUsedNorm[normKey] < driftBudgetNorm[normKey] {
-						if ai := pickDriftEdit(sessionEdits, content, sinceNanos, maxNanos, true, recPerEditNorm, usedPerEditNorm); ai != nil {
-							e = ai
-							driftUsedNorm[normKey]++
-						}
-					}
-				}
-			}
-			if e != nil {
-				// Normalise legacy rows: tool="human" pre-dates the split.
-				if e.Tool == store.ToolHuman {
-					p.tool, p.genType = "", store.GenTypeHuman
-				} else {
-					p.tool, p.genType = e.Tool, e.GenType
-				}
-				if e.Model.Valid {
-					p.model = e.Model.String
-				}
-				p.edit = e
-			}
-			resolved = append(resolved, p)
-		}
+	for _, a := range added {
+		resolved = append(resolved, perLine{file: a.File, line: a.LineNum, content: a.Content, tool: "", genType: store.GenTypeHuman})
 	}
-
 	sort.Slice(resolved, func(i, j int) bool {
 		if resolved[i].file != resolved[j].file {
 			return resolved[i].file < resolved[j].file
@@ -1881,51 +1528,6 @@ func bumpGenType(by *ByGenType, gt store.GenType) {
 // When useNorm is true, coversLine is never consulted: position-only matches
 // (edits without a content_sha at all) are already covered by the non-norm
 // primary call, so re-checking them here would just duplicate that result.
-func pickEdit(edits []store.Edit, ln int, content string, minNanos, maxNanos int64, allowLineMatch, useNorm bool) *store.Edit {
-	// When a human edit and an AI edit both match a line by IDENTICAL content_sha,
-	// the AI authored that text — the human only shifted it (e.g. inserting lines
-	// above an AI block pushes it down, and the human-edit watcher re-records the
-	// moved lines at their new positions under a newer human row). Without this
-	// preference the newer human row, encountered first in time-desc order, would
-	// steal those lines and flip AI→Human in the committed note even though the
-	// gutter (which resolves live against the AI edit's sha) shows them correctly.
-	// So: take the first AI/tool match immediately; remember the first human match
-	// only as a fallback for lines no AI edit matches. A genuine human OVERRIDE is
-	// unaffected — there the human changes the line, so its content_sha differs
-	// from the AI's and no AI edit matches at all.
-	var humanFallback *store.Edit
-	for i := range edits {
-		e := &edits[i]
-		if e.TimestampNanos <= minNanos || e.TimestampNanos > maxNanos {
-			continue
-		}
-		// Session scope: content-SHA must also be at the recorded line so a
-		// human copy-paste of AI lines doesn't get attributed as AI. Cross-session
-		// fallback (allowLineMatch=false, e.g. cherry-pick) skips the line check
-		// because line numbers legitimately differ after rebase/squash.
-		shaLn := 0
-		if allowLineMatch {
-			shaLn = ln
-		}
-		var matched bool
-		if useNorm {
-			matched = coversContentSHANorm(e.Lines, content, shaLn)
-		} else {
-			matched = coversContentSHA(e.Lines, content, shaLn) || (allowLineMatch && coversLine(e.Lines, ln))
-		}
-		if !matched {
-			continue
-		}
-		if isNonAITool(e.Tool) {
-			if humanFallback == nil {
-				humanFallback = e
-			}
-			continue
-		}
-		return e
-	}
-	return humanFallback
-}
 
 // pickDriftEdit chooses the AI edit for a line whose content matches a recorded
 // AI line but at a DIFFERENT position (drift). Unlike pickEdit it ignores line
@@ -1936,39 +1538,6 @@ func pickEdit(edits []store.Edit, ln int, content string, minNanos, maxNanos int
 // recorded count instead of all going to the newest edit. Falls back to the
 // newest match when every edit's budget is spent (so a line is still attributed
 // rather than dropped). rec/used are keyed by edit ID then content hash.
-func pickDriftEdit(edits []store.Edit, content string, minNanos, maxNanos int64, useNorm bool, rec, used map[int64]map[string]int) *store.Edit {
-	key := sha256HexStr([]byte(content))
-	if useNorm {
-		key = sha256HexNormStr(content)
-	}
-	var fallback *store.Edit
-	for i := range edits {
-		e := &edits[i]
-		if e.TimestampNanos <= minNanos || e.TimestampNanos > maxNanos || isNonAITool(e.Tool) {
-			continue
-		}
-		var matched bool
-		if useNorm {
-			matched = coversContentSHANorm(e.Lines, content, 0)
-		} else {
-			matched = coversContentSHA(e.Lines, content, 0)
-		}
-		if !matched {
-			continue
-		}
-		if fallback == nil {
-			fallback = e
-		}
-		if used[e.ID][key] < rec[e.ID][key] {
-			if used[e.ID] == nil {
-				used[e.ID] = map[string]int{}
-			}
-			used[e.ID][key]++
-			return e
-		}
-	}
-	return fallback
-}
 
 // coversLine reports whether any edit line covers post-image line n BY POSITION.
 // Lines that carry a ContentSHA are skipped here on purpose: their content is
@@ -1995,22 +1564,6 @@ func coversLine(lines []store.EditLine, n int) bool {
 // line must also have StartLine == ln, so a human copy-paste of AI-generated
 // content at a different position is not mis-attributed. Pass ln = 0 for the
 // cross-session fallback (cherry-pick/squash) where line numbers may differ.
-func coversContentSHA(lines []store.EditLine, content string, ln int) bool {
-	if content == "" {
-		return false
-	}
-	want := sha256HexStr([]byte(content))
-	for _, l := range lines {
-		if l.ContentSHA == "" || l.ContentSHA != want {
-			continue
-		}
-		if ln > 0 && l.StartLine != ln {
-			continue
-		}
-		return true
-	}
-	return false
-}
 
 // coversContentSHANorm is coversContentSHA's fallback for the
 // whitespace-normalized hash: it matches a line whose exact bytes changed
@@ -2018,22 +1571,6 @@ func coversContentSHA(lines []store.EditLine, content string, ln int) bool {
 // commas, or adjusted spacing) but whose collapsed-whitespace text still
 // matches the AI-recorded line. Same ln=0 cross-session/drift convention as
 // coversContentSHA.
-func coversContentSHANorm(lines []store.EditLine, content string, ln int) bool {
-	want := sha256HexNormStr(content)
-	if want == "" {
-		return false
-	}
-	for _, l := range lines {
-		if l.ContentSHANorm == "" || l.ContentSHANorm != want {
-			continue
-		}
-		if ln > 0 && l.StartLine != ln {
-			continue
-		}
-		return true
-	}
-	return false
-}
 
 // editIsNarrowed reports whether an edit was recorded as a NARROWED delta
 // (it captured only the lines that differ from a pre-chat snapshot, rather than
@@ -2042,18 +1579,6 @@ func coversContentSHANorm(lines []store.EditLine, content string, ln int) bool {
 // drift budget sums them across edits instead of taking the max. A missing or
 // false flag (every non-chat tool, and chat applies with no fresh snapshot)
 // means a full recording, which is max'd.
-func editIsNarrowed(e *store.Edit) bool {
-	if e == nil || !e.RawMeta.Valid || e.RawMeta.String == "" {
-		return false
-	}
-	var meta struct {
-		Narrowed bool `json:"narrowed"`
-	}
-	if err := json.Unmarshal([]byte(e.RawMeta.String), &meta); err != nil {
-		return false
-	}
-	return meta.Narrowed
-}
 
 func confidenceFor(tool store.Tool, e *store.Edit) store.Confidence {
 	if e != nil {
