@@ -2,30 +2,10 @@ package gitnotes
 
 import (
 	"database/sql"
-	"path/filepath"
 	"testing"
 
 	"github.com/blamely/blamely/internal/store"
 )
-
-// expandLines flattens collapsed RangeEntry ranges back into one LineEntry per
-// line so per-line test assertions stay meaningful after range collapsing.
-func expandLines(f FileEntry) []LineEntry {
-	var out []LineEntry
-	for _, r := range f.Lines {
-		for ln := r.Start; ln <= r.End; ln++ {
-			out = append(out, LineEntry{
-				Line:       ln,
-				Type:       r.Type,
-				AuthorType: r.AuthorType,
-				Tool:       r.Tool,
-				Model:      r.Model,
-				GenType:    r.GenType,
-			})
-		}
-	}
-	return out
-}
 
 // ---- coversLine ----
 
@@ -66,52 +46,6 @@ func TestCoversLine_MultipleRanges(t *testing.T) {
 func TestCoversLine_Empty(t *testing.T) {
 	if coversLine(nil, 1) {
 		t.Error("empty lines should cover nothing")
-	}
-}
-
-// ---- mergeEditsByTimeDesc ----
-
-func makeEdit(ts int64) store.Edit {
-	return store.Edit{TimestampNanos: ts}
-}
-
-func TestMergeEditsByTimeDesc_BothSorted(t *testing.T) {
-	a := []store.Edit{makeEdit(100), makeEdit(60)}
-	b := []store.Edit{makeEdit(80), makeEdit(40)}
-	got := mergeEditsByTimeDesc(a, b)
-	want := []int64{100, 80, 60, 40}
-	if len(got) != len(want) {
-		t.Fatalf("len: want %d, got %d", len(want), len(got))
-	}
-	for i, e := range got {
-		if e.TimestampNanos != want[i] {
-			t.Errorf("index %d: want %d, got %d", i, want[i], e.TimestampNanos)
-		}
-	}
-}
-
-func TestMergeEditsByTimeDesc_OneEmpty(t *testing.T) {
-	a := []store.Edit{makeEdit(10), makeEdit(5)}
-	got := mergeEditsByTimeDesc(a, nil)
-	if len(got) != 2 || got[0].TimestampNanos != 10 {
-		t.Errorf("expected unchanged a, got %v", got)
-	}
-}
-
-func TestMergeEditsByTimeDesc_BothEmpty(t *testing.T) {
-	got := mergeEditsByTimeDesc(nil, nil)
-	if len(got) != 0 {
-		t.Errorf("expected empty, got %v", got)
-	}
-}
-
-func TestMergeEditsByTimeDesc_TieBreak(t *testing.T) {
-	// Same timestamp — order between the two is stable (a before b).
-	a := []store.Edit{makeEdit(50)}
-	b := []store.Edit{makeEdit(50)}
-	got := mergeEditsByTimeDesc(a, b)
-	if len(got) != 2 {
-		t.Fatalf("expected 2, got %d", len(got))
 	}
 }
 
@@ -170,16 +104,6 @@ func TestNullInt64(t *testing.T) {
 }
 
 // ---- buildNote: per-line shape, deletions, suggested vs accepted, zero by_tool ----
-
-func openTestDB(t *testing.T) *store.DB {
-	t.Helper()
-	db, err := store.OpenAt(filepath.Join(t.TempDir(), "test.sqlite"))
-	if err != nil {
-		t.Fatalf("OpenAt: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-	return db
-}
 
 func TestCollapseToRanges(t *testing.T) {
 	chat := "chat"

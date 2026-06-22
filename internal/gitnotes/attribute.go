@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/blamely/blamely/internal/authorship"
 	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/daemon"
 	"github.com/blamely/blamely/internal/gitutil"
@@ -844,20 +843,9 @@ type moveAttr struct {
 }
 
 func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []AddedLine, deleted map[string][]DeletedLine, renames map[string]string, fileChanges map[string]FileChangeType) (*Note, error) {
-	// Scope AI edits by WORK SESSION (branch + HEAD-at-edit-time), not by a
-	// timestamp window. At commit time the session is the one keyed by this
-	// commit's parent — the HEAD tip while those edits were being made.
-	branch := gitutil.BranchName(repoPath)
+	// baseSHA = the commit's parent (HEAD while the edits were made) — the key the
+	// v2 working-log flip reads.
 	baseSHA := gitutil.ParentCommitSHA(repoPath, sha)
-	// sessionID is "" when the branch is unresolvable (detached HEAD / not a
-	// repo). EditsForFileInSession still pulls session_id IS NULL rows, which is
-	// where detached/legacy edits live, so they attribute by line as before.
-	var sessionID string
-	if branch != "" {
-		if id, err := db.ResolveSession(repoPath, branch, baseSHA); err == nil {
-			sessionID = id
-		}
-	}
 
 	// Intra-session lower bound: an edit already consumed by an earlier commit on
 	// this branch must not re-claim a line in a later commit (sessions can span
@@ -890,70 +878,14 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		}
 	}
 
-	// editsForFile pulls the current-session edits for a file. Content-sha
-	// matching (both exact and drift fallback) is scoped to THIS session only:
-	// AI-generated content from a previous session that a human copy-pastes
-	// into the current session's commit must attribute as Human.
-	editsForFile := func(file string) (sessionEdits []store.Edit, err error) {
-		// Phase 6: when Attribution v2 is on (default), the diff-based working log is
-		// the attribution source — skip the legacy content_sha matcher entirely so
-		// added lines default Human and the v2 flip sets AI. SQLite-backed METADATA
-		// (coding time, tokens, prompts) below is unaffected: it uses other queries.
-		if authorship.Enabled() {
-			return nil, nil
-		}
-		if sessionEdits, err = db.EditsForFileInSession(repoPath, file, sessionID); err != nil {
-			return nil, err
-		}
-		// Destination of a rename: also pull edits recorded under the old name
-		// so `git mv` doesn't lose history.
-		if from, ok := renames[file]; ok && from != "" {
-			if old, err := db.EditsForFileInSession(repoPath, from, sessionID); err == nil {
-				sessionEdits = mergeEditsByTimeDesc(sessionEdits, old)
-			}
-		}
-		return sessionEdits, nil
-	}
-
-	// deletionEditsForFile pulls candidate edits for DELETION attribution across
-	// ALL sessions on this branch (not just the commit's session). An AI tool
-	// often removes content in one work-session, but the human stages and commits
-	// that deletion in a later session under a different HEAD — strict session
-	// scoping (correct for added lines, to keep human copy-paste of old AI code
-	// Human) would mislabel that genuine AI deletion as Human. The removal is
-	// still matched by exact content_sha with a consume-once budget, so each
-	// recorded AI removal credits at most one committed deletion.
-	delEditsByFile := map[string][]store.Edit{}
-	deletionEditsForFile := func(file string) []store.Edit {
-		// Phase 6: v2 deletion log (flipDeletionsToWorkingLog) is the deletion
-		// attribution source when v2 is on; skip the legacy content_sha deletion matcher.
-		if authorship.Enabled() {
-			return nil
-		}
-		if cached, ok := delEditsByFile[file]; ok {
-			return cached
-		}
-		// When the branch is unresolvable (detached HEAD / not a git repo), we
-		// can't branch-scope, so fall back to ALL edits for the file — mirroring
-		// how the add-path pulls session_id IS NULL rows in that situation.
-		pull := func(f string) ([]store.Edit, error) {
-			if branch == "" {
-				return db.EditsForFileAny(repoPath, f)
-			}
-			return db.EditsForFileOnBranch(repoPath, f, branch)
-		}
-		edits, err := pull(file)
-		if err != nil {
-			edits = nil
-		}
-		if from, ok := renames[file]; ok && from != "" {
-			if old, err := pull(from); err == nil {
-				edits = mergeEditsByTimeDesc(edits, old)
-			}
-		}
-		delEditsByFile[file] = edits
-		return edits
-	}
+	// editsForFile / deletionEditsForFile fed the legacy content_sha matcher. With
+	// Attribution v2 the only engine (Enabled() is unconditional), the diff-based
+	// working log is the source of truth — the matcher never runs — so both return
+	// nil and added/deleted lines default Human until the v2 flip sets AI. The SQLite
+	// METADATA path (coding time, tokens, prompts, conversation) is unaffected: it
+	// uses other queries in AttributeAndWrite, not these.
+	editsForFile := func(file string) ([]store.Edit, error) { return nil, nil }
+	deletionEditsForFile := func(file string) []store.Edit { return nil }
 
 	resolved := make([]perLine, 0, len(added))
 	sessionEditsByFile := map[string][]store.Edit{}
@@ -1234,6 +1166,7 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			// AI produced stays Human.
 			if content != "" && (e == nil || isNonAITool(e.Tool)) {
 				shaKey := sha256HexStr([]byte(content))
+				// Copypaste budget (see above): a git-added line whose content was
 				// pasted, but which git anchored off the exact paste position, is
 				// claimed for copypaste here — before AI drift, so an AI repeat of
 				// the same content can't steal it. Still Human in the AI/Human split.
@@ -1635,27 +1568,6 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 	note.Totals.HumanDeletedLines = note.Totals.DeletedLines - note.Totals.AIDeletedLines
 
 	return note, nil
-}
-
-// mergeEditsByTimeDesc merges two slices of edits already sorted newest-first
-// into one slice in the same order. Used to fold edits recorded under a
-// pre-rename path into the per-file query without losing the newest-wins
-// semantics the join relies on.
-func mergeEditsByTimeDesc(a, b []store.Edit) []store.Edit {
-	out := make([]store.Edit, 0, len(a)+len(b))
-	i, j := 0, 0
-	for i < len(a) && j < len(b) {
-		if a[i].TimestampNanos >= b[j].TimestampNanos {
-			out = append(out, a[i])
-			i++
-		} else {
-			out = append(out, b[j])
-			j++
-		}
-	}
-	out = append(out, a[i:]...)
-	out = append(out, b[j:]...)
-	return out
 }
 
 // removedHashMultisets builds, per edit, "remaining" multisets of the
@@ -2210,12 +2122,6 @@ func isNonAITool(t store.Tool) bool {
 	return t == "" || t == store.ToolHuman || t == store.ToolCopyPaste
 }
 func equalStrPtr(a, b *string) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	return *a == *b
-}
-func equalInt64Ptr(a, b *int64) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
