@@ -20,10 +20,10 @@ import (
 //
 // Add (empty baseline → all `author`), edit (diff), and delete (lines vanish) all
 // fall out of the same alignment. Reflow (whitespace-only changes) is handled by
-// the normalized comparison in alignLines (Phase 4): a reindented/reformatted line
-// keeps its prior author. Move detection is still layered in later (§8); a moved
-// line is currently treated as changed → `author`, which is safe (it's a real
-// edit) and never mislabels an in-place human line.
+// the normalized comparison in alignLines, and MOVE detection (Phase 4) carries a
+// relocated line's prior author to its new position: a block moved by an AI edit
+// stays Human (moving code is not authoring it). Genuine adds/changes still go to
+// `author`.
 //
 // nowMS is injected (not time.Now()) so callers/tests are deterministic; pass 0
 // to stamp with the wall clock.
@@ -33,12 +33,18 @@ func Attribute(prior *WorkingLog, baseline, newContent string, author Author, no
 
 	// matchedOld[i] = index into oldLines that new line i is unchanged from, or -1.
 	matchedOld := alignLines(oldLines, newLines)
+	// movedFrom[i] = index into oldLines that new line i was MOVED from (an
+	// unmatched old line of identical content relocated), or -1.
+	movedFrom := detectMoves(oldLines, newLines, matchedOld)
 
 	perLine := make([]Author, len(newLines))
 	for i := range newLines {
 		if j := matchedOld[i]; j >= 0 {
 			// Unchanged line: carry the prior author (old line j+1, 1-based).
 			perLine[i] = priorAuthorOr(prior, j+1)
+		} else if mf := movedFrom[i]; mf >= 0 {
+			// Moved line: carry the prior author from its old position.
+			perLine[i] = priorAuthorOr(prior, mf+1)
 		} else {
 			perLine[i] = author
 		}
@@ -47,7 +53,7 @@ func Attribute(prior *WorkingLog, baseline, newContent string, author Author, no
 	// overrode[i] records the author a CHANGED line replaced, when its type differs
 	// from the new author (a human rewriting AI code, or vice-versa) — an audit
 	// marker, not a change to who owns the line now.
-	overrode := detectOverrode(prior, matchedOld, len(oldLines), author)
+	overrode := detectOverrode(prior, matchedOld, movedFrom, len(oldLines), author)
 
 	if nowMS == 0 {
 		nowMS = time.Now().UnixMilli()
@@ -67,15 +73,59 @@ func Attribute(prior *WorkingLog, baseline, newContent string, author Author, no
 	}
 }
 
+// detectMoves pairs each unmatched NEW line with an unmatched OLD line of identical
+// (whitespace-normalized) content — a relocated line. Matching is FIFO by content
+// (first available old line of that content), which is deterministic and identical
+// across the Go, TS, and Kotlin ports. LCS-matched lines are never moves; a new
+// line with no surviving deleted twin is a genuine add (movedFrom = -1).
+func detectMoves(oldLines, newLines []string, matchedOld []int) []int {
+	moved := make([]int, len(newLines))
+	for i := range moved {
+		moved[i] = -1
+	}
+	oldMatched := make([]bool, len(oldLines))
+	for _, j := range matchedOld {
+		if j >= 0 {
+			oldMatched[j] = true
+		}
+	}
+	oldN := normalizeLinesForMatch(oldLines)
+	newN := normalizeLinesForMatch(newLines)
+	// queues[content] = unmatched old indices with that normalized content, in order.
+	queues := make(map[string][]int)
+	for oi := range oldLines {
+		if !oldMatched[oi] {
+			queues[oldN[oi]] = append(queues[oldN[oi]], oi)
+		}
+	}
+	for ni := range newLines {
+		if matchedOld[ni] >= 0 {
+			continue
+		}
+		q := queues[newN[ni]]
+		if len(q) > 0 {
+			moved[ni] = q[0]
+			queues[newN[ni]] = q[1:]
+		}
+	}
+	return moved
+}
+
 // detectOverrode finds replace pairs and, for each changed NEW line whose replaced
 // OLD line had a different-type author, records that prior author. It walks the LCS
-// alignment gap by gap (unmatched old lines [oldCursor,gapOldEnd) vs unmatched new
-// lines [i,gapNewEnd)) and pairs them positionally — deterministic and identical
-// across the Go, TS, and Kotlin ports (the golden vectors enforce it). Pure inserts
-// (empty old side of the gap) and pure deletes never produce an override.
-func detectOverrode(prior *WorkingLog, matchedOld []int, nOld int, author Author) []*Author {
+// alignment gap by gap and pairs, positionally, the NEW lines that are neither
+// matched nor moved against the OLD lines not consumed by a move — deterministic
+// and identical across the Go, TS, and Kotlin ports. Pure inserts, pure deletes,
+// and moves never produce an override.
+func detectOverrode(prior *WorkingLog, matchedOld, movedFrom []int, nOld int, author Author) []*Author {
 	m := len(matchedOld)
 	overrode := make([]*Author, m)
+	consumedOld := make([]bool, nOld)
+	for _, mf := range movedFrom {
+		if mf >= 0 {
+			consumedOld[mf] = true
+		}
+	}
 	oldCursor := 0
 	i := 0
 	for i < m {
@@ -92,11 +142,23 @@ func detectOverrode(prior *WorkingLog, matchedOld []int, nOld int, author Author
 		if gapNewEnd < m {
 			gapOldEnd = matchedOld[gapNewEnd]
 		}
-		for k := 0; i+k < gapNewEnd && oldCursor+k < gapOldEnd; k++ {
-			replaced := priorAuthorOr(prior, oldCursor+k+1)
+		// Pair the gap's non-moved new lines with its non-consumed old lines.
+		var newAvail, oldAvail []int
+		for ni := i; ni < gapNewEnd; ni++ {
+			if movedFrom[ni] < 0 {
+				newAvail = append(newAvail, ni)
+			}
+		}
+		for oi := oldCursor; oi < gapOldEnd; oi++ {
+			if !consumedOld[oi] {
+				oldAvail = append(oldAvail, oi)
+			}
+		}
+		for k := 0; k < len(newAvail) && k < len(oldAvail); k++ {
+			replaced := priorAuthorOr(prior, oldAvail[k]+1)
 			if replaced.Type != author.Type {
 				p := replaced
-				overrode[i+k] = &p
+				overrode[newAvail[k]] = &p
 			}
 		}
 		oldCursor = gapOldEnd
