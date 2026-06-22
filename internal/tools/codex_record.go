@@ -33,6 +33,9 @@ func RecordCodexFromStdin(r io.Reader) error {
 		log.Printf("blamely record codex: parse hook payload: %v", err)
 		return nil
 	}
+	// gen_type from the session's surface: the VS Code chat panel reports "chat",
+	// the terminal CLI "cli" (see ReadCodexGenType / codexGenType).
+	gt := ReadCodexGenType(p.TranscriptPath)
 
 	// A single apply_patch can add/update some files and DELETE others. The
 	// `*** Delete File:` directives produce no edit range, so handle them up
@@ -44,7 +47,7 @@ func RecordCodexFromStdin(r io.Reader) error {
 		if !filepath.IsAbs(abs) && p.Cwd != "" {
 			abs = filepath.Join(p.Cwd, dp)
 		}
-		if err := recordToolDeletionPath(abs, p.Cwd, "codex", "cli", p.Model, p.SessionID, p.TranscriptPath, "codex_delete"); err != nil {
+		if err := recordToolDeletionPath(abs, p.Cwd, "codex", gt, p.Model, p.SessionID, p.TranscriptPath, "codex_delete"); err != nil {
 			return err
 		}
 	}
@@ -57,7 +60,7 @@ func RecordCodexFromStdin(r io.Reader) error {
 		// its deletions above (avoids recording the same removal twice).
 		if len(deletedViaPatch) == 0 && looksLikePatch(strings.ToLower(p.ToolName)) {
 			if root := findRepoRoot(p.Cwd, p.Cwd); root != "" {
-				return recordShellDeletions(root, shellCommandFromInput(p.ToolInput), "codex", "cli", p.Model, p.SessionID, p.TranscriptPath, "codex_shell_delete")
+				return recordShellDeletions(root, shellCommandFromInput(p.ToolInput), "codex", gt, p.Model, p.SessionID, p.TranscriptPath, "codex_shell_delete")
 			}
 		}
 		return nil
@@ -90,7 +93,7 @@ func RecordCodexFromStdin(r io.Reader) error {
 	payload := daemon.EditPayload{
 		Tool:           "codex",
 		Confidence:     "high",
-		GenType:        "cli",
+		GenType:        gt,
 		RepoPath:       repoPath,
 		FilePath:       rel,
 		Model:          p.Model,
@@ -107,7 +110,7 @@ func RecordCodexFromStdin(r io.Reader) error {
 	})
 	// Attribution: mirror into the working log before the
 	// daemon POST so capture is daemon-independent. No-op when the flag is off.
-	captureAuthorship(repoPath, rel, "codex", "cli", payload.Model)
+	captureAuthorship(repoPath, rel, "codex", gt, payload.Model)
 	return postToDaemon(payload)
 }
 

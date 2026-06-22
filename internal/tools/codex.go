@@ -208,8 +208,67 @@ func tailCodexSession(ctx context.Context, path string, sink daemon.Sink, db *st
 // when usage arrives (or on shutdown).
 type codexState struct {
 	model   string
+	genType string // resolved from session_meta (chat for IDE surfaces, else cli)
 	pending []daemon.Event
 	sink    daemon.Sink
+}
+
+// gen returns the session's gen_type, defaulting to "cli" until a session_meta
+// line resolves the surface (older flat-format logs carry no session_meta).
+func (st *codexState) gen() string {
+	if st.genType != "" {
+		return st.genType
+	}
+	return "cli"
+}
+
+// codexGenType maps a Codex session's originator/source to a gen_type. An IDE
+// surface — the VS Code chat panel (originator "codex_vscode" / source "vscode"),
+// JetBrains, etc. — is a conversational panel → "chat"; the terminal CLI → "cli".
+// Unknown surfaces default to "cli" (Codex's historical assumption).
+func codexGenType(originator, source string) string {
+	s := strings.ToLower(originator + " " + source)
+	switch {
+	case strings.Contains(s, "vscode"), strings.Contains(s, "vs code"),
+		strings.Contains(s, "intellij"), strings.Contains(s, "jetbrains"),
+		strings.Contains(s, "ide"), strings.Contains(s, "extension"):
+		return "chat"
+	}
+	return "cli"
+}
+
+// ReadCodexGenType resolves a Codex session transcript's gen_type from its
+// session_meta line (originator/source). Used by the PostToolUse hook path, which
+// has only a transcript path. Returns "cli" when unreadable or unrecognized.
+func ReadCodexGenType(path string) string {
+	if path == "" {
+		return "cli"
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "cli"
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for sc.Scan() {
+		if !strings.Contains(sc.Text(), "session_meta") {
+			continue
+		}
+		var env codexWrappedLine
+		if json.Unmarshal(sc.Bytes(), &env) != nil || env.Type != "session_meta" {
+			continue
+		}
+		var p struct {
+			Originator string `json:"originator"`
+			Source     string `json:"source"`
+		}
+		if json.Unmarshal(env.Payload, &p) == nil {
+			return codexGenType(p.Originator, p.Source)
+		}
+		return "cli"
+	}
+	return "cli"
 }
 
 // flush sets token fields (if provided) on every pending event and writes
@@ -333,7 +392,7 @@ func processCodexLine(raw []byte, st *codexState) {
 				When:       when,
 				Tool:       "codex",
 				Confidence: "high",
-				GenType:    "cli", // Codex is always invoked from the command line
+				GenType:    st.gen(),
 				RepoPath:   repo,
 				FilePath:   rel,
 				Model:      st.model,
@@ -366,6 +425,14 @@ func processCodexWrappedLine(env *codexWrappedLine, st *codexState) {
 		when = time.Now()
 	}
 	switch env.Type {
+	case "session_meta":
+		var p struct {
+			Originator string `json:"originator"`
+			Source     string `json:"source"`
+		}
+		if json.Unmarshal(env.Payload, &p) == nil {
+			st.genType = codexGenType(p.Originator, p.Source)
+		}
 	case "turn_context":
 		var p struct {
 			Model string `json:"model"`
@@ -486,7 +553,7 @@ func emitCodexShellDeletions(payload json.RawMessage, when time.Time, st *codexS
 			When:           when,
 			Tool:           "codex",
 			Confidence:     "high",
-			GenType:        "cli",
+			GenType:        st.gen(),
 			RepoPath:       repo,
 			FilePath:       rel,
 			Model:          st.model,
@@ -593,7 +660,7 @@ func emitCodexPatchApplyEvents(payload json.RawMessage, when time.Time, st *code
 			When:           when,
 			Tool:           "codex",
 			Confidence:     "high",
-			GenType:        "cli",
+			GenType:        st.gen(),
 			RepoPath:       repo,
 			FilePath:       rel,
 			Model:          st.model,

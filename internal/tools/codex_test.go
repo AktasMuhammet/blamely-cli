@@ -557,3 +557,48 @@ func TestFindCodexSessionFiles_MissingDir(t *testing.T) {
 		t.Fatalf("findCodexSessionFiles on missing dir = %v, want empty", got)
 	}
 }
+
+func TestCodexGenType(t *testing.T) {
+	cases := []struct{ originator, source, want string }{
+		{"codex_vscode", "vscode", "chat"}, // the VS Code chat panel
+		{"codex_intellij", "jetbrains", "chat"},
+		{"codex_cli_rs", "cli", "cli"}, // terminal
+		{"", "", "cli"},                // unknown → cli
+	}
+	for _, c := range cases {
+		if got := codexGenType(c.originator, c.source); got != c.want {
+			t.Errorf("codexGenType(%q,%q)=%q, want %q", c.originator, c.source, got, c.want)
+		}
+	}
+}
+
+func TestProcessCodexLine_SessionMetaDrivesGenType(t *testing.T) {
+	sink := &mockSink{}
+	st := &codexState{sink: sink}
+
+	// A VS Code chat-panel session: its session_meta makes patches gen_type "chat".
+	processCodexLine([]byte(`{"type":"session_meta","payload":{"originator":"codex_vscode","source":"vscode"}}`), st)
+	if st.genType != "chat" {
+		t.Fatalf("session_meta should set genType=chat, got %q", st.genType)
+	}
+	patch := "*** Begin Patch\n*** Update File: /repo/p.go\n@@\n+x\n*** End Patch\n"
+	processCodexLine(mustMarshalFuncCall("apply_patch", patch), st)
+	st.flush(100, 10, 0, 0, true)
+	if len(sink.events) != 1 {
+		t.Fatalf("want 1 event, got %d", len(sink.events))
+	}
+	if sink.events[0].GenType != "chat" {
+		t.Errorf("VS Code codex patch: want gen_type chat, got %q", sink.events[0].GenType)
+	}
+}
+
+func TestProcessCodexLine_DefaultsCliWithoutSessionMeta(t *testing.T) {
+	sink := &mockSink{}
+	st := &codexState{sink: sink}
+	patch := "*** Begin Patch\n*** Update File: /repo/p.go\n@@\n+x\n*** End Patch\n"
+	processCodexLine(mustMarshalFuncCall("apply_patch", patch), st)
+	st.flush(100, 10, 0, 0, true)
+	if len(sink.events) != 1 || sink.events[0].GenType != "cli" {
+		t.Fatalf("without session_meta want one cli event, got %+v", sink.events)
+	}
+}
