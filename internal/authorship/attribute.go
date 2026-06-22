@@ -19,9 +19,11 @@ import (
 //   - Lines with no prior coverage default to Human (I5).
 //
 // Add (empty baseline → all `author`), edit (diff), and delete (lines vanish) all
-// fall out of the same alignment. Move detection / reflow are layered in later
-// (§8, Phase 4); v2 base behavior treats a moved line as changed → `author`,
-// which is safe (it's a real edit) and never mislabels an in-place human line.
+// fall out of the same alignment. Reflow (whitespace-only changes) is handled by
+// the normalized comparison in alignLines (Phase 4): a reindented/reformatted line
+// keeps its prior author. Move detection is still layered in later (§8); a moved
+// line is currently treated as changed → `author`, which is safe (it's a real
+// edit) and never mislabels an in-place human line.
 //
 // nowMS is injected (not time.Now()) so callers/tests are deterministic; pass 0
 // to stamp with the wall clock.
@@ -91,6 +93,11 @@ func splitLines(s string) []string {
 // with backtrack; positional matching is what makes duplicate identical lines
 // resolve correctly (the unchanged occurrence matches in place; an extra copy is
 // reported as added) without any content-hash disambiguation.
+//
+// Lines are compared WHITESPACE-NORMALIZED (Phase 4 reflow): a line that changed
+// only in indentation / trailing or collapsed whitespace counts as unchanged and
+// keeps its prior author — reformatting is not authorship ("formatting
+// non-substantial"). A genuine content change still mismatches → the editor.
 func alignLines(oldLines, newLines []string) []int {
 	n, m := len(oldLines), len(newLines)
 	matched := make([]int, m)
@@ -100,15 +107,17 @@ func alignLines(oldLines, newLines []string) []int {
 	if n == 0 || m == 0 {
 		return matched
 	}
+	oldN := normalizeLinesForMatch(oldLines)
+	newN := normalizeLinesForMatch(newLines)
 
-	// dp[i][j] = LCS length of oldLines[i:] and newLines[j:].
+	// dp[i][j] = LCS length of oldN[i:] and newN[j:].
 	dp := make([][]int, n+1)
 	for i := range dp {
 		dp[i] = make([]int, m+1)
 	}
 	for i := n - 1; i >= 0; i-- {
 		for j := m - 1; j >= 0; j-- {
-			if oldLines[i] == newLines[j] {
+			if oldN[i] == newN[j] {
 				dp[i][j] = dp[i+1][j+1] + 1
 			} else if dp[i+1][j] >= dp[i][j+1] {
 				dp[i][j] = dp[i+1][j]
@@ -120,7 +129,7 @@ func alignLines(oldLines, newLines []string) []int {
 	// Backtrack to recover the matched (unchanged) pairs.
 	i, j := 0, 0
 	for i < n && j < m {
-		if oldLines[i] == newLines[j] {
+		if oldN[i] == newN[j] {
 			matched[j] = i
 			i++
 			j++
@@ -131,6 +140,22 @@ func alignLines(oldLines, newLines []string) []int {
 		}
 	}
 	return matched
+}
+
+// normalizeLineForMatch collapses a line to its whitespace-insensitive form: trim
+// ends + collapse internal whitespace runs to a single space. This MUST produce
+// identical output in the Go, TypeScript, and Kotlin ports (the golden vectors
+// enforce it) so the three agree on what counts as a reflow.
+func normalizeLineForMatch(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+func normalizeLinesForMatch(lines []string) []string {
+	out := make([]string, len(lines))
+	for i, l := range lines {
+		out[i] = normalizeLineForMatch(l)
+	}
+	return out
 }
 
 func sha256Hex(s string) string {
