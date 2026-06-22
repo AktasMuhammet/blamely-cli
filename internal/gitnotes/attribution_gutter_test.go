@@ -37,6 +37,8 @@ func TestReconcileGutterOverrides_DuplicateContentBlock(t *testing.T) {
 		return strings.TrimSpace(string(out))
 	}
 	git("init", "-q")
+	git("config", "user.email", "t@t")
+	git("config", "user.name", "t")
 	git("checkout", "-q", "-b", "main")
 
 	const rel = "styles.css"

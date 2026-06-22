@@ -39,6 +39,8 @@ func TestAttributePipelineE2E(t *testing.T) {
 		return strings.TrimSpace(string(out))
 	}
 	git("init", "-q")
+	git("config", "user.email", "t@t")
+	git("config", "user.name", "t")
 	git("checkout", "-q", "-b", "main")
 	const rel = "app.py"
 	abs := filepath.Join(repo, rel)
@@ -110,6 +112,8 @@ func TestAttributePipelineE2E_TwoCommits(t *testing.T) {
 		return strings.TrimSpace(string(out))
 	}
 	git("init", "-q")
+	git("config", "user.email", "t@t")
+	git("config", "user.name", "t")
 	git("checkout", "-q", "-b", "main")
 	const rel = "app.py"
 	abs := filepath.Join(repo, rel)
@@ -195,6 +199,8 @@ func TestAttributePipelineE2E_Amend(t *testing.T) {
 		return nil
 	}
 	git("init", "-q")
+	git("config", "user.email", "t@t")
+	git("config", "user.name", "t")
 	git("checkout", "-q", "-b", "main")
 	abs := filepath.Join(repo, "app.py")
 	os.WriteFile(abs, []byte("h1\nh2\n"), 0o644)
@@ -268,6 +274,8 @@ func TestAttributeSkipsDuringRewrite(t *testing.T) {
 		return strings.TrimSpace(string(out))
 	}
 	git("init", "-q")
+	git("config", "user.email", "t@t")
+	git("config", "user.name", "t")
 	git("checkout", "-q", "-b", "main")
 	os.WriteFile(filepath.Join(repo, "app.py"), []byte("x\n"), 0o644)
 	git("add", ".")

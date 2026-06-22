@@ -30,6 +30,8 @@ func TestSeedCommittedWorkingLog(t *testing.T) {
 		return strings.TrimSpace(string(out))
 	}
 	git("init", "-q")
+	git("config", "user.email", "t@t")
+	git("config", "user.name", "t")
 	git("checkout", "-q", "-b", "main")
 	os.WriteFile(filepath.Join(repo, "f.txt"), []byte("ai line\nhuman line\n"), 0o644)
 	git("add", ".")

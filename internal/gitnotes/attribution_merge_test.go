@@ -27,6 +27,8 @@ func TestRestrictMergeToResolution(t *testing.T) {
 	write := func(s string) { os.WriteFile(filepath.Join(repo, "f.txt"), []byte(s), 0o644) }
 
 	git("init", "-q")
+	git("config", "user.email", "t@t")
+	git("config", "user.name", "t")
 	git("checkout", "-q", "-b", "main")
 	write("base\n")
 	git("add", ".")

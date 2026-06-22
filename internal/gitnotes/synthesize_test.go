@@ -21,6 +21,8 @@ func gitInitCommit(t *testing.T, content string) (repo string) {
 		}
 	}
 	run("init")
+	run("config", "user.email", "t@t")
+	run("config", "user.name", "t")
 	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
