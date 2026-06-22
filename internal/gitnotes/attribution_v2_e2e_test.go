@@ -8,7 +8,9 @@ import (
 	"testing"
 
 	"github.com/blamely/blamely/internal/authorship"
+	"github.com/blamely/blamely/internal/gitutil"
 	"github.com/blamely/blamely/internal/install"
+	"github.com/blamely/blamely/internal/store"
 )
 
 // TestAttributePipelineE2E exercises the REAL post-commit attribute sequence —
@@ -157,9 +159,11 @@ func TestAttributePipelineE2E_TwoCommits(t *testing.T) {
 	}
 }
 
-// TestAttributePipelineE2E_Amend verifies the flip survives a `git commit --amend`:
-// the amended commit keeps the same parent, so the working log (keyed by that
-// parent) must still drive the note. A real history-rewrite case (Phase 5).
+// TestAttributePipelineE2E_Amend verifies attribution survives a `git commit
+// --amend`. The first commit DELETES the committed file's working log, so the
+// amend (same parent) can no longer re-flip from it — instead it reconciles the
+// AI attribution from the SQLite edit the daemon recorded. Mirrors real capture,
+// which records both the working log and the SQLite edit.
 func TestAttributePipelineE2E_Amend(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
@@ -205,6 +209,21 @@ func TestAttributePipelineE2E_Amend(t *testing.T) {
 		authorship.Author{Type: authorship.AI, Tool: "claude", GenType: "chat"}, 1); err != nil {
 		t.Fatal(err)
 	}
+	// Real capture also records the edit in SQLite — that's what the amend relies on
+	// once the committed file's working log is deleted.
+	db, derr := store.Open()
+	if derr != nil {
+		t.Fatal(derr)
+	}
+	repoID, _ := gitutil.RepoID(repo)
+	if _, err := db.InsertEdit(store.Edit{
+		TimestampNanos: 1, RepoPath: repoID, FilePath: "app.py",
+		Tool: "claude", Confidence: "high", GenType: "chat",
+		Lines: editLines("ai3"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
 	os.WriteFile(abs, []byte("h1\nh2\nai3\n"), 0o644)
 	git("add", ".")
 	git("commit", "-q", "-m", "c2")

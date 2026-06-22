@@ -323,13 +323,13 @@ func ListWorkingLogs(repoRoot, branch, baseSHA string) ([]*WorkingLog, error) {
 // commit of one file must not strand another file's working log) and stays bounded —
 // logs follow HEAD instead of accumulating at ancestor bases.
 //
-// Files in `keepAtOldBase` are LEFT at oldBase: those are the files this commit
-// included, and a later amend/rebase re-attributes that same commit by reading its
-// parent-base log + copying the note (see attribution_v2_gitops.go), so moving them
-// would make the rewrite fall back to v1 and clobber the correct note. A file whose
-// newBase log already exists (a fresher editor flush) wins; the old one is dropped.
-// No-op when oldBase == newBase or there is nothing to move.
-func MigrateWorkingLogs(repoRoot, branch, oldBase, newBase string, keepAtOldBase map[string]bool) error {
+// Files in `committed` (the files this commit included) are DELETED from oldBase:
+// their per-line attribution now lives durably in the git note (pushed to the
+// remote) and in SQLite (from which amend/rebase re-attribution reconciles), so
+// keeping a per-commit working log would only accumulate on disk without bound.
+// A file whose newBase log already exists (a fresher editor flush) wins; the old
+// one is dropped. No-op when oldBase == newBase or there is nothing to move.
+func MigrateWorkingLogs(repoRoot, branch, oldBase, newBase string, committed map[string]bool) error {
 	if oldBase == "" || newBase == "" || oldBase == newBase {
 		return nil
 	}
@@ -339,8 +339,12 @@ func MigrateWorkingLogs(repoRoot, branch, oldBase, newBase string, keepAtOldBase
 	}
 	for _, wl := range logs {
 		rel := wl.File
-		if keepAtOldBase[rel] {
-			continue // committed in this commit — keep for amend/rebase re-flip
+		if committed[rel] {
+			// Committed in this commit: drop the working log (note + SQLite hold the
+			// attribution now) instead of stranding it at the parent base forever.
+			_ = os.Remove(WorkingLogPath(repoRoot, branch, oldBase, rel))
+			_ = os.Remove(BaselinePath(repoRoot, branch, oldBase, rel))
+			continue
 		}
 		oldWL := WorkingLogPath(repoRoot, branch, oldBase, rel)
 		oldBaseline := BaselinePath(repoRoot, branch, oldBase, rel)
@@ -365,8 +369,8 @@ func MigrateWorkingLogs(repoRoot, branch, oldBase, newBase string, keepAtOldBase
 		_ = os.Remove(oldWL)
 		_ = os.Remove(oldBaseline)
 	}
-	// Drop the old base dir only if nothing was kept there (no committed-file logs
-	// retained for amend/rebase). os.Remove fails (non-empty) → harmless.
+	// Drop the old base dir once empty (committed logs deleted, uncommitted moved
+	// forward). A non-empty dir — e.g. an unmigrated log — is left intact (harmless).
 	if remaining, rerr := ListWorkingLogs(repoRoot, branch, oldBase); rerr == nil && len(remaining) == 0 {
 		_ = os.RemoveAll(workingLogDir(repoRoot, branch, oldBase))
 	}
