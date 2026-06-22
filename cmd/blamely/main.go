@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -112,6 +113,7 @@ func main() {
 	root.AddCommand(cmdRecord())
 	root.AddCommand(cmdAttribute())
 	root.AddCommand(cmdAuthorship())
+	root.AddCommand(cmdRecordDeletion())
 	root.AddCommand(cmdAttributionStatus())
 	root.AddCommand(cmdReport())
 	root.AddCommand(cmdBlame())
@@ -465,6 +467,54 @@ func restrictLinesToChanged(lines []authorship.LineAttribution, changed map[int]
 		}
 	}
 	return out
+}
+
+// cmdRecordDeletion records the baseline lines an AI edit REMOVED, so committed
+// deletions attribute to the AI tool instead of falling back to Human. The IDE
+// trackers call it when an AI edit shrinks a file (the CLI `record` path already does
+// this for tool hooks; the editor previously did not, so editor-originated AI
+// deletions were lost). The CURRENT file content is read from stdin (the editor buffer
+// may be unsaved), the committed content is the baseline, and the difference — via the
+// same alignment/move detection as Attribute — is appended to .deletions.jsonl.
+func cmdRecordDeletion() *cobra.Command {
+	var tool, genType, model string
+	c := &cobra.Command{
+		Use:    "record-deletion <file>",
+		Hidden: true,
+		Short:  "Internal: record AI-deleted baseline lines (Attribution v2). Current content on stdin.",
+		Args:   cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !authorship.Enabled() {
+				return nil
+			}
+			abs, err := filepath.Abs(args[0])
+			if err != nil {
+				return err
+			}
+			ctx, ok := authorship.ResolveContext(abs)
+			if !ok {
+				return nil // not inside a work tree
+			}
+			current, err := io.ReadAll(os.Stdin)
+			if err != nil {
+				return err
+			}
+			baseline, ok := gitnotes.ShowFileAt(ctx.RepoRoot, ctx.BaseSHA, ctx.RelPath)
+			if !ok {
+				return nil // not present at base (new file) → no baseline deletions
+			}
+			deleted := authorship.DeletedBaselineLines(baseline, string(current))
+			if len(deleted) == 0 {
+				return nil
+			}
+			author := authorship.Author{Type: authorship.AI, Tool: tool, GenType: genType, Model: model}
+			return authorship.AppendDeletions(ctx.RepoRoot, ctx.Branch, ctx.BaseSHA, ctx.RelPath, deleted, author)
+		},
+	}
+	c.Flags().StringVar(&tool, "tool", "", "AI tool that performed the deletion (copilot|cursor|claude|gemini|...)")
+	c.Flags().StringVar(&genType, "gen-type", "completion", "gen_type of the deleting edit (chat|completion|cli)")
+	c.Flags().StringVar(&model, "model", "", "model id, if known")
+	return c
 }
 
 func cmdAuthorship() *cobra.Command {

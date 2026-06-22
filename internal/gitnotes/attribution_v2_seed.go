@@ -121,6 +121,12 @@ func collapseAuthors(perLine []authorship.Author) []authorship.LineAttribution {
 	return out
 }
 
+// ShowFileAt is the exported wrapper used by the record-deletion command to read a
+// file's committed content (the baseline that deletions are computed against).
+func ShowFileAt(repoPath, sha, relPath string) (string, bool) {
+	return showFileAt(repoPath, sha, relPath)
+}
+
 func showFileAt(repoPath, sha, relPath string) (string, bool) {
 	out, err := exec.Command("git", "-C", repoPath, "show", sha+":"+relPath).Output()
 	if err != nil {
