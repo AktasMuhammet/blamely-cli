@@ -1,6 +1,6 @@
 # Attribution v2 — Design
 
-**Status:** Draft / for review · **Owner:** Blamely · **Scope:** blamely-cli + VS Code plugin + IntelliJ plugin
+**Status:** Implemented behind a flag (engine + CLI pipeline complete; editor display + git-op lifecycle in progress) · **Owner:** Blamely · **Scope:** blamely-cli + VS Code plugin + IntelliJ plugin
 
 > **Project constraints (apply to all of v2):**
 > - **Naming:** do not reference any external project by name in code, comments, or docs — describe approaches generically.
@@ -10,8 +10,10 @@ This document specifies a migration of Blamely's line-level AI/Human attribution
 current **"record per-line content hashes, then guess at commit"** model to a
 **"capture a pre-edit baseline, diff it, and maintain a stateful working log"** model.
 
-Nothing is implemented until this document is signed off. Implementation must be verified
-against the **invariants (§4)** and the **proof matrix (§11)**.
+Implementation is **gated by a feature flag** — `BLAMELY_ATTRIBUTION_V2` (CLI/daemon
+env) and `blamely.attributionV2` (both editor plugins), **off by default** — so `main`
+ships unchanged. See **§16 — Implementation status** for what is built today; correctness is
+verified against the **invariants (§4)** and the **proof matrix (§11)**.
 
 ---
 
@@ -165,26 +167,42 @@ instead of from hash-matching.
 ## 7. The single diff engine
 
 ```
-attribute(oldContent, newContent string, author Author) → []LineAttribution
+Attribute(prior *WorkingLog, baseline, newContent string, author Author, nowMS int64) → *WorkingLog
 ```
-- One function, used by every path (CLI `record`, plugin apply, watcher).
-- Built on the existing `addedOrMovedLineRanges` (LCS) in `lineranges.go`, extended with
-  a token-aligned diff + 3-line **move detection** + reflow handling (§8).
-- **Add** (empty baseline → all `author`), **edit** (diff), **delete** (baseline−new) all fall out
-  of the same call.
-- Replaces and retires: `narrowToChangedLines`, `ResolveWholeFileWrite`, `netUnchangedEditLines`,
-  `pickDriftAiEdit`, and every per-tool narrowing branch.
+- One function, used by every path (CLI `record`, plugin apply, watcher). Implemented three times
+  from one spec — Go (`internal/authorship/attribute.go`), TypeScript, Kotlin — and pinned by the
+  shared golden vectors (§6, §11).
+- A line **unchanged** vs the baseline (an LCS match) keeps its **prior** author (so an AI edit that
+  re-emits a human line stays Human, I3); an added/changed line is attributed to `author`; an
+  uncovered line defaults to Human (I5).
+- **Add** (empty baseline → all `author`), **edit** (diff), **delete** (lines vanish), **duplicate**
+  (resolved by diff position, not hash), **reflow**, **move**, and **override** all fall out of the
+  same call (transform rules in §8).
+- **No content-hash guessing.** This replaces and retires the old hash budget/drift matcher and
+  every per-tool narrowing branch (removed in Phase 6).
 
 ---
 
-## 8. Edit-transform rules (correctness on hard cases)
+## 8. Edit-transform rules (correctness on hard cases) — **implemented**
 
-- **Line shift** (insert/delete above) → ranges move, authorship preserved.
-- **Move** (≥3-line block relocated) → detected, authorship follows the block.
-- **Reflow / whitespace-only** → authorship inherited; flagged `formatting_non_substantial`.
-- **Human overwrites AI** → new line is Human; `overrode` records the prior AI author.
-- **Duplicate identical lines** → resolved by *position in the diff*, not by hash — the diff knows
-  which occurrence changed.
+All of the following are implemented identically in Go/TS/Kotlin and covered by named golden
+vectors (§11):
+
+- **Line shift** (insert/delete above) → ranges move, authorship preserved. *(LCS positional match.)*
+- **Reflow / whitespace-only** → authorship inherited. Implemented as a **whitespace-normalized**
+  line comparison in the LCS (`normalizeLineForMatch` = trim + collapse internal whitespace runs):
+  a reindented/reformatted line is treated as unchanged and keeps its prior author. A substantive
+  content change still mismatches → the editor. *(Token-level reflow, e.g. operator spacing, is a
+  later refinement.)*
+- **Move** → a relocated line carries its prior author. Implemented as **FIFO-by-content pairing**
+  (`detectMoves`): each unmatched new line pairs with the first unmatched old line of identical
+  normalized content. A block an AI moves stays Human; an AI block a human moves stays AI. *(This
+  is line-granular, not a ≥3-line block heuristic; it is deterministic and parity-tested.)*
+- **Human overwrites AI** → new line is the editor; `overrode` records the replaced author when its
+  type differs. Implemented as `detectOverrode` (gap-positional replace pairing); a moved line is
+  never treated as an override.
+- **Duplicate identical lines** → resolved by *position in the diff*, not by hash — the unchanged
+  occurrence matches in place; an extra copy is an add.
 
 ---
 
@@ -201,24 +219,29 @@ attribute(oldContent, newContent string, author Author) → []LineAttribution
 
 ## 10. Migration phases (incremental, dual-run, reversible)
 
-Every phase is behind a feature flag and leaves `main` shippable.
+Every phase is behind a feature flag and leaves `main` shippable. Status as built (✅ done,
+◐ partial, ☐ remaining):
 
-- **Phase 0 — Foundations (no behavior change).** Working-log format spec + shared golden test
-  vectors; the `attribute()` diff engine; atomic file read-modify-write in Go/TS/Kotlin. Ported
-  from a comprehensive attribution-transform corpus.
-- **Phase 1 — Capture.** Plugin live tracker (typing/completion/apply → working log); CLI
-  `record`/`record --pre` → working log for terminal agents. Baselines per Decision B.
-- **Phase 2 — Dual-run validation.** Keep the old hash engine; at commit compute **both** notes
-  and log divergences on the golden corpus + real repos. **No output change yet.**
-- **Phase 3 — Flip note + gutter to the working log.** Single source (I4). Old engine still
-  present behind the flag for rollback.
-- **Phase 4 — Transform robustness.** Token-aligned diff, move detection, reflow, `overrode`,
-  line-shift transforms across successive edits.
-- **Phase 5 — Git operations.** Re-attribution through rebase/stash/merge/reset (working log ↔
-  notes), mirroring a notes-rewrite approach for rebase/stash/merge/reset.
-- **Phase 6 — Retire old engine.** Remove hash budget/drift + per-tool narrowing once the new
-  engine has run clean in production for a defined window. Keep `content_sha` only as a degraded
-  fallback for unobserved edits.
+- **Phase 0 — Foundations (no behavior change). ✅** Working-log format spec + shared golden
+  vectors; the `Attribute()` engine; atomic file read-modify-write + per-file lock in Go/TS/Kotlin.
+- **Phase 1 — Capture. ✅** Editor live tracker in both IDEs (typing=Human, completion/apply=AI →
+  working log); CLI `record` + **`record --pre`** → working log for terminal agents. Baselines per
+  Decision B.
+- **Phase 2 — Dual-run validation. ✅** Old hash engine kept; at commit the working log is compared
+  to the v1 note and divergences are logged (`logV2Divergence`). No output change.
+- **Phase 3 — Flip note to the working log. ◐** The **commit note** is rewritten from the working
+  log when the flag is on (`flipNoteToWorkingLog`, recomputes totals/by_tool/by_gen_type). The
+  **gutter** flip (plugins read the working log live) is the remaining half (needs a running IDE).
+- **Phase 4 — Transform robustness. ✅** Reflow (whitespace-normalized matching), move detection
+  (FIFO-by-content), and `overrode` (replace pairing) — all three languages, all parity-tested
+  (§8). *(Token-aligned diff for token-level reflow is a later refinement.)*
+- **Phase 5 — Git-op lifecycle. ◐** **GC** of working logs whose base object git no longer has
+  (`GCWorkingLogs`, safe by object-existence) and **note-seeding** (carry committed authorship
+  across a commit via `git blame` + notes, wired through `authorship.SeedHook`) are done for the
+  CLI path. Full rebase/stash/merge re-attribution and the editor-path seed remain.
+- **Phase 6 — Retire old engine. ☐** Gated on §12. Remove hash budget/drift + per-tool narrowing
+  once the new engine has soaked clean; keep `content_sha` only as a degraded unobserved-edit
+  fallback.
 
 ---
 
@@ -276,13 +299,49 @@ mis-attribution.
 
 ---
 
-## 15. Open questions (must close before Phase 0)
+## 15. Open questions
 
-1. Working-log location confirmation: `.git/blamely/working_logs/...` (aligns with existing
-   branch-session state) — confirm vs a top-level `.git/blamely/` layout already in use.
-2. Watcher watermark file format/location (per-watcher file vs one state file).
-3. Soak-window length and the real-repo panel for the §12 gate.
-4. Whether the slim daemon stays as a long-running process or becomes launch-on-demand for tailing.
+1. ~~Working-log location~~ **Resolved:** `.git/blamely/working_logs/<branch>/<base_sha>/<path>.json`
+   with baselines under `.baselines/` of the same dir (§3.2, implemented in `store.go`).
+2. Watcher watermark file format/location (per-watcher file vs one state file) — unchanged from v1.
+3. Soak-window length and the real-repo panel for the §12 gate — **still open** (the §12 gate has
+   not yet been run; it is what unblocks the gutter flip + Phase 6).
+4. Whether the slim daemon stays long-running or becomes launch-on-demand — unchanged from v1.
+
+---
+
+## 16. Implementation status (as built)
+
+Flag: `BLAMELY_ATTRIBUTION_V2` (CLI/daemon env, `1/true/on/yes`) and `blamely.attributionV2`
+(both editor settings), **off by default**. `main` behavior is unchanged with the flag off.
+
+| Area | State | Where |
+|---|---|---|
+| Engine (`Attribute`) — add/edit/delete/dup/**reflow**/**move**/**override** | ✅ Go · TS · Kotlin | `internal/authorship/attribute.go` + plugin ports |
+| Working-log store (atomic write + per-file lock) | ✅ Go · TS · Kotlin | `internal/authorship/store.go` + ports |
+| Shared golden vectors (18) + cross-language sync guard | ✅ | `internal/authorship/testdata/golden_vectors.json` |
+| Terminal capture (`record` for 5 tools) + **`record --pre`** baseline | ✅ | `internal/tools/*`, `cmd/blamely/main.go` |
+| Editor capture (live tracker, typing=Human, completion/apply=AI) | ✅ both IDEs | `WorkingLogTracker` (TS/Kotlin) + completion hooks |
+| Phase 2 dual-run divergence logging | ✅ | `internal/gitnotes/attribution_v2_dualrun.go` |
+| Phase 3 **note** flip (note ← working log) | ✅ | `internal/gitnotes/attribution_v2_flip.go` |
+| Phase 5 GC (prune dangling-base logs) | ✅ | `internal/authorship/gc.go` |
+| Phase 5 note-seeding (committed authorship across commits) | ✅ CLI path | `internal/gitnotes/attribution_v2_seed.go` + `authorship.SeedHook` |
+| Phase 3 **gutter** flip (plugins read the working log live) | ☐ | needs editor work + a running IDE |
+| Editor-path note-seeding (FileTracker init from committed authorship) | ☐ | TS/Kotlin tracker work |
+| Full git-op re-attribution (rebase/stash/merge) | ☐ | Phase 5 remainder |
+| Phase 6 retire old engine | ☐ | gated on §12 |
+| PreToolUse `--pre` install wiring | ☐ deferred | per-call hook cost while experimental |
+
+**Architecture notes worth recording:**
+- **Note-seeding uses a hook, not a call.** `gitnotes` already imports `internal/tools`, so the
+  engine cannot import `gitnotes`. `authorship.SeedHook` is a function pointer the top-level `main`
+  package registers (`SeedCommittedWorkingLog`), keeping the engine dependency-free.
+- **GC is by object-existence, not reachability** — a log is pruned only once its base *object* is
+  gone (post amend/rebase/`git gc`), so it can never describe content reachable from any ref.
+- **Reflow ≠ token diff (yet)** and **move is line-granular FIFO**, not a ≥3-line block heuristic;
+  both are deterministic so the three language ports stay byte-identical (the vectors enforce it).
+- **The §12 gate has not run.** It is the explicit prerequisite for the gutter flip and Phase 6;
+  until then those stay behind the flag and `main` is unaffected.
 
 ---
 
