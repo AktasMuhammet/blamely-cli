@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"os/exec"
 	"sort"
+	"time"
 
 	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/gitutil"
+	"github.com/blamely/blamely/internal/store"
 )
 
 // DiffWorkingTree diffs the working tree against HEAD (tracked changes, staged +
@@ -47,6 +49,27 @@ func AttributeWorkingTree(repoPath string) (*Note, error) {
 	note := buildWorkingTreeNote(change, branch)
 	flipAddsAtBase(repoPath, branch, base, note)
 	flipDeletesAtBase(repoPath, branch, base, note, change)
+
+	// Same lossless content_sha cross-check the commit-time path runs, so `blamely
+	// stats` (pre-commit) matches the committed note: upgrade Human add/delete lines
+	// the working-log + deletions-log fold couldn't resolve to the AI tool that
+	// recorded their content in SQLite. Passing now as the "commit" time makes the
+	// window (HEAD, now] — i.e. exactly this session's uncommitted edits, since
+	// PreviousCommitTimestampNanos(now) resolves to HEAD. Best-effort: a missing DB
+	// just leaves the fold's result unchanged.
+	if db, derr := store.Open(); derr == nil {
+		defer db.Close()
+		repoID, _ := gitutil.RepoID(repoPath)
+		if repoID == "" {
+			repoID = repoPath
+		}
+		nowNanos := time.Now().UnixNano()
+		reconcileAddsFromEdits(db, repoID, nowNanos, note, change.Added)
+		reconcileDeletesFromEdits(db, repoID, nowNanos, note, change)
+	}
+	// Fold deletions into the generation breakdown so `blamely stats` bars cover all
+	// changed lines, not just additions (mirrors AttributeAndWrite).
+	addDeletedLinesToGenType(note)
 	return note, nil
 }
 

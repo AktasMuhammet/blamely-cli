@@ -1,6 +1,9 @@
 package gitnotes
 
-import "github.com/blamely/blamely/internal/authorship"
+import (
+	"github.com/blamely/blamely/internal/authorship"
+	"github.com/blamely/blamely/internal/store"
+)
 
 // flipDeletionsToWorkingLog attributes a commit's DELETED lines from the Attribution
 // v2 deletions log (who removed which line content), instead of the legacy hash
@@ -81,6 +84,143 @@ func flipDeletesAtBase(repoPath, branch, base string, note *Note, change *Commit
 	}
 	if changed {
 		recomputeDeletedAggregates(note)
+	}
+}
+
+// reconcileDeletesFromEdits is the deletion twin of reconcileAddsFromEdits — and
+// the lossless cross-check flipDeletionsToWorkingLog can't do. The deletion flip
+// reads ONLY the editor-tracker deletions log (authorship.LoadDeletions); a chat
+// tool that removed lines (copilot/claude chat, codex cli) records its removed-line
+// hashes in SQLite (edit_removed_lines) but writes no deletions-log entry, so those
+// deletions fall through to Human. Here, for every committed deleted line the flip
+// left Human, match its content against a removed-line content_sha an AI tool
+// recorded within this commit's window (consume-once, exact-then-norm, via the same
+// pickEditForRemovedLine the legacy matcher uses) and credit it to that tool.
+// Human→AI only; never downgrades a deletion the deletions log already attributed.
+func reconcileDeletesFromEdits(db *store.DB, repoID string, commitNanos int64, note *Note, change *CommitChange) {
+	if db == nil || note == nil || change == nil || !authorship.Enabled() {
+		return
+	}
+	// Same window as flipDeletionsToWorkingLog / the add reconciliation.
+	sinceNanos := db.PreviousCommitTimestampNanos(repoID, commitNanos)
+	const sameSecondSlackNanos = int64(5 * 1e9)
+	maxNanos := commitNanos + sameSecondSlackNanos
+
+	changedAny := false
+	for fi := range note.Files {
+		fe := &note.Files[fi]
+		// change.Deleted is keyed by the PRE-commit path (rename source, if any).
+		prePath := fe.Path
+		if orig, ok := change.Renames[fe.Path]; ok {
+			prePath = orig
+		}
+		delLines := change.Deleted[prePath]
+		if len(delLines) == 0 {
+			continue
+		}
+		byLineContent := make(map[int]string, len(delLines))
+		for _, d := range delLines {
+			byLineContent[d.LineNum] = d.Content
+		}
+
+		// AI edits that recorded REMOVED lines for this file, in window.
+		edits, err := db.EditsForFileSince(repoID, prePath, sinceNanos)
+		if err != nil {
+			continue
+		}
+		aiEdits := make([]store.Edit, 0, len(edits))
+		for i := range edits {
+			e := &edits[i]
+			if e.TimestampNanos <= sinceNanos || e.TimestampNanos > maxNanos {
+				continue
+			}
+			if authorTypeFor(e.Tool) != "AI" || len(e.RemovedLines) == 0 || editFromWholeFileWrite(e) {
+				continue
+			}
+			aiEdits = append(aiEdits, *e)
+		}
+		if len(aiEdits) == 0 {
+			continue
+		}
+		remSHA, remNorm := removedHashMultisets(aiEdits)
+
+		var rewritten []RangeEntry
+		changed := false
+		for _, r := range fe.Lines {
+			if r.Type != "delete" {
+				rewritten = append(rewritten, r)
+				continue
+			}
+			for ln := r.Start; ln <= r.End; ln++ {
+				re := RangeEntry{Start: ln, End: ln, Type: "delete", AuthorType: r.AuthorType, Tool: r.Tool, Model: r.Model, GenType: r.GenType}
+				if re.AuthorType != "AI" {
+					if e := pickEditForRemovedLine(aiEdits, byLineContent[ln], sinceNanos, maxNanos, remSHA, remNorm); e != nil {
+						re = aiDeleteRange(ln, e)
+						changed = true
+					}
+				}
+				rewritten = append(rewritten, re)
+			}
+		}
+		if changed {
+			fe.Lines = collapseAddRanges(rewritten) // type-aware; safe for deletes
+			changedAny = true
+		}
+	}
+	if changedAny {
+		recomputeDeletedAggregates(note)
+	}
+}
+
+// aiDeleteRange builds an AI-authored deleted RangeEntry for one line from the edit
+// that recorded its removal (the deletion counterpart of aiAddRange).
+func aiDeleteRange(ln int, e *store.Edit) RangeEntry {
+	re := RangeEntry{Start: ln, End: ln, Type: "delete", AuthorType: "AI", Tool: string(e.Tool)}
+	if e.Model.Valid && e.Model.String != "" {
+		m := e.Model.String
+		re.Model = &m
+	}
+	if gt := string(e.GenType); gt != "" && gt != string(store.GenTypeUnknown) {
+		re.GenType = &gt
+	}
+	return re
+}
+
+// addDeletedLinesToGenType folds DELETED lines into by_gen_type so the generation
+// breakdown (and the bars rendered from it) reflect deletions, not just additions.
+// recomputeAddedAggregates rebuilds by_gen_type from ADDED lines only (overwriting
+// the deleted-line contribution buildNote had folded in), so this re-adds it as the
+// final step. Each AI deletion contributes its gen_type (chat/cli/completion);
+// human deletions count as human. MUST be called exactly once, after both the
+// add-recompute and deletion attribution are final, or deletions double-count.
+func addDeletedLinesToGenType(note *Note) {
+	if note == nil {
+		return
+	}
+	for _, fe := range note.Files {
+		for _, r := range fe.Lines {
+			if r.Type != "delete" {
+				continue
+			}
+			n := r.End - r.Start + 1
+			if n <= 0 {
+				continue
+			}
+			if r.AuthorType == "AI" {
+				switch ptrStr(r.GenType) {
+				case "chat":
+					note.ByGenType.Chat += n
+				case "cli":
+					note.ByGenType.CLI += n
+				case "completion":
+					note.ByGenType.Completion += n
+				default:
+					note.ByGenType.Unknown += n
+				}
+			} else {
+				note.ByGenType.Human += n
+			}
+		}
 	}
 }
 

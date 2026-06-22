@@ -392,7 +392,7 @@ func cmdRecord() *cobra.Command {
 // restrictLinesToChanged keeps only the per-line authorship for lines in `changed`
 // (the uncommitted-diff set), re-collapsing runs that share an author. An empty
 // `changed` yields no lines — the gutter shows nothing once a file has no changes.
-func restrictLinesToChanged(lines []authorship.LineAttribution, changed map[int]bool) []authorship.LineAttribution {
+func restrictLinesToChanged(lines []authorship.LineAttribution, changed map[int]bool, overrides map[int]authorship.Author) []authorship.LineAttribution {
 	if len(changed) == 0 {
 		return nil
 	}
@@ -402,11 +402,18 @@ func restrictLinesToChanged(lines []authorship.LineAttribution, changed map[int]
 			if !changed[ln] {
 				continue
 			}
-			if n := len(out); n > 0 && out[n-1].End == ln-1 && out[n-1].Author == r.Author && out[n-1].Overrode == r.Overrode {
+			author, overrode := r.Author, r.Overrode
+			// A content_sha reconciliation (gutter twin of the note path) may upgrade
+			// a Human line the working-log fold couldn't resolve to AI; that clears
+			// any human-override marker the line carried.
+			if ov, ok := overrides[ln]; ok {
+				author, overrode = ov, nil
+			}
+			if n := len(out); n > 0 && out[n-1].End == ln-1 && out[n-1].Author == author && out[n-1].Overrode == overrode {
 				out[n-1].End = ln
 				continue
 			}
-			out = append(out, authorship.LineAttribution{Start: ln, End: ln, Author: r.Author, Overrode: r.Overrode})
+			out = append(out, authorship.LineAttribution{Start: ln, End: ln, Author: author, Overrode: overrode})
 		}
 	}
 	return out
@@ -479,12 +486,23 @@ func cmdAuthorship() *cobra.Command {
 			// The gutter marks only the UNCOMMITTED CHANGES, not the whole file's
 			// history: intersect each file's working-log authorship with `git diff
 			// HEAD`. After a commit those lines are no longer changed → no icon.
+			//
+			// One DB handle for the whole request (the --all path restricts many
+			// files); nil is fine — ReconcileGutterOverrides no-ops on a nil db.
+			db, _ := store.Open()
+			if db != nil {
+				defer db.Close()
+			}
 			restrict := func(wl *authorship.WorkingLog) {
 				if wl == nil {
 					return
 				}
 				changed := gitnotes.UncommittedAddedLines(ctx.RepoRoot, wl.File)
-				wl.Lines = restrictLinesToChanged(wl.Lines, changed)
+				// Live twin of the commit-note reconciliation: upgrade Human lines the
+				// working-log fold couldn't resolve to AI when their content matches a
+				// recorded AI edit, so the gutter and the eventual note agree (I4).
+				overrides := gitnotes.ReconcileGutterOverrides(db, ctx.RepoRoot, ctx.BaseSHA, wl, changed)
+				wl.Lines = restrictLinesToChanged(wl.Lines, changed, overrides)
 			}
 
 			// --all: every tracked file's working log for the repo (sidebar aggregate).

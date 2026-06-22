@@ -630,7 +630,19 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	// (diff-based truth, no hash guessing), then the deletions, GC, and migrate the
 	// logs forward on commit.
 	flipNoteToWorkingLog(repoPath, note)
+	// Lossless cross-check: the working-log fold can't disambiguate AI-authored
+	// added lines that duplicate existing content (chat edits carry placeholder
+	// positions), so it drops them to Human. Scoped to this commit's added lines,
+	// the recorded content_shas reattribute them deterministically. Human→AI only.
+	reconcileAddsFromEdits(db, repoID, commitNanos, note, change.Added)
 	flipDeletionsToWorkingLog(repoPath, note, change)
+	// Lossless cross-check for deletions: the deletions log misses chat/cli tools
+	// that removed lines (recorded only in SQLite edit_removed_lines), so reattribute
+	// those Human deletions to the AI tool by removed-line content_sha. Human→AI only.
+	reconcileDeletesFromEdits(db, repoID, commitNanos, note, change)
+	// Fold deletions into the generation breakdown (the add-recompute above reset it
+	// to additions only), so the Generation bars cover all changed lines.
+	addDeletedLinesToGenType(note)
 	gcWorkingLogsIfEnabled(repoPath)
 	migrateWorkingLogsOnCommit(repoPath, note)
 
