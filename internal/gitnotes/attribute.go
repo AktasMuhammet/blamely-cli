@@ -613,10 +613,13 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 		}
 	}
 
-	// Phase 2 dual-run: measure the Attribution v2 working log against this note
-	// (flag-gated, log-only — never alters the note). The Phase 3 flip will make
-	// the note read from the working log once divergence is driven to zero.
+	// Phase 2 dual-run: log how the Attribution v2 working log differs from the v1
+	// note (flag-gated). Then Phase 3 flip: when the flag is on, rewrite the note's
+	// added-line attribution FROM the working log (diff-based truth, no hash
+	// guessing). Both are no-ops when the flag is off, so default behavior is
+	// unchanged.
 	logV2Divergence(repoPath, note)
+	flipNoteToWorkingLog(repoPath, note)
 
 	body, err := json.Marshal(note)
 	if err != nil {

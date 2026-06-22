@@ -228,3 +228,19 @@ func AuthorTypesForFile(repoRoot, branch, baseSHA, relPath string) (map[int]Auth
 	}
 	return m, true
 }
+
+// AuthorsForFile is AuthorTypesForFile but returns the FULL author (tool, model,
+// gen_type), used by the Phase 3 flip to rewrite a note's per-line attribution.
+func AuthorsForFile(repoRoot, branch, baseSHA, relPath string) (map[int]Author, bool) {
+	wl, err := LoadWorkingLog(repoRoot, branch, baseSHA, relPath)
+	if err != nil || wl == nil {
+		return nil, false
+	}
+	m := make(map[int]Author, len(wl.Lines))
+	for _, r := range wl.Lines {
+		for ln := r.Start; ln <= r.End; ln++ {
+			m[ln] = r.Author
+		}
+	}
+	return m, true
+}
