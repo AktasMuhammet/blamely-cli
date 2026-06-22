@@ -17,7 +17,13 @@ func flipDeletionsToWorkingLog(repoPath string, note *Note, change *CommitChange
 	if parent == "" {
 		return
 	}
-	deletions, err := authorship.LoadDeletions(repoPath, note.Branch, parent)
+	flipDeletesAtBase(repoPath, note.Branch, parent, note, change)
+}
+
+// flipDeletesAtBase rewrites the note's deleted-line attribution from the deletions log
+// at `base` (the commit's parent, or HEAD for the uncommitted working tree).
+func flipDeletesAtBase(repoPath, branch, base string, note *Note, change *CommitChange) {
+	deletions, err := authorship.LoadDeletions(repoPath, branch, base)
 	if err != nil || len(deletions) == 0 {
 		return
 	}

@@ -48,10 +48,17 @@ func flipNoteToWorkingLog(repoPath string, note *Note) {
 	if parent == "" {
 		return
 	}
+	flipAddsAtBase(repoPath, note.Branch, parent, note)
+}
+
+// flipAddsAtBase rewrites the note's added-line attribution from the working logs at
+// `base` (the commit's parent for a committed note, or HEAD for the uncommitted
+// working tree), then recomputes the added-line aggregates.
+func flipAddsAtBase(repoPath, branch, base string, note *Note) {
 	flipped := false
 	for fi := range note.Files {
 		fe := &note.Files[fi]
-		authors, ok := authorship.AuthorsForFile(repoPath, note.Branch, parent, fe.Path)
+		authors, ok := authorship.AuthorsForFile(repoPath, branch, base, fe.Path)
 		if !ok {
 			continue // not tracked by v2 → keep this file's v1 attribution
 		}

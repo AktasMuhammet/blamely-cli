@@ -579,13 +579,18 @@ func cmdReport() *cobra.Command {
 
 func cmdStats() *cobra.Command {
 	return &cobra.Command{
-		Use:   "stats [<sha>]",
-		Short: "Deep single-commit view: +added/-deleted, per-tool, gen-type, tokens, session",
+		Use:   "stats [head|<sha>]",
+		Short: "Deep view: no arg → current uncommitted change; `head` → last commit; <sha> → that commit",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			sha := "HEAD"
-			if len(args) == 1 {
-				sha = args[0]
+			// No argument → the CURRENT uncommitted change (working tree vs HEAD).
+			if len(args) == 0 {
+				return report.RenderCurrentStats()
+			}
+			// `head` (any case) → the last commit; otherwise the given commit-ish.
+			sha := args[0]
+			if strings.EqualFold(sha, "head") {
+				sha = "HEAD"
 			}
 			return report.RenderStats(sha)
 		},

@@ -64,6 +64,40 @@ func RenderStats(sha string) error {
 	return nil
 }
 
+// RenderCurrentStats prints the same deep view for the CURRENT uncommitted change
+// (`blamely stats` with no argument): it attributes the working-tree diff against HEAD
+// from the v2 working logs, with no commit/note required.
+func RenderCurrentStats() error {
+	repoPath, ok := gitutil.Toplevel(".")
+	if !ok {
+		return fmt.Errorf("not inside a git repository")
+	}
+	note, err := gitnotes.AttributeWorkingTree(repoPath)
+	if err != nil {
+		return err
+	}
+	if note == nil || len(note.Files) == 0 {
+		fmt.Println("No uncommitted changes.")
+		return nil
+	}
+	db, err := store.Open()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	repoID, _ := gitutil.RepoID(repoPath)
+	if repoID == "" {
+		repoID = repoPath
+	}
+	meta := commitMeta_{"sha": "working-tree", "subject": "uncommitted changes"}
+	sessionNanos := db.SessionDurationNanos(repoID, time.Now().UnixNano())
+	if note.CodingTimeNanos == 0 {
+		note.CodingTimeNanos = sessionNanos
+	}
+	renderDashboard(os.Stdout, note, meta, false)
+	return nil
+}
+
 type commitMeta_ map[string]string
 
 func commitMeta(repoPath, sha string) (commitMeta_, error) {
