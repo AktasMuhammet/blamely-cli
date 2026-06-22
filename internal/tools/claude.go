@@ -239,6 +239,11 @@ func RecordClaudeFromStdin(r io.Reader) error {
 		tool:           tool,
 	})
 
+	// Attribution v2 (dual-run, flag-gated): mirror this edit into the working log
+	// BEFORE the daemon POST, so capture is daemon-independent. No-op when the flag
+	// is off; never affects the recording below.
+	captureV2(repoPath, rel, tool, genType, payload.Model)
+
 	return postToDaemon(payload)
 }
 
