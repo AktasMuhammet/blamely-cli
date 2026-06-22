@@ -235,10 +235,14 @@ Every phase is behind a feature flag and leaves `main` shippable. Status as buil
 - **Phase 4 — Transform robustness. ✅** Reflow (whitespace-normalized matching), move detection
   (FIFO-by-content), and `overrode` (replace pairing) — all three languages, all parity-tested
   (§8). *(Token-aligned diff for token-level reflow is a later refinement.)*
-- **Phase 5 — Git-op lifecycle. ◐** **GC** of working logs whose base object git no longer has
-  (`GCWorkingLogs`, safe by object-existence) and **note-seeding** (carry committed authorship
-  across a commit via `git blame` + notes, wired through `authorship.SeedHook`) are done for the
-  CLI path. Full rebase/stash/merge re-attribution and the editor-path seed remain.
+- **Phase 5 — Git-op lifecycle. ◐** Done for the CLI path: **GC** of working logs whose base
+  object git no longer has (`GCWorkingLogs`, safe by object-existence); **note-seeding** (carry
+  committed authorship across a commit via `git blame` + notes, wired through `authorship.SeedHook`);
+  and **history-rewrite robustness** — amend/rebase/cherry-pick add the blamely ref to
+  `notes.rewriteRef` so git copies the (flipped) note onto the rewritten commit, and attribution
+  **skips while a rewrite is in progress** (`InProgressOp`) so the per-commit hook doesn't clobber
+  that copy. Verified end-to-end with a real `git rebase`. Merge-conflict-resolution attribution
+  and the editor-path seed remain.
 - **Phase 6 — Retire old engine. ☐** Gated on §12. Remove hash budget/drift + per-tool narrowing
   once the new engine has soaked clean; keep `content_sha` only as a degraded unobserved-edit
   fallback.
@@ -328,7 +332,8 @@ Flag: `BLAMELY_ATTRIBUTION_V2` (CLI/daemon env, `1/true/on/yes`) and `blamely.at
 | Phase 5 note-seeding (committed authorship across commits) | ✅ CLI path | `internal/gitnotes/attribution_v2_seed.go` + `authorship.SeedHook` |
 | Phase 3 **gutter** flip (plugins read the working log live) | ☐ | needs editor work + a running IDE |
 | Editor-path note-seeding (FileTracker init from committed authorship) | ☐ | TS/Kotlin tracker work |
-| Full git-op re-attribution (rebase/stash/merge) | ☐ | Phase 5 remainder |
+| History-rewrite robustness (amend/rebase/cherry-pick) | ✅ | notes.rewriteRef + skip-while-in-progress; real-rebase e2e |
+| Merge-conflict-resolution attribution | ☐ | Phase 5 remainder |
 | Phase 6 retire old engine | ☐ | gated on §12 |
 | PreToolUse `--pre` install wiring | ☐ deferred | per-call hook cost while experimental |
 

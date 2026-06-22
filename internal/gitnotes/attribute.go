@@ -442,6 +442,15 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	if wt, ok := gitutil.Toplevel(repoPath); ok {
 		repoPath = wt
 	}
+
+	// Attribution v2 git-op robustness: make blamely notes follow history rewrites,
+	// and skip recomputing while one is in progress so the inherited (correct) note
+	// isn't clobbered by a v1 fallback. No-ops when the v2 flag is off.
+	ensureNotesFollowRewrites(repoPath)
+	if attributionShouldSkip(repoPath) {
+		return nil, nil
+	}
+
 	repoID, _ := gitutil.RepoID(repoPath)
 	if repoID == "" {
 		repoID = repoPath
@@ -1310,7 +1319,7 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 
 	// Aggregate per-tool and build files/lines.
 	type toolAgg struct {
-		lines      int
+		lines int
 		// acceptedLines counts only lines whose source edit reported a suggestion
 		// (SuggestedLines > 0 — i.e. inline completions). It's the "accepted"
 		// half of the suggested/accepted acceptance metric, so it must NOT include

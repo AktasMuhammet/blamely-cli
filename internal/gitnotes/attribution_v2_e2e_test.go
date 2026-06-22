@@ -227,3 +227,64 @@ func TestAttributePipelineE2E_Amend(t *testing.T) {
 		t.Errorf("post-amend line 3: want AI/claude, got %+v", r)
 	}
 }
+
+// TestAttributeSkipsDuringRewrite verifies the Phase 5 git-op guard: while a history
+// rewrite is in progress, AttributeAndWrite skips (so the note git copies onto the
+// rewritten commit via notes.rewriteRef is not clobbered by a v1 fallback), and it
+// configures notes.rewriteRef so that copy happens.
+func TestAttributeSkipsDuringRewrite(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	t.Setenv("BLAMELY_ATTRIBUTION_V2", "1")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	repo := t.TempDir()
+	git := func(args ...string) string {
+		cmd := exec.Command("git", append([]string{"-C", repo, "-c", "core.hooksPath="}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git("init", "-q")
+	git("checkout", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(repo, "app.py"), []byte("x\n"), 0o644)
+	git("add", ".")
+	git("commit", "-q", "-m", "c1")
+	sha := git("rev-parse", "HEAD")
+
+	// Pre-place the note git would have copied onto the rewritten commit.
+	inherited := `{"schema":2,"commit":"` + sha + `","files":[{"path":"app.py","lines":[{"start":1,"end":1,"type":"add","author_type":"AI","tool":"claude"}]}]}`
+	nf := filepath.Join(t.TempDir(), "n.json")
+	os.WriteFile(nf, []byte(inherited), 0o644)
+	git("notes", "--ref="+NotesRef, "add", "-f", "-F", nf, sha)
+
+	// Mark a rebase in progress.
+	if err := os.MkdirAll(filepath.Join(repo, ".git", "rebase-merge"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	note, err := AttributeAndWrite(repo, sha)
+	if err != nil {
+		t.Fatalf("AttributeAndWrite: %v", err)
+	}
+	if note != nil {
+		t.Errorf("expected skip (nil note) during rewrite, got %+v", note)
+	}
+	// The inherited note must be untouched.
+	out := git("notes", "--ref="+NotesRef, "show", sha)
+	if !strings.Contains(out, `"author_type":"AI"`) || !strings.Contains(out, `"tool":"claude"`) {
+		t.Errorf("inherited note was clobbered during rewrite: %s", out)
+	}
+	// notes.rewriteRef must have been configured so git copies the note.
+	cfg := git("config", "--get-all", "notes.rewriteRef")
+	if !strings.Contains(cfg, NotesRef) {
+		t.Errorf("notes.rewriteRef must include %q, got %q", NotesRef, cfg)
+	}
+}
