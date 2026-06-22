@@ -332,7 +332,7 @@ Flag: `BLAMELY_ATTRIBUTION_V2` (CLI/daemon env, `1/true/on/yes`) and `blamely.at
 | Phase 5 note-seeding (committed authorship across commits) | ✅ CLI path | `internal/gitnotes/attribution_v2_seed.go` + `authorship.SeedHook` |
 | Gutter source — `blamely authorship <file>` (single per-line source, I4) | ✅ | CLI command; seeds + returns the working log; smoke-verified |
 | Editor-path note-seeding | ✅ | implicit in `authorship` (seeds committed authorship on query) |
-| Phase 3 **gutter** rendering flip (plugins paint from `authorship`) | ☐ | data source ready; rendering wiring needs a running IDE |
+| Phase 3 **gutter** rendering flip (plugins paint from `authorship`) | ◐ | `GutterV2` overlay implemented + compiling in BOTH IDEs (flag-gated, active editor); needs an IDE run to verify icons |
 | History-rewrite robustness (amend/rebase/cherry-pick) | ✅ | notes.rewriteRef + skip-while-in-progress; real-rebase e2e |
 | Merge-conflict-resolution attribution | ☐ | Phase 5 remainder |
 | Phase 6 retire old engine | ☐ | gated on §12 |
