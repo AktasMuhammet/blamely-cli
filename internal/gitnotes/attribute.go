@@ -460,6 +460,10 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	if err != nil {
 		return nil, fmt.Errorf("diff commit: %w", err)
 	}
+	// Attribution v2: a merge commit's note should credit only the conflict
+	// resolution (lines added vs BOTH parents), not the merged-in branch's lines
+	// (authored elsewhere). No-op for non-merges / when v2 is off.
+	restrictMergeToResolution(repoPath, sha, change)
 	commitNanos, err := CommitTimestampNanos(repoPath, sha)
 	if err != nil {
 		return nil, err

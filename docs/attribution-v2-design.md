@@ -338,7 +338,7 @@ setting `false`. With v2 off (opt-out), behavior is the legacy engine, unchanged
 | Watcher tools → v2 (Copilot transcript / Codex / Cursor / antigravity) | ✅ | dbSink.Record feeds live edits into the working log; stale replay skipped |
 | Phase 3 **gutter + sidebar** flip (plugins paint from `authorship`) | ◐ | both IDEs paint gutter/status/sidebar repo-wide from `authorship --all` (one v2 source); needs an IDE run to verify icons |
 | History-rewrite robustness (amend/rebase/cherry-pick) | ✅ | notes.rewriteRef + skip-while-in-progress; real-rebase e2e |
-| Merge-conflict-resolution attribution | ☐ | Phase 5 remainder |
+| Merge-conflict-resolution attribution | ✅ | merge note keeps only lines added vs BOTH parents (resolution); real-merge e2e |
 | Phase 6 retire old engine | ☐ | gated on §12 |
 | PreToolUse `--pre` install wiring | ☐ deferred | per-call hook cost while experimental |
 
