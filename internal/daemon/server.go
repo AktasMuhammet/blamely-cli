@@ -494,12 +494,59 @@ func validateAndStore(db *store.DB, p EditPayload) error {
 			ContentSHA: rl.ContentSHA, ContentSHANorm: rl.ContentSHANorm,
 		})
 	}
+	netUnchangedEditLines(&e)
 	sessions.resolve(db, &e, p.Branch)
 	if _, err := db.InsertEdit(e); err != nil {
 		return err
 	}
 	updateFileSnapshot(db, p.RepoPath, p.FilePath)
 	return nil
+}
+
+// netUnchangedEditLines cancels added/removed lines with identical content within
+// one edit. When a tool emits a whole-file (or large-region) rewrite, every
+// UNCHANGED line — and any human-typed line the assistant re-included verbatim —
+// arrives as a matching removed+added pair. Those are not AI authorship: only
+// net-new added lines and net-removed lines are. Doing this once here, on the
+// common store.Edit every tool funnels through (validateAndStore for hook tools,
+// dbSink.Record for watcher tools), means Copilot, Claude, Codex, Cursor, … all
+// get it — instead of each parser re-implementing (and drifting on) the rule.
+// Matching is by content_sha (multiset), so a re-included duplicate is cancelled
+// exactly as many times as it was removed.
+func netUnchangedEditLines(e *store.Edit) {
+	if len(e.Lines) == 0 || len(e.RemovedLines) == 0 {
+		return
+	}
+	remCount := make(map[string]int, len(e.RemovedLines))
+	for _, rl := range e.RemovedLines {
+		if rl.ContentSHA != "" {
+			remCount[rl.ContentSHA]++
+		}
+	}
+	addCount := make(map[string]int, len(e.Lines))
+	for _, ln := range e.Lines {
+		if ln.ContentSHA != "" {
+			addCount[ln.ContentSHA]++
+		}
+	}
+	keptLines := make([]store.EditLine, 0, len(e.Lines))
+	for _, ln := range e.Lines {
+		if ln.ContentSHA != "" && remCount[ln.ContentSHA] > 0 {
+			remCount[ln.ContentSHA]-- // unchanged line — paired with a removal
+			continue
+		}
+		keptLines = append(keptLines, ln)
+	}
+	keptRemoved := make([]store.RemovedLineHash, 0, len(e.RemovedLines))
+	for _, rl := range e.RemovedLines {
+		if rl.ContentSHA != "" && addCount[rl.ContentSHA] > 0 {
+			addCount[rl.ContentSHA]-- // unchanged line — paired with an addition
+			continue
+		}
+		keptRemoved = append(keptRemoved, rl)
+	}
+	e.Lines = keptLines
+	e.RemovedLines = keptRemoved
 }
 
 // updateFileSnapshot caches repo/file's current on-disk content as the

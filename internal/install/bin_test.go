@@ -94,3 +94,25 @@ func TestPlaceBinary_RenameAsideFallback(t *testing.T) {
 		t.Errorf("expected 1 renamed-aside copy, found %d", len(asides))
 	}
 }
+
+func TestRecordHookCommand_QuotesSpacedPath(t *testing.T) {
+	// Space-free path (the common case, and what the hook tests assume): unquoted,
+	// byte-identical so the idempotent re-install comparison stays stable.
+	if got := recordHookCommand("/usr/local/bin/blamely", "cursor"); got != "/usr/local/bin/blamely record cursor" {
+		t.Errorf("space-free: got %q", got)
+	}
+	// A path with a space must be quoted so the shell doesn't split it (else the
+	// hook silently never runs — the Windows symptom, since C:\Users\First Last\…
+	// is common). Use forward slashes here so the assertion is OS-independent:
+	// filepath.ToSlash only rewrites the host separator, so a backslash input
+	// wouldn't convert on this (non-Windows) test runner.
+	got := recordHookCommand("/usr/local/My Tools/blamely", "cursor")
+	want := `"/usr/local/My Tools/blamely" record cursor`
+	if got != want {
+		t.Errorf("spaced path:\n got  %q\n want %q", got, want)
+	}
+	// The path-agnostic marker suffix survives quoting (install/uninstall match it).
+	if !containsSubstr(got, "record cursor") {
+		t.Errorf("marker 'record cursor' lost after quoting: %q", got)
+	}
+}

@@ -162,6 +162,7 @@ func (s *dbSink) Record(ev Event) error {
 		}
 		e.RemovedLines = append(e.RemovedLines, store.RemovedLineHash{ContentSHA: rl.ContentSHA, ContentSHANorm: rl.ContentSHANorm})
 	}
+	netUnchangedEditLines(&e)
 	sessions.resolve(s.db, &e, ev.Branch)
 	if _, err := s.db.InsertEdit(e); err != nil {
 		log.Printf("watcher %q: insert edit failed file=%q: %v", ev.Tool, ev.FilePath, err)

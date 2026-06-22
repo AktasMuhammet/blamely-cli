@@ -92,9 +92,9 @@ func RecordCopilotFromStdin(r io.Reader) error {
 	// new content against the daemon's cached snapshot to detect removed lines —
 	// otherwise a Copilot CLI overwrite that drops lines loses the deletion.
 	if newFullContent != nil {
-		if snapshot, ok := fetchSnapshot(repoPath, rel); ok {
-			removed = append(removed, RemovedLineHashes(snapshot, *newFullContent)...)
-		}
+		var wfRemoved []DeletedLineHash
+		ranges, wfRemoved = ResolveWholeFileWrite(repoPath, rel, *newFullContent, ranges)
+		removed = append(removed, wfRemoved...)
 	}
 
 	gen := copilotGenType(p.ToolName)

@@ -207,6 +207,139 @@ func TestBuildNote_DeletionOnlyPopulatesByTool(t *testing.T) {
 
 func sqlNullString(s string) sql.NullString { return sql.NullString{Valid: true, String: s} }
 
+// TestBuildNote_PasteIntoIdenticalRunKeepsCount reproduces the user's commit
+// 8b56805e: the user pasted 4 IDENTICAL lines at L16–L19, but because the
+// surrounding lines are identical too, git anchors the inserted block at the
+// EARLIEST position and reports the added lines as L15–L18 (calling the user's
+// L19 "unchanged" and inventing a "new" L15). The copypaste edit recorded the
+// paste at its true positions (16–19). Before the fix the exact-position pin
+// only covered the overlap (16–18) → copypaste=3, and git's phantom L15 fell
+// through to bare Human. Expected: all 4 git-added lines attribute to copypaste,
+// since within an all-identical run it doesn't matter which copy git labeled new.
+func TestBuildNote_PasteIntoIdenticalRunKeepsCount(t *testing.T) {
+	db := openTestDB(t)
+	repo := "/r"
+	now := time.Now().UnixNano()
+
+	const x = "hello13, hello25" // every line in the run is this exact text
+
+	// The editor recorded the clipboard paste at its TRUE positions L16–L19.
+	if _, err := db.InsertEdit(store.Edit{
+		TimestampNanos: now - int64(time.Second),
+		RepoPath:       repo, FilePath: "f.txt",
+		Tool: store.ToolCopyPaste, Confidence: store.ConfidenceHigh, GenType: store.GenTypeHuman,
+		Lines: []store.EditLine{
+			{StartLine: 16, EndLine: 16, ContentSHA: sha256HexStr([]byte(x)), ContentSHANorm: sha256HexNormStr(x)},
+			{StartLine: 17, EndLine: 17, ContentSHA: sha256HexStr([]byte(x)), ContentSHANorm: sha256HexNormStr(x)},
+			{StartLine: 18, EndLine: 18, ContentSHA: sha256HexStr([]byte(x)), ContentSHANorm: sha256HexNormStr(x)},
+			{StartLine: 19, EndLine: 19, ContentSHA: sha256HexStr([]byte(x)), ContentSHANorm: sha256HexNormStr(x)},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// git's added set for this commit, anchored one line EARLIER than the paste.
+	added := []AddedLine{
+		{File: "f.txt", LineNum: 15, Content: x},
+		{File: "f.txt", LineNum: 16, Content: x},
+		{File: "f.txt", LineNum: 17, Content: x},
+		{File: "f.txt", LineNum: 18, Content: x},
+	}
+	note, err := buildNote(db, repo, "sha1", now, added, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("buildNote: %v", err)
+	}
+
+	at := map[int]string{}
+	for _, f := range note.Files {
+		for _, r := range f.Lines {
+			for ln := r.Start; ln <= r.End; ln++ {
+				at[ln] = r.AuthorType
+			}
+		}
+	}
+	for ln := 15; ln <= 18; ln++ {
+		if at[ln] != "Human" {
+			t.Errorf("L%d: want Human (pasted), got %s", ln, at[ln])
+		}
+	}
+	if cp := note.ByTool["copypaste"]; cp.Lines != 4 {
+		t.Errorf("by_tool copypaste lines = %d, want 4 (the whole paste)", cp.Lines)
+	}
+	if note.Totals.AILines != 0 || note.Totals.HumanLines != 4 {
+		t.Errorf("want AI 0 / Human 4, got AI %d / Human %d", note.Totals.AILines, note.Totals.HumanLines)
+	}
+}
+
+// TestBuildNote_PasteNotStolenByAIRepeat reproduces the user's second bug: the
+// user pastes a block, then an AI generates the SAME content. The AI's recording
+// leaves unused content_sha drift budget, which (before the fix) leaked onto the
+// pasted line git had anchored just outside the exact paste range — flipping the
+// user's pasted line to AI in the gutter. The copypaste budget is consumed BEFORE
+// the AI drift fallback, so the pasted line stays Human.
+func TestBuildNote_PasteNotStolenByAIRepeat(t *testing.T) {
+	db := openTestDB(t)
+	repo := "/r"
+	now := time.Now().UnixNano()
+
+	const x = "hello13, hello25"
+
+	// AI recorded the same content at a DRIFTED position (not committed here),
+	// leaving drift budget for x that could leak onto an unpinned identical line.
+	if _, err := db.InsertEdit(store.Edit{
+		TimestampNanos: now - int64(time.Minute),
+		RepoPath:       repo, FilePath: "f.txt",
+		Tool: store.ToolClaude, Confidence: store.ConfidenceHigh, GenType: store.GenTypeChat,
+		Model: sqlNullString("claude-opus-4-8"),
+		Lines: []store.EditLine{
+			{StartLine: 30, EndLine: 30, ContentSHA: sha256HexStr([]byte(x)), ContentSHANorm: sha256HexNormStr(x)},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The user's paste, recorded at its true positions L16–L19.
+	if _, err := db.InsertEdit(store.Edit{
+		TimestampNanos: now - int64(time.Second),
+		RepoPath:       repo, FilePath: "f.txt",
+		Tool: store.ToolCopyPaste, Confidence: store.ConfidenceHigh, GenType: store.GenTypeHuman,
+		Lines: []store.EditLine{
+			{StartLine: 16, EndLine: 16, ContentSHA: sha256HexStr([]byte(x)), ContentSHANorm: sha256HexNormStr(x)},
+			{StartLine: 17, EndLine: 17, ContentSHA: sha256HexStr([]byte(x)), ContentSHANorm: sha256HexNormStr(x)},
+			{StartLine: 18, EndLine: 18, ContentSHA: sha256HexStr([]byte(x)), ContentSHANorm: sha256HexNormStr(x)},
+			{StartLine: 19, EndLine: 19, ContentSHA: sha256HexStr([]byte(x)), ContentSHANorm: sha256HexNormStr(x)},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// git anchored the paste at L15–L18; L15 is the unpinned boundary line.
+	added := []AddedLine{
+		{File: "f.txt", LineNum: 15, Content: x},
+		{File: "f.txt", LineNum: 16, Content: x},
+		{File: "f.txt", LineNum: 17, Content: x},
+		{File: "f.txt", LineNum: 18, Content: x},
+	}
+	note, err := buildNote(db, repo, "sha1", now, added, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("buildNote: %v", err)
+	}
+
+	at := map[int]string{}
+	for _, f := range note.Files {
+		for _, r := range f.Lines {
+			for ln := r.Start; ln <= r.End; ln++ {
+				at[ln] = r.AuthorType
+			}
+		}
+	}
+	if at[15] != "Human" {
+		t.Errorf("L15 (pasted boundary line): want Human, got %s — AI repeat stole the paste", at[15])
+	}
+	if note.Totals.AILines != 0 || note.Totals.HumanLines != 4 {
+		t.Errorf("want AI 0 / Human 4 (all pasted), got AI %d / Human %d", note.Totals.AILines, note.Totals.HumanLines)
+	}
+}
+
 // TestBuildNote_PastedBlockIsCoherentlyHuman: the AI wrote a multi-line block
 // once; the human pasted an exact copy of it. Per-line matching splits the copy
 // jaggedly; coalesceDuplicateBlocks makes the whole pasted block Human and keeps

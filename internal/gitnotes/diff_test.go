@@ -498,3 +498,29 @@ func loadExcludeListFromContent(t *testing.T, content string) *config.ExcludeLis
 	}
 	return list
 }
+
+// Git appends a TAB after the path in ---/+++ headers when the filename contains
+// a space (e.g. "+++ b/login page.html\t"). The parsed path must NOT keep that
+// tab, else a space-named AI file's lines key under "login page.html\t", miss the
+// recorded AI edit ("login page.html"), and the whole file falls to Human.
+func TestParseDiff_SpaceInFilenameStripsTrailingTab(t *testing.T) {
+	diff := "diff --git a/login page.html b/login page.html\n" +
+		"new file mode 100644\n" +
+		"--- /dev/null\n" +
+		"+++ b/login page.html\t\n" +
+		"@@ -0,0 +1,2 @@\n" +
+		"+<html>\n" +
+		"+</html>\n"
+	c, err := parseDiff(strings.NewReader(diff), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Added) != 2 {
+		t.Fatalf("want 2 added lines, got %d", len(c.Added))
+	}
+	for _, a := range c.Added {
+		if a.File != "login page.html" {
+			t.Errorf("added line keyed under %q, want %q (trailing tab not stripped)", a.File, "login page.html")
+		}
+	}
+}

@@ -767,3 +767,65 @@ func portFromURL(t *testing.T, url string) int {
 	}
 	return port
 }
+
+// netUnchangedEditLines is the single, tool-agnostic place that drops unchanged
+// (and human-re-included) lines from a whole-file rewrite. Every tool's parser
+// emits raw added/removed lines (mirroring the Copilot apply_patch parser); this
+// is where the AI-vs-unchanged decision is made once for all of them. Repro from
+// the field (scenario_4521 Copilot, scenario_4500 Claude): "delete a few lines +
+// add a few" comes back as a -N/+N rewrite that re-includes unchanged and
+// human-typed lines; only the genuinely-new lines must remain AI.
+func TestNetUnchangedEditLines(t *testing.T) {
+	sha := func(s string) string { return "sha:" + s } // stand-in; helper compares equality only
+	e := &store.Edit{
+		Lines: []store.EditLine{
+			{StartLine: 1, EndLine: 1, ContentSHA: sha("heloo")},
+			{StartLine: 2, EndLine: 2, ContentSHA: sha("dasdasdas")},
+			{StartLine: 3, EndLine: 3, ContentSHA: sha("sadsadas")}, // human-pasted, re-included
+			{StartLine: 4, EndLine: 4, ContentSHA: sha("dasdasd")},  // human-pasted, re-included
+			{StartLine: 5, EndLine: 5, ContentSHA: sha("hello")},    // genuinely new
+			{StartLine: 6, EndLine: 6, ContentSHA: sha("hello")},
+			{StartLine: 7, EndLine: 7, ContentSHA: sha("hello")},
+		},
+		RemovedLines: []store.RemovedLineHash{
+			{ContentSHA: sha("ddasdsasd")}, // genuinely deleted
+			{ContentSHA: sha("sadasda")},
+			{ContentSHA: sha("dasasd")},
+			{ContentSHA: sha("heloo")}, // re-emitted unchanged
+			{ContentSHA: sha("dasdasdas")},
+			{ContentSHA: sha("sadsadas")},
+			{ContentSHA: sha("dasdasd")},
+		},
+	}
+	netUnchangedEditLines(e)
+
+	if len(e.Lines) != 3 {
+		t.Fatalf("added: want 3 (the new hello lines), got %d", len(e.Lines))
+	}
+	for i, ln := range e.Lines {
+		if ln.ContentSHA != sha("hello") {
+			t.Errorf("added[%d]: want hello, got %q", i, ln.ContentSHA)
+		}
+	}
+	if len(e.RemovedLines) != 3 {
+		t.Fatalf("removed: want 3 (ddasdsasd/sadasda/dasasd), got %d", len(e.RemovedLines))
+	}
+	for _, rl := range e.RemovedLines {
+		if rl.ContentSHA == sha("sadsadas") || rl.ContentSHA == sha("dasdasd") || rl.ContentSHA == sha("heloo") {
+			t.Errorf("an unchanged line leaked into removed: %q", rl.ContentSHA)
+		}
+	}
+}
+
+// A pure addition (no removed lines) and a pure deletion must pass through
+// untouched — netting only cancels matching pairs.
+func TestNetUnchangedEditLines_NoOpWhenNoOverlap(t *testing.T) {
+	e := &store.Edit{
+		Lines:        []store.EditLine{{StartLine: 1, EndLine: 1, ContentSHA: "a"}, {StartLine: 2, EndLine: 2, ContentSHA: "b"}},
+		RemovedLines: []store.RemovedLineHash{{ContentSHA: "x"}},
+	}
+	netUnchangedEditLines(e)
+	if len(e.Lines) != 2 || len(e.RemovedLines) != 1 {
+		t.Errorf("no-overlap edit was altered: added=%d removed=%d", len(e.Lines), len(e.RemovedLines))
+	}
+}

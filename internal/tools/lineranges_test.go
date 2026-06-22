@@ -550,3 +550,36 @@ func TestAddedOrMovedLineRanges_PureInsertAndDuplicate(t *testing.T) {
 		t.Fatalf("duplicate: want [2-..], got %+v", got)
 	}
 }
+
+// A whole-file Write must credit the AI only for genuinely-new lines, not for
+// unchanged or human-typed lines it re-emitted. Repro from the field
+// (scenario_4500.txt): the human's lines were in the file before Claude's Write;
+// the Write re-included them and they were wrongly attributed to Claude.
+func TestNarrowWholeFileAddedLines(t *testing.T) {
+	snapshot := "header\nhuman_typed_1\nhuman_typed_2\nfooter"
+	write := "header\nhuman_typed_1\nhuman_typed_2\nfooter\nai_new_1\nai_new_2"
+	got := narrowWholeFileAddedLines(snapshot, write)
+	if len(got) != 2 {
+		t.Fatalf("want 2 new AI lines, got %d: %+v", len(got), got)
+	}
+	if got[0].ContentSHA != sha256Hex([]byte("ai_new_1")) || got[1].ContentSHA != sha256Hex([]byte("ai_new_2")) {
+		t.Errorf("wrong lines credited: %+v", got)
+	}
+	for _, r := range got {
+		if r.ContentSHA == sha256Hex([]byte("human_typed_1")) || r.ContentSHA == sha256Hex([]byte("human_typed_2")) {
+			t.Errorf("human-typed line wrongly credited to AI")
+		}
+	}
+	// New positions are preserved (lines 5 and 6 in the written file).
+	if got[0].Start != 5 || got[1].Start != 6 {
+		t.Errorf("line numbers wrong: got %d,%d want 5,6", got[0].Start, got[1].Start)
+	}
+}
+
+// A no-op Write (content identical to the snapshot) credits the AI with nothing.
+func TestNarrowWholeFileAddedLines_NoChange(t *testing.T) {
+	same := "a\nb\nc"
+	if got := narrowWholeFileAddedLines(same, same); len(got) != 0 {
+		t.Errorf("identical write should yield 0 AI lines, got %d", len(got))
+	}
+}

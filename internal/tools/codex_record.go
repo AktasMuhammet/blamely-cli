@@ -76,13 +76,15 @@ func RecordCodexFromStdin(r io.Reader) error {
 		}
 	}
 
-	// Claude-compatible Write shape overwrites the whole file with no
-	// "before" content of its own — fetch the daemon's cached snapshot so we
-	// can still detect lines this write removed.
+	// Claude-compatible Write shape overwrites the whole file with no "before"
+	// content of its own — resolve it against the daemon's cached snapshot so
+	// added lines are narrowed to what genuinely changed (and removed lines
+	// detected), instead of crediting every re-emitted line to the AI. Same
+	// shared rule every whole-file tool uses.
 	if newFullContent != nil {
-		if snapshot, ok := fetchSnapshot(repoPath, rel); ok {
-			removed = append(removed, RemovedLineHashes(snapshot, *newFullContent)...)
-		}
+		var wfRemoved []DeletedLineHash
+		ranges, wfRemoved = ResolveWholeFileWrite(repoPath, rel, *newFullContent, ranges)
+		removed = append(removed, wfRemoved...)
 	}
 
 	payload := daemon.EditPayload{

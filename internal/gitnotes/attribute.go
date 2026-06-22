@@ -597,6 +597,22 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 		}
 	}
 
+	// Standardize by_tool so every AI tool reports the same shape. by_tool only
+	// ever holds AI tools (human lines live in Totals.HumanLines), so a tool's
+	// committed Lines ARE the lines the user kept — i.e. its accepted_lines.
+	// Watchers don't set accepted_lines (only the human→AI flip path did), which
+	// left it missing for codex/cursor/claude-desktop entries. Backfill it here,
+	// in one place, so consumers see accepted_lines for every tool. suggested_lines
+	// is deliberately left untouched: it's the model's REAL original proposal as
+	// reported by each watcher (0 where the watcher can't measure it), and
+	// inflating it to accepted would destroy the proposed-vs-kept signal.
+	for k, t := range note.ByTool {
+		if t.AcceptedLines == 0 && t.Lines > 0 {
+			t.AcceptedLines = t.Lines
+			note.ByTool[k] = t
+		}
+	}
+
 	body, err := json.Marshal(note)
 	if err != nil {
 		return nil, fmt.Errorf("marshal note: %w", err)
@@ -1109,6 +1125,54 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		driftUsed := map[string]int{}
 		driftUsedNorm := map[string]int{}
 
+		// Copypaste budget. Within a RUN of identical lines, git anchors the
+		// inserted block at the EARLIEST position, which need not coincide
+		// line-for-line with where the editor recorded the paste (e.g. the user
+		// pastes 4 copies at L16–L19 but git reports the added block as L15–L18,
+		// calling the user's L19 "unchanged" and inventing a "new" L15). The
+		// exact-position pin above (pastedLines) then misses the boundary line.
+		// Beyond those pins, allow a content to be claimed for copypaste as many
+		// times as a copypaste edit recorded it, minus the copies already pinned
+		// at their exact position — so the pasted COUNT is preserved regardless of
+		// which identical copy git happened to label "new". MAX over paste edits
+		// (re-records of the same paste don't add copies). Consumed before the AI
+		// drift fallback so an AI repeat generated AFTER the paste can't steal the
+		// pasted line.
+		pasteRecordedSHA := map[string]int{}
+		for i := range sessionEdits {
+			e := &sessionEdits[i]
+			if e.Tool != store.ToolCopyPaste || e.TimestampNanos <= sinceNanos || e.TimestampNanos > maxNanos {
+				continue
+			}
+			perEdit := map[string]int{}
+			for _, l := range e.Lines {
+				if l.ContentSHA != "" {
+					perEdit[l.ContentSHA]++
+				}
+			}
+			for k, v := range perEdit {
+				if v > pasteRecordedSHA[k] {
+					pasteRecordedSHA[k] = v
+				}
+			}
+		}
+		pasteExactSHA := map[string]int{}
+		for _, ln := range lineNos {
+			if !pastedLines[ln] {
+				continue
+			}
+			if c := lineContent[fileLineKey{file, ln}]; c != "" {
+				pasteExactSHA[sha256HexStr([]byte(c))]++
+			}
+		}
+		pasteBudget := map[string]int{}
+		for sha, rec := range pasteRecordedSHA {
+			if b := rec - pasteExactSHA[sha]; b > 0 {
+				pasteBudget[sha] = b
+			}
+		}
+		pasteUsed := map[string]int{}
+
 		for _, ln := range lineNos {
 			// Default: human-typed code. tool="" + gen_type=human is the
 			// canonical representation; humans aren't a tool.
@@ -1136,6 +1200,17 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			// AI produced stays Human.
 			if content != "" && (e == nil || isNonAITool(e.Tool)) {
 				shaKey := sha256HexStr([]byte(content))
+				// Copypaste budget (see above): a git-added line whose content was
+				// pasted, but which git anchored off the exact paste position, is
+				// claimed for copypaste here — before AI drift, so an AI repeat of
+				// the same content can't steal it. Still Human in the AI/Human split.
+				if pasteUsed[shaKey] < pasteBudget[shaKey] {
+					pasteUsed[shaKey]++
+					p.tool = store.ToolCopyPaste
+					p.genType = store.GenTypeHuman
+					resolved = append(resolved, p)
+					continue
+				}
 				if driftUsed[shaKey] < driftBudget[shaKey] {
 					if ai := pickDriftEdit(sessionEdits, content, sinceNanos, maxNanos, false, recPerEdit, usedPerEdit); ai != nil {
 						e = ai

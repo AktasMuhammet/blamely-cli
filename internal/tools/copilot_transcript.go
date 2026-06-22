@@ -220,14 +220,15 @@ func tailCopilotTranscript(ctx context.Context, path string, sink daemon.Sink, d
 			if ev.Data.ModelID != "" {
 				model = displayModel(ev.Data.ModelID)
 			}
-			hasPatch := false
+			hasEdit := false
 			for _, tr := range ev.Data.ToolRequests {
-				if looksLikePatch(tr.Name) {
-					hasPatch = true
+				if looksLikePatch(tr.Name) || looksLikeCreateFile(tr.Name) ||
+					looksLikeReplaceString(tr.Name) || looksLikeInsertEdit(tr.Name) {
+					hasEdit = true
 					break
 				}
 			}
-			if !hasPatch {
+			if !hasEdit {
 				saveWM(false)
 				continue
 			}
@@ -239,10 +240,23 @@ func tailCopilotTranscript(ctx context.Context, path string, sink daemon.Sink, d
 				m = model
 			}
 			for _, tr := range ev.Data.ToolRequests {
-				if !looksLikePatch(tr.Name) {
-					continue // chat only — read_file/manage_todo_list/etc. and inline completions are never recorded here
+				switch {
+				case looksLikePatch(tr.Name):
+					emitCopilotPatchEdits(tr.Arguments, m, inTok, outTok, path, sink)
+				case looksLikeCreateFile(tr.Name):
+					// Agent mode creates brand-new files with create_file, not
+					// apply_patch — without this their lines fall to Human at commit.
+					emitCopilotCreateFileEdits(tr.Arguments, m, inTok, outTok, path, sink)
+				case looksLikeReplaceString(tr.Name):
+					// Edits to EXISTING files use replace_string_in_file (not
+					// apply_patch) — the "file replace" case; without this the edit
+					// isn't recorded and the changed lines fall to Human.
+					emitCopilotReplaceStringEdits(tr.Arguments, m, inTok, outTok, path, sink)
+				case looksLikeInsertEdit(tr.Name):
+					emitCopilotInsertEditEdits(tr.Arguments, m, inTok, outTok, path, sink)
 				}
-				emitCopilotPatchEdits(tr.Arguments, m, inTok, outTok, path, sink)
+				// Anything else (read_file/manage_todo_list/etc. and inline
+				// completions) is never recorded here.
 			}
 		}
 		saveWM(false)
@@ -295,6 +309,169 @@ func emitCopilotPatchEdits(args json.RawMessage, model string, inputTokens, outp
 	}
 }
 
+// VS Code agent mode expresses file changes with several tools BESIDES apply_patch
+// — create_file for new files, replace_string_in_file / insert_edit_into_file for
+// edits to existing files. Each must be recognized or its lines fall to Human at
+// commit. apply_patch is handled by looksLikePatch / emitCopilotPatchEdits.
+func looksLikeCreateFile(name string) bool {
+	n := strings.ToLower(name)
+	return n == "create_file" || n == "createfile" || n == "create_new_file"
+}
+func looksLikeReplaceString(name string) bool {
+	n := strings.ToLower(name)
+	return n == "replace_string_in_file" || n == "replace_string" || n == "str_replace"
+}
+func looksLikeInsertEdit(name string) bool {
+	n := strings.ToLower(name)
+	return n == "insert_edit_into_file" || n == "insert_edit"
+}
+
+// unwrapToolArgs returns the inner JSON for a tool argument that may be a JSON
+// string literal wrapping the real object (Copilot double-encodes some args).
+func unwrapToolArgs(args json.RawMessage) json.RawMessage {
+	var asStr string
+	if json.Unmarshal(args, &asStr) == nil && strings.TrimSpace(asStr) != "" {
+		return json.RawMessage(asStr)
+	}
+	return args
+}
+
+// copilotAddedRangesFromContent returns one per-line LineRange (with content_sha)
+// for every non-blank line of content, numbered by position. Commit-time
+// attribution matches by content_sha, so positions are just stable placeholders.
+func copilotAddedRangesFromContent(content string) []daemon.LineRange {
+	var out []daemon.LineRange
+	for i, line := range strings.Split(content, "\n") {
+		text := strings.TrimRight(line, "\r")
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		out = append(out, daemon.LineRange{
+			Start: i + 1, End: i + 1,
+			ContentSHA: sha256Hex([]byte(text)), ContentSHANorm: sha256HexNorm(text),
+		})
+	}
+	return out
+}
+
+// copilotRemovedHashesFromContent returns removed-line hashes for every non-blank
+// line of content (the deletion-side counterpart of copilotAddedRangesFromContent).
+func copilotRemovedHashesFromContent(content string) []daemon.RemovedLineHash {
+	var out []daemon.RemovedLineHash
+	for _, line := range strings.Split(content, "\n") {
+		text := strings.TrimRight(line, "\r")
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		out = append(out, daemon.RemovedLineHash{
+			ContentSHA: sha256Hex([]byte(text)), ContentSHANorm: sha256HexNorm(text),
+		})
+	}
+	return out
+}
+
+// emitCopilotFileEdit records ONE normalized Copilot chat edit for absPath, given
+// already-parsed added/removed lines. It resolves the repo + relative path and
+// attaches the turn's model/tokens. Shared by every non-apply_patch tool parser
+// (create_file, replace_string_in_file, insert_edit_into_file) so they all produce
+// the same normalized edit — and the daemon's common netUnchangedEditLines then
+// drops any unchanged/human lines the tool re-emitted.
+func emitCopilotFileEdit(absPath string, added []daemon.LineRange, removed []daemon.RemovedLineHash, model string, inputTokens, outputTokens int64, sessionPath, kind string, sink daemon.Sink) {
+	if strings.TrimSpace(absPath) == "" || (len(added) == 0 && len(removed) == 0) {
+		return
+	}
+	abs := strings.TrimSpace(absPath)
+	if r, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = r
+	}
+	repo, _ := gitutil.RepoID(abs)
+	if repo == "" {
+		return
+	}
+	rel := abs
+	if wt, _ := gitutil.Toplevel(abs); wt != "" {
+		if r, err := filepath.Rel(wt, abs); err == nil && !strings.HasPrefix(r, "..") {
+			rel = r
+		}
+	}
+	ev := daemon.Event{
+		When:         time.Now(),
+		Tool:         "copilot",
+		Confidence:   "high",
+		GenType:      "chat",
+		Model:        model,
+		RepoPath:     repo,
+		FilePath:     rel,
+		Lines:        added,
+		RemovedLines: removed,
+		RawMeta:      fmt.Sprintf(`{"source":"copilot_transcript","transcript_path":%q,"tool_kind":%q}`, sessionPath, kind),
+	}
+	if inputTokens > 0 {
+		v := inputTokens
+		ev.InputTokens = &v
+	}
+	if outputTokens > 0 {
+		v := outputTokens
+		ev.OutputTokens = &v
+	}
+	if err := sink.Record(ev); err != nil {
+		log.Printf("copilot-transcript sink: %v", err)
+	} else {
+		log.Printf("copilot-transcript: %s %s +%d -%d model=%s", kind, rel, len(added), len(removed), model)
+	}
+}
+
+// emitCopilotCreateFileEdits parses a create_file tool argument
+// ({"filePath","content"}) and records every non-blank content line as a chat
+// edit, so a brand-new AI file is attributed to Copilot instead of falling to Human.
+func emitCopilotCreateFileEdits(args json.RawMessage, model string, inputTokens, outputTokens int64, sessionPath string, sink daemon.Sink) {
+	var cf struct {
+		FilePath string `json:"filePath"`
+		Content  string `json:"content"`
+	}
+	if json.Unmarshal(unwrapToolArgs(args), &cf) != nil {
+		return
+	}
+	emitCopilotFileEdit(cf.FilePath, copilotAddedRangesFromContent(cf.Content), nil,
+		model, inputTokens, outputTokens, sessionPath, "create_file", sink)
+}
+
+// emitCopilotReplaceStringEdits parses a replace_string_in_file tool argument
+// ({"filePath","oldString","newString"}) — Copilot's edit-an-existing-file tool —
+// recording newString lines as added and oldString lines as removed. The daemon's
+// netUnchangedEditLines then cancels the unchanged context the model re-emitted, so
+// only the genuinely-changed lines are credited to the AI.
+func emitCopilotReplaceStringEdits(args json.RawMessage, model string, inputTokens, outputTokens int64, sessionPath string, sink daemon.Sink) {
+	var rep struct {
+		FilePath  string `json:"filePath"`
+		OldString string `json:"oldString"`
+		NewString string `json:"newString"`
+	}
+	if json.Unmarshal(unwrapToolArgs(args), &rep) != nil {
+		return
+	}
+	emitCopilotFileEdit(rep.FilePath,
+		copilotAddedRangesFromContent(rep.NewString),
+		copilotRemovedHashesFromContent(rep.OldString),
+		model, inputTokens, outputTokens, sessionPath, "replace_string_in_file", sink)
+}
+
+// emitCopilotInsertEditEdits parses an insert_edit_into_file tool argument
+// ({"filePath","code"}) — Copilot's other edit tool — recording the inserted code
+// lines as added. (`code` carries only the new/changed region; any context line it
+// includes that already exists won't match the file at commit, so it's harmless.)
+func emitCopilotInsertEditEdits(args json.RawMessage, model string, inputTokens, outputTokens int64, sessionPath string, sink daemon.Sink) {
+	var in struct {
+		FilePath string `json:"filePath"`
+		Code     string `json:"code"`
+	}
+	if json.Unmarshal(unwrapToolArgs(args), &in) != nil {
+		return
+	}
+	emitCopilotFileEdit(in.FilePath, copilotAddedRangesFromContent(in.Code), nil,
+		model, inputTokens, outputTokens, sessionPath, "insert_edit_into_file", sink)
+}
+
 // chatSessionModelUsage reads the model + latest token usage from the chatSessions
 // file that pairs with a transcript (same session id, sibling directory). The
 // transcript stream itself has neither, so this is the only source. Best-effort:
@@ -330,6 +507,10 @@ type copilotPatchFile struct {
 // per-line added ranges (content_sha + norm) and removed-line hashes. Positions
 // are sequential placeholders — commit-time attribution matches by content_sha,
 // not line number, so the AI lines survive drift.
+//
+// This records the raw +/- lines as-is; unchanged lines an agent re-emits as
+// matching -X/+X pairs (whole-file rewrites) are netted out centrally in
+// netUnchangedEditLines at daemon ingestion, so every tool shares that rule.
 func parseApplyPatchPerLine(body string) []copilotPatchFile {
 	var out []copilotPatchFile
 	var cur *copilotPatchFile

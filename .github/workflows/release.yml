@@ -160,45 +160,6 @@ jobs:
           fi
           echo "OK: $bin shows no readable blamely import paths"
 
-      - name: Sign Windows binary (Authenticode)
-        # An UNSIGNED, garble-obfuscated binary is what trips Defender's
-        # Trojan:Win32/Gracing (and Wacatac/Sabsik) FALSE positives — the
-        # encrypted-literals pattern looks like a packer. Signing it with a
-        # trusted code-signing cert removes the warning while keeping -literals.
-        # Set the WINDOWS_CERT_BASE64 (base64 of a .pfx) and WINDOWS_CERT_PASSWORD
-        # repo secrets to enable it; with no cert the step warns and ships
-        # unsigned so forks/CI still build. (EV/HSM-token certs can't be exported
-        # to a .pfx — those need a dedicated signing service or self-hosted
-        # runner; this covers the .pfx/OV path.)
-        if: matrix.goos == 'windows'
-        shell: pwsh
-        env:
-          WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
-          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
-        run: |
-          $bin = "dist/blamely_${{ steps.tag.outputs.tag }}_${{ matrix.goos }}_${{ matrix.goarch }}/blamely${{ matrix.ext }}"
-          if ([string]::IsNullOrEmpty($env:WINDOWS_CERT_BASE64)) {
-            Write-Warning "WINDOWS_CERT_BASE64 secret not set — shipping $bin UNSIGNED (Defender may flag it as Trojan:Win32/Gracing)."
-            exit 0
-          }
-          $pfx = Join-Path $env:RUNNER_TEMP 'blamely-sign.pfx'
-          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERT_BASE64))
-          try {
-            # PersistKeySet so the private key is usable for signing.
-            $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]'PersistKeySet,Exportable'
-            $cert  = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($pfx, $env:WINDOWS_CERT_PASSWORD, $flags)
-            # SHA-256 + an RFC3161 timestamp so the signature outlives the cert.
-            $sig = Set-AuthenticodeSignature -FilePath $bin -Certificate $cert `
-                     -HashAlgorithm SHA256 -TimestampServer 'http://timestamp.digicert.com'
-            if ($sig.Status -ne 'Valid') {
-              Write-Error "signing failed: $($sig.Status) — $($sig.StatusMessage)"
-              exit 1
-            }
-            Write-Host "Signed and timestamped $bin"
-          } finally {
-            Remove-Item $pfx -Force -ErrorAction SilentlyContinue
-          }
-
       - name: Smoke-test obfuscated binary (native arch only)
         # The static grep can't catch an obfuscated-but-BROKEN binary. With
         # GOGARBLE='*', garble rewrites modernc.org/sqlite (heavy unsafe +

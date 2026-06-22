@@ -279,6 +279,59 @@ func narrowToChangedLines(oldStr, newStr string, full LineRange) ([]LineRange, i
 	return out, suggested
 }
 
+// ResolveWholeFileWrite is the single, tool-agnostic resolution for a whole-file
+// overwrite (Write / write_file / Copilot CLI write): given the repo+file and the
+// new full content, it fetches the pre-write snapshot and returns the added lines
+// narrowed to what genuinely changed plus the removed-line hashes. When no
+// snapshot exists it returns `fallback` (the caller's whole-file ranges) and no
+// removals, since there is no baseline to narrow against.
+//
+// Every whole-file parser MUST route through here so the "unchanged/human lines an
+// overwrite re-emitted are not AI" rule is applied identically — instead of each
+// parser re-deriving (and, as happened, some omitting) it.
+func ResolveWholeFileWrite(repoPath, filePath, newContent string, fallback []LineRange) (added []LineRange, removed []DeletedLineHash) {
+	snapshot, ok := fetchSnapshot(repoPath, filePath)
+	if !ok {
+		return fallback, nil
+	}
+	return narrowWholeFileAddedLines(snapshot, newContent), RemovedLineHashes(snapshot, newContent)
+}
+
+// narrowWholeFileAddedLines narrows a WHOLE-FILE write (newStr is the entire new
+// file content) down to the lines genuinely new or moved vs oldStr (the pre-write
+// content), each carrying its content_sha so attribution survives drift. Unlike
+// narrowToChangedLines it has NO "credit the whole span when nothing changed"
+// fallback: a write whose content equals the prior file yields zero AI lines.
+//
+// Shared by every parser that receives whole-file content (Claude Write, Copilot
+// CLI record, …): without it those parsers credit EVERY line — including unchanged
+// and human-typed lines the agent merely re-emitted — to the AI. Returns line
+// numbers as positions within newStr.
+func narrowWholeFileAddedLines(oldStr, newStr string) []LineRange {
+	newLines := strings.Split(newStr, "\n")
+	if n := len(newLines); n > 0 && newLines[n-1] == "" {
+		newLines = newLines[:n-1] // drop trailing empty from a final newline
+	}
+	var out []LineRange
+	for _, r := range addedOrMovedLineRanges([]byte(oldStr), []byte(newStr)) {
+		for rel := r.Start; rel <= r.End; rel++ {
+			if rel-1 < 0 || rel-1 >= len(newLines) {
+				continue
+			}
+			text := strings.TrimRight(newLines[rel-1], "\r")
+			if strings.TrimSpace(text) == "" {
+				continue
+			}
+			out = append(out, LineRange{
+				Start: rel, End: rel,
+				ContentSHA:     sha256Hex([]byte(text)),
+				ContentSHANorm: sha256HexNorm(text),
+			})
+		}
+	}
+	return out
+}
+
 // CountAddedLines returns the number of net-new lines in newStr vs oldStr —
 // i.e. the same metric narrowToChangedLines yields when an absolute file
 // location is unavailable. Used by Edit/MultiEdit handlers to still credit

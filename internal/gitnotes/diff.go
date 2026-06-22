@@ -165,6 +165,21 @@ func DiffCommit(repoPath, sha string) (*CommitChange, error) {
 	return out, nil
 }
 
+// trimDiffHeaderPathTab strips git's path-terminating TAB from a `--- a/` /
+// `+++ b/` header path. Git appends a TAB after the filename in these headers
+// when the name contains a space (to mark where the name ends), e.g.
+// `+++ b/login page.html\t`. Left in, the trailing tab makes the post-commit
+// path ("login page.html\t") fail to match the recorded AI edit's path
+// ("login page.html"), so every line of a space-named file falls to Human even
+// though an AI tool authored it. A filename containing a literal tab is
+// git-quoted instead, so cutting at the first tab is safe.
+func trimDiffHeaderPathTab(s string) string {
+	if i := strings.IndexByte(s, '\t'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
 // parseDiff reads `git diff --unified=0 -M -C` output and produces a
 // CommitChange. Extracted from DiffCommit so the hunk-pairing logic can be
 // exercised with hand-crafted diff strings in tests.
@@ -341,11 +356,11 @@ func parseDiff(r io.Reader, excl *config.ExcludeList) (*CommitChange, error) {
 			}
 			setFileChange(to, FileCopied)
 		case strings.HasPrefix(line, "--- a/"):
-			curDelFile = strings.TrimPrefix(line, "--- a/")
+			curDelFile = trimDiffHeaderPathTab(strings.TrimPrefix(line, "--- a/"))
 		case strings.HasPrefix(line, "--- /dev/null"):
 			curDelFile = "" // new file — no pre-commit path
 		case strings.HasPrefix(line, "+++ b/"):
-			curFile = strings.TrimPrefix(line, "+++ b/")
+			curFile = trimDiffHeaderPathTab(strings.TrimPrefix(line, "+++ b/"))
 		case strings.HasPrefix(line, "+++ /dev/null"):
 			curFile = "" // deleted file — no post-commit path
 		case strings.HasPrefix(line, "@@"):

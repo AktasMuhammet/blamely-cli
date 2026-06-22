@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/blamely/blamely/internal/config"
@@ -26,8 +27,19 @@ import (
 // (forward slashes, which CreateProcess accepts and which need no JSON/TOML
 // escaping) makes the comparison stable. Matching by marker on uninstall is
 // unaffected (it's path-agnostic).
+//
+// A path containing whitespace is quoted: the hook runner executes this command
+// through a shell, so an UNQUOTED path with a space (very common on Windows —
+// C:\Users\First Last\.blamely\bin\blamely.exe) is split on the space and the
+// hook silently never runs. Quoting only when needed keeps the byte-identical /
+// idempotent comparison for the common (space-free) path, and the " record <tool>"
+// marker suffix is preserved either way.
 func recordHookCommand(binaryPath, tool string) string {
-	return filepath.ToSlash(binaryPath) + " record " + tool
+	p := filepath.ToSlash(binaryPath)
+	if strings.ContainsAny(p, " \t") {
+		p = `"` + p + `"`
+	}
+	return p + " record " + tool
 }
 
 // InstalledBinaryPath returns the path where `blamely install` keeps a stable

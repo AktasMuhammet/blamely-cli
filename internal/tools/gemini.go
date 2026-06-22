@@ -77,9 +77,9 @@ func RecordGeminiFromStdin(r io.Reader) error {
 	// own — fetch the daemon's cached snapshot (the file's content as of its
 	// last recorded edit) so we can still detect lines this write removed.
 	if newFullContent != nil {
-		if snapshot, ok := fetchSnapshot(repoPath, rel); ok {
-			removed = append(removed, RemovedLineHashes(snapshot, *newFullContent)...)
-		}
+		var wfRemoved []DeletedLineHash
+		ranges, wfRemoved = ResolveWholeFileWrite(repoPath, rel, *newFullContent, ranges)
+		removed = append(removed, wfRemoved...)
 	}
 
 	genType := ReadTranscriptGenType(p.TranscriptPath)
