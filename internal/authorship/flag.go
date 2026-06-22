@@ -5,15 +5,15 @@ import (
 	"strings"
 )
 
-// Enabled reports whether the Attribution v2 working-log engine runs alongside the
-// existing recorder. OFF by default; set BLAMELY_ATTRIBUTION_V2=1 (or true/on/yes)
-// to enable. This is the Phase 1–2 dual-run switch: while on, edits also flow into
-// the working log, but the committed note and the gutter do NOT read it until the
-// Phase 3 flip — so enabling it is side-effect-free for attribution output.
+// Enabled reports whether the Attribution v2 working-log engine is active (capture,
+// note flip, seeding, GC). ON by default; opt out with BLAMELY_ATTRIBUTION_V2 set to
+// 0/false/off/no/disable(d). When on, the committed note is sourced from the
+// diff-based working log, falling back to the legacy engine for any file that has no
+// working log — so it degrades safely where v2 never captured.
 func Enabled() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("BLAMELY_ATTRIBUTION_V2"))) {
-	case "1", "true", "on", "yes":
-		return true
+	case "0", "false", "off", "no", "disable", "disabled":
+		return false
 	}
-	return false
+	return true
 }

@@ -10,10 +10,12 @@ This document specifies a migration of Blamely's line-level AI/Human attribution
 current **"record per-line content hashes, then guess at commit"** model to a
 **"capture a pre-edit baseline, diff it, and maintain a stateful working log"** model.
 
-Implementation is **gated by a feature flag** — `BLAMELY_ATTRIBUTION_V2` (CLI/daemon
-env) and `blamely.attributionV2` (both editor plugins), **off by default** — so `main`
-ships unchanged. See **§16 — Implementation status** for what is built today; correctness is
-verified against the **invariants (§4)** and the **proof matrix (§11)**.
+Implementation is **on by default** as of this branch — `BLAMELY_ATTRIBUTION_V2`
+(CLI/daemon env) and `blamely.attributionV2` (both editor plugins) default to ON, with
+opt-out (env `0/false/off`; setting `false`). It **degrades safely**: any file with no
+working log falls back to the legacy engine, so default behavior only changes where v2
+actually captured. See **§16 — Implementation status** for what is built today;
+correctness is verified against the **invariants (§4)** and the **proof matrix (§11)**.
 
 ---
 
@@ -316,8 +318,9 @@ mis-attribution.
 
 ## 16. Implementation status (as built)
 
-Flag: `BLAMELY_ATTRIBUTION_V2` (CLI/daemon env, `1/true/on/yes`) and `blamely.attributionV2`
-(both editor settings), **off by default**. `main` behavior is unchanged with the flag off.
+Flag: `BLAMELY_ATTRIBUTION_V2` (CLI/daemon env) and `blamely.attributionV2` (both editor
+settings), **on by default**; opt out with the env set to `0/false/off/no/disable` or the
+setting `false`. With v2 off (opt-out), behavior is the legacy engine, unchanged.
 
 | Area | State | Where |
 |---|---|---|
