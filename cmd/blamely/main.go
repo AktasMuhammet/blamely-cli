@@ -330,6 +330,18 @@ func cmdRecord() *cobra.Command {
 			// the very tools blamely sits in front of. So we record best-effort
 			// and swallow errors (surfaced on stderr for debugging only); a
 			// failed recording must never block the host tool.
+
+			// --pre: PreToolUse mode. Snapshot the target file's pre-edit content
+			// as the Attribution v2 baseline (flag-gated, best-effort) instead of
+			// recording an edit. The matching PostToolUse `record` then diffs the
+			// agent's write against this exact baseline.
+			if pre, _ := cmd.Flags().GetBool("pre"); pre {
+				if err := tools.CaptureBaselineFromStdin(os.Stdin); err != nil {
+					fmt.Fprintf(os.Stderr, "blamely record %s --pre: %v\n", args[0], err)
+				}
+				return nil
+			}
+
 			var recErr error
 			switch args[0] {
 			case "claude", "cursor":
@@ -351,6 +363,7 @@ func cmdRecord() *cobra.Command {
 			return nil
 		},
 	}
+	c.Flags().Bool("pre", false, "PreToolUse mode: snapshot the target file's pre-edit content as the Attribution v2 baseline (no edit recorded)")
 	return c
 }
 

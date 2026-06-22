@@ -1,8 +1,10 @@
 package tools
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/blamely/blamely/internal/authorship"
@@ -59,4 +61,48 @@ func TestCaptureV2_FlagGatingAndAuthorChaining(t *testing.T) {
 	if got[3] != authorship.AI {
 		t.Errorf("appended line must be AI, got L3=%q", got[3])
 	}
+}
+
+// record --pre (CaptureBaselineFromStdin) snapshots the pre-edit content so the
+// matching post-edit captureV2 diffs against it — the terminal-agent baseline
+// fallback. Here: human content exists, --pre captures it, then an AI edit appends;
+// the human lines must stay Human.
+func TestCaptureBaselineFromStdin_FeedsPostEditDiff(t *testing.T) {
+	t.Setenv("BLAMELY_ATTRIBUTION_V2", "1")
+	repo := gitInitRepo(t)
+	rel := "f.txt"
+	abs := filepath.Join(repo, rel)
+	os.WriteFile(abs, []byte("h1\nh2\n"), 0o644)
+
+	// PreToolUse: capture the current (human) content as the baseline.
+	payload := `{"cwd":` + jsonStr(repo) + `,"tool_input":{"file_path":` + jsonStr(abs) + `}}`
+	if err := CaptureBaselineFromStdin(strings.NewReader(payload)); err != nil {
+		t.Fatal(err)
+	}
+	// The agent then appends a line; PostToolUse records it.
+	os.WriteFile(abs, []byte("h1\nh2\nai3\n"), 0o644)
+	captureV2(repo, rel, "claude", "chat", "")
+
+	ctx, ok := authorship.ResolveContext(abs)
+	if !ok {
+		t.Fatal("resolve ctx")
+	}
+	wl, err := authorship.LoadWorkingLog(ctx.RepoRoot, ctx.Branch, ctx.BaseSHA, ctx.RelPath)
+	if err != nil || wl == nil {
+		t.Fatalf("load working log: %v", err)
+	}
+	got := map[int]authorship.AuthorType{}
+	for _, r := range wl.Lines {
+		for ln := r.Start; ln <= r.End; ln++ {
+			got[ln] = r.Author.Type
+		}
+	}
+	if got[1] != authorship.Human || got[2] != authorship.Human || got[3] != authorship.AI {
+		t.Errorf("want H,H,AI; got L1=%q L2=%q L3=%q", got[1], got[2], got[3])
+	}
+}
+
+func jsonStr(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }
