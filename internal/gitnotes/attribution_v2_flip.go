@@ -10,6 +10,15 @@ import "github.com/blamely/blamely/internal/authorship"
 // file with no working log keeps its v1 attribution (degraded, not wrong). Behind
 // the flag, so default behavior is unchanged.
 
+// gcWorkingLogsIfEnabled prunes dangling-base working logs after a commit
+// (flag-gated, best-effort) so history-rewrite churn doesn't accumulate on disk.
+func gcWorkingLogsIfEnabled(repoPath string) {
+	if !authorship.Enabled() {
+		return
+	}
+	_, _ = authorship.GCWorkingLogs(repoPath)
+}
+
 func flipNoteToWorkingLog(repoPath string, note *Note) {
 	if note == nil || !authorship.Enabled() {
 		return

@@ -620,6 +620,7 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	// unchanged.
 	logV2Divergence(repoPath, note)
 	flipNoteToWorkingLog(repoPath, note)
+	gcWorkingLogsIfEnabled(repoPath)
 
 	body, err := json.Marshal(note)
 	if err != nil {
