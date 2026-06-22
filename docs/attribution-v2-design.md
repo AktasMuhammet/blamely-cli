@@ -330,8 +330,9 @@ Flag: `BLAMELY_ATTRIBUTION_V2` (CLI/daemon env, `1/true/on/yes`) and `blamely.at
 | Phase 3 **note** flip (note ← working log) | ✅ | `internal/gitnotes/attribution_v2_flip.go` |
 | Phase 5 GC (prune dangling-base logs) | ✅ | `internal/authorship/gc.go` |
 | Phase 5 note-seeding (committed authorship across commits) | ✅ CLI path | `internal/gitnotes/attribution_v2_seed.go` + `authorship.SeedHook` |
-| Phase 3 **gutter** flip (plugins read the working log live) | ☐ | needs editor work + a running IDE |
-| Editor-path note-seeding (FileTracker init from committed authorship) | ☐ | TS/Kotlin tracker work |
+| Gutter source — `blamely authorship <file>` (single per-line source, I4) | ✅ | CLI command; seeds + returns the working log; smoke-verified |
+| Editor-path note-seeding | ✅ | implicit in `authorship` (seeds committed authorship on query) |
+| Phase 3 **gutter** rendering flip (plugins paint from `authorship`) | ☐ | data source ready; rendering wiring needs a running IDE |
 | History-rewrite robustness (amend/rebase/cherry-pick) | ✅ | notes.rewriteRef + skip-while-in-progress; real-rebase e2e |
 | Merge-conflict-resolution attribution | ☐ | Phase 5 remainder |
 | Phase 6 retire old engine | ☐ | gated on §12 |
