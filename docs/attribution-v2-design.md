@@ -336,7 +336,7 @@ setting `false`. With v2 off (opt-out), behavior is the legacy engine, unchanged
 | Gutter source — `blamely authorship <file>` (single per-line source, I4) | ✅ | CLI command; seeds + returns the working log; smoke-verified |
 | Editor-path note-seeding | ✅ | implicit in `authorship` (seeds committed authorship on query) |
 | Watcher tools → v2 (Copilot transcript / Codex / Cursor / antigravity) | ✅ | dbSink.Record feeds live edits into the working log; stale replay skipped |
-| Phase 3 **gutter** rendering flip (plugins paint from `authorship`) | ◐ | `GutterV2` overlay implemented + compiling in BOTH IDEs (flag-gated, active editor); needs an IDE run to verify icons |
+| Phase 3 **gutter + sidebar** flip (plugins paint from `authorship`) | ◐ | both IDEs paint gutter/status/sidebar repo-wide from `authorship --all` (one v2 source); needs an IDE run to verify icons |
 | History-rewrite robustness (amend/rebase/cherry-pick) | ✅ | notes.rewriteRef + skip-while-in-progress; real-rebase e2e |
 | Merge-conflict-resolution attribution | ☐ | Phase 5 remainder |
 | Phase 6 retire old engine | ☐ | gated on §12 |
