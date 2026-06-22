@@ -634,6 +634,7 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	logV2Divergence(repoPath, note)
 	flipNoteToWorkingLog(repoPath, note)
 	gcWorkingLogsIfEnabled(repoPath)
+	migrateWorkingLogsOnCommit(repoPath, note)
 
 	body, err := json.Marshal(note)
 	if err != nil {

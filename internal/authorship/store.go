@@ -313,3 +313,59 @@ func ListWorkingLogs(repoRoot, branch, baseSHA string) ([]*WorkingLog, error) {
 	}
 	return out, nil
 }
+
+// MigrateWorkingLogs re-keys working logs (and their baselines) from oldBase to
+// newBase under the same branch, updating each log's BaseSHA. Called post-commit to
+// move uncommitted attribution onto the new HEAD so it survives the commit (a partial
+// commit of one file must not strand another file's working log) and stays bounded —
+// logs follow HEAD instead of accumulating at ancestor bases.
+//
+// Files in `keepAtOldBase` are LEFT at oldBase: those are the files this commit
+// included, and a later amend/rebase re-attributes that same commit by reading its
+// parent-base log + copying the note (see attribution_v2_gitops.go), so moving them
+// would make the rewrite fall back to v1 and clobber the correct note. A file whose
+// newBase log already exists (a fresher editor flush) wins; the old one is dropped.
+// No-op when oldBase == newBase or there is nothing to move.
+func MigrateWorkingLogs(repoRoot, branch, oldBase, newBase string, keepAtOldBase map[string]bool) error {
+	if oldBase == "" || newBase == "" || oldBase == newBase {
+		return nil
+	}
+	logs, err := ListWorkingLogs(repoRoot, branch, oldBase)
+	if err != nil || len(logs) == 0 {
+		return err
+	}
+	for _, wl := range logs {
+		rel := wl.File
+		if keepAtOldBase[rel] {
+			continue // committed in this commit — keep for amend/rebase re-flip
+		}
+		oldWL := WorkingLogPath(repoRoot, branch, oldBase, rel)
+		oldBaseline := BaselinePath(repoRoot, branch, oldBase, rel)
+		newWL := WorkingLogPath(repoRoot, branch, newBase, rel)
+		if _, statErr := os.Stat(newWL); statErr == nil {
+			// A fresher log already exists at the new base — drop the stale one.
+			_ = os.Remove(oldWL)
+			_ = os.Remove(oldBaseline)
+			continue
+		}
+		wl.BaseSHA = newBase
+		data, merr := json.MarshalIndent(wl, "", "  ")
+		if merr != nil {
+			continue
+		}
+		if atomicWrite(newWL, data) != nil {
+			continue
+		}
+		if content, ok := loadBaseline(oldBaseline); ok {
+			_ = atomicWrite(BaselinePath(repoRoot, branch, newBase, rel), []byte(content))
+		}
+		_ = os.Remove(oldWL)
+		_ = os.Remove(oldBaseline)
+	}
+	// Drop the old base dir only if nothing was kept there (no committed-file logs
+	// retained for amend/rebase). os.Remove fails (non-empty) → harmless.
+	if remaining, rerr := ListWorkingLogs(repoRoot, branch, oldBase); rerr == nil && len(remaining) == 0 {
+		_ = os.RemoveAll(workingLogDir(repoRoot, branch, oldBase))
+	}
+	return nil
+}

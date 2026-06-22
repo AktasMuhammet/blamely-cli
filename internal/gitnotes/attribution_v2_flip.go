@@ -19,6 +19,27 @@ func gcWorkingLogsIfEnabled(repoPath string) {
 	_, _ = authorship.GCWorkingLogs(repoPath)
 }
 
+// migrateWorkingLogsOnCommit re-keys the just-committed parent's working logs onto
+// the new HEAD (this commit), so uncommitted attribution for files NOT in this commit
+// survives a partial commit, and tracked logs follow HEAD instead of stranding at the
+// parent base. Must run AFTER the flip has read the parent-base logs. Flag-gated.
+func migrateWorkingLogsOnCommit(repoPath string, note *Note) {
+	if note == nil || !authorship.Enabled() {
+		return
+	}
+	parent := commitParentSHA(repoPath, note.Commit)
+	if parent == "" {
+		return
+	}
+	// Files included in THIS commit stay at the parent base (amend/rebase re-flips
+	// them from there); only uncommitted files migrate forward to the new HEAD.
+	committed := make(map[string]bool, len(note.Files))
+	for _, f := range note.Files {
+		committed[f.Path] = true
+	}
+	_ = authorship.MigrateWorkingLogs(repoPath, note.Branch, parent, note.Commit, committed)
+}
+
 func flipNoteToWorkingLog(repoPath string, note *Note) {
 	if note == nil || !authorship.Enabled() {
 		return
