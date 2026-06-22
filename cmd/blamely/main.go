@@ -10,6 +10,7 @@ import (
 
 	"time"
 
+	"github.com/blamely/blamely/internal/authorship"
 	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/daemon"
 	"github.com/blamely/blamely/internal/gitnotes"
@@ -18,6 +19,17 @@ import (
 	"github.com/blamely/blamely/internal/store"
 	"github.com/blamely/blamely/internal/tools"
 )
+
+// Wire Attribution v2 note-seeding into the engine here, at the top level: main can
+// import both authorship and gitnotes without a cycle (gitnotes already imports
+// tools, so the hook can't live there). Before a file's first recorded edit, this
+// seeds its working log from committed authorship so unchanged committed lines keep
+// their real author across a commit. Flag-gated inside the callee.
+func init() {
+	authorship.SeedHook = func(repoRoot, branch, baseSHA, relPath string) {
+		_ = gitnotes.SeedCommittedWorkingLog(repoRoot, branch, baseSHA, relPath)
+	}
+}
 
 // version is the baseline product version, kept in sync with the VS Code and
 // JetBrains plugins. The release workflow can still override it at link time via

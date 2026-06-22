@@ -59,6 +59,14 @@ func ResolveContext(absPath string) (Context, bool) {
 	return Context{RepoRoot: top, Branch: branch, BaseSHA: base, RelPath: filepath.ToSlash(rel)}, true
 }
 
+// SeedHook, if set, is invoked before a file's first recorded edit to seed its
+// working log from COMMITTED authorship (so unchanged committed lines keep their
+// real author across a commit instead of defaulting to Human, I5). It is a hook —
+// not a direct call — so the engine stays free of any git-notes dependency; a higher
+// layer that can read notes registers it. Best-effort: it already no-ops when a log
+// exists, and any error is ignored. Runs OUTSIDE Update's lock to avoid re-entry.
+var SeedHook func(repoRoot, branch, baseSHA, relPath string)
+
 // RecordEdit captures an observed POST-edit: it reads the file's current content
 // and updates its working log, attributing the genuinely-changed lines to author.
 // The first observed edit (no stored baseline) diffs against the file's HEAD
@@ -67,6 +75,9 @@ func RecordEdit(absPath string, author Author) (*WorkingLog, error) {
 	ctx, ok := ResolveContext(absPath)
 	if !ok {
 		return nil, fmt.Errorf("authorship: %q is not inside a git work tree", absPath)
+	}
+	if SeedHook != nil {
+		SeedHook(ctx.RepoRoot, ctx.Branch, ctx.BaseSHA, ctx.RelPath)
 	}
 	data, err := os.ReadFile(absPath)
 	if err != nil {

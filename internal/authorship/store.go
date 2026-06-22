@@ -105,6 +105,39 @@ func PutBaseline(repoRoot, branch, baseSHA, relPath, content string) error {
 	return atomicWrite(BaselinePath(repoRoot, branch, baseSHA, relPath), []byte(content))
 }
 
+// SeedWorkingLog writes a STARTING working log + baseline for relPath at (branch,
+// baseSHA) from a known per-line attribution — used to carry COMMITTED authorship
+// across a commit so re-editing an unchanged committed line keeps its real author
+// instead of defaulting to Human (I5). It is a no-op if a working log already
+// exists, so it never clobbers uncommitted state. nowMS=0 leaves the stamp unset
+// (the next Update restamps). Held under the same per-file lock as Update.
+func SeedWorkingLog(repoRoot, branch, baseSHA, relPath, content string, lines []LineAttribution, nowMS int64) error {
+	rel := cleanRel(relPath)
+	wlPath := WorkingLogPath(repoRoot, branch, baseSHA, relPath)
+	basePath := BaselinePath(repoRoot, branch, baseSHA, relPath)
+	return withFileLock(wlPath, func() error {
+		existing, err := loadWorkingLogFile(wlPath)
+		if err != nil {
+			return err
+		}
+		if existing != nil {
+			return nil // already tracking this file — don't overwrite
+		}
+		wl := &WorkingLog{
+			Schema: WorkingLogSchema, File: rel, BaseSHA: baseSHA,
+			BlobSHA: sha256Hex(content), UpdatedMS: nowMS, Lines: lines,
+		}
+		data, err := json.MarshalIndent(wl, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := atomicWrite(wlPath, data); err != nil {
+			return err
+		}
+		return atomicWrite(basePath, []byte(content))
+	})
+}
+
 // Update applies one observed edit to relPath's working log under a per-file lock:
 // it diffs the stored baseline (the content the current attributions describe)
 // against newContent, attributes the changed lines to author, and persists both
