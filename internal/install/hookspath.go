@@ -191,12 +191,30 @@ exit 0
 // It is best-effort and never errors out: callers run it on the hot path of a
 // commit, so it must never block. User-authored repo hooks (those without a
 // Blamely marker) are left untouched.
+//
+// It removes the legacy contents of .git/blamely individually but PRESERVES the
+// Attribution v2 working logs (.git/blamely/working_logs): this runs at the start
+// of `blamely attribute` (the post-commit hook), which reads the working log a
+// moment later to write the note — a wholesale RemoveAll here would wipe it first.
 func RemoveLegacyRepoHooks(repoRoot string) {
 	gitDir, err := gitDirFor(repoRoot)
 	if err != nil {
 		return
 	}
-	_ = os.RemoveAll(filepath.Join(gitDir, "blamely"))
+	blamelyDir := filepath.Join(gitDir, "blamely")
+	if entries, derr := os.ReadDir(blamelyDir); derr == nil {
+		for _, e := range entries {
+			if e.Name() == "working_logs" {
+				continue // Attribution v2 state — not a legacy artifact
+			}
+			_ = os.RemoveAll(filepath.Join(blamelyDir, e.Name()))
+		}
+		// If nothing remains (no v2 working logs), drop the now-empty dir too, so a
+		// repo with no v2 state ends up exactly as before (.git/blamely gone).
+		if rem, rerr := os.ReadDir(blamelyDir); rerr == nil && len(rem) == 0 {
+			_ = os.Remove(blamelyDir)
+		}
+	}
 	for _, name := range []string{"pre-push", "post-commit"} {
 		hookPath := filepath.Join(gitDir, "hooks", name)
 		if isBlamelyManagedHook(hookPath) {
