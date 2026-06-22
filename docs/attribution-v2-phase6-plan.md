@@ -1,10 +1,19 @@
 # Phase 6 — Retire the legacy engine (plan)
 
-Status: **planned, gated on the §12 soak.** This is the final phase: make Attribution
-v2 the *only* attribution engine and remove the content-hash guesser. It is written
-as a plan because it is a rewrite (v2 is currently a correction layer over the v1
-note builder), it removes a fallback, and it cascades into `store`/`daemon`/tests —
-so it must be applied deliberately *after* the soak, not blind.
+Status: **in progress — v2-only beta `1.6.3-beta.12`.** Make Attribution v2 the *only*
+attribution engine and remove the content-hash guesser.
+
+Beta progress (branch `attribution-v2`):
+- **B3 done** — dual-run divergence machinery + `attribution-status` removed.
+- **B1 done** — `Enabled()` is unconditional; the `BLAMELY_ATTRIBUTION_V2` opt-out and
+  the v1-engine tests are gone. The guesser is now UNREACHABLE.
+- **B2 pending** — physically delete the now-dead guesser body in `buildNote` + its
+  helpers (a `buildNote`→`buildNoteV2` rewrite; the dead code has zero runtime effect,
+  so this is cleanup, sequenced behind the v2 e2e tests).
+- SQLite `content_sha` writes are intentionally KEPT for this beta (cheap, unused for
+  attribution). Token/prompt/session metadata stays — reporting needs it.
+
+Original plan below (steps 1–2 landed earlier; step 3 = B1).
 
 ## Why it can't be a blind delete
 - `gitnotes.buildNote` (~930 lines) builds the note (files, ranges, totals) using the
