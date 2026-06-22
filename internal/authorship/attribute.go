@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // Attribute is THE attribution engine (docs/attribution-v2-design.md §7). Given a
@@ -247,12 +248,21 @@ func alignLines(oldLines, newLines []string) []int {
 	return matched
 }
 
-// normalizeLineForMatch collapses a line to its whitespace-insensitive form: trim
-// ends + collapse internal whitespace runs to a single space. This MUST produce
+// normalizeLineForMatch reduces a line to its whitespace-insensitive form by
+// REMOVING all whitespace (git diff -w semantics). A line that changed only in
+// whitespace — indentation, trailing, or between tokens (operator spacing like
+// `x=1` ↔ `x = 1`) — therefore matches and keeps its prior author: reformatting is
+// not authorship. Trade-off: a whitespace edit INSIDE a string literal also reads
+// as reflow (prior author kept); that is rare and defensible. This MUST produce
 // identical output in the Go, TypeScript, and Kotlin ports (the golden vectors
 // enforce it) so the three agree on what counts as a reflow.
 func normalizeLineForMatch(s string) string {
-	return strings.Join(strings.Fields(s), " ")
+	return strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 func normalizeLinesForMatch(lines []string) []string {

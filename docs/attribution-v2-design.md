@@ -191,11 +191,11 @@ All of the following are implemented identically in Go/TS/Kotlin and covered by 
 vectors (§11):
 
 - **Line shift** (insert/delete above) → ranges move, authorship preserved. *(LCS positional match.)*
-- **Reflow / whitespace-only** → authorship inherited. Implemented as a **whitespace-normalized**
-  line comparison in the LCS (`normalizeLineForMatch` = trim + collapse internal whitespace runs):
-  a reindented/reformatted line is treated as unchanged and keeps its prior author. A substantive
-  content change still mismatches → the editor. *(Token-level reflow, e.g. operator spacing, is a
-  later refinement.)*
+- **Reflow / whitespace-only** → authorship inherited. Implemented as an **ignore-all-whitespace**
+  comparison in the LCS (`normalizeLineForMatch` removes all whitespace, git diff -w semantics):
+  indentation, trailing, AND operator-spacing changes (`x=1` ↔ `x = 1`) read as reflow and keep
+  the prior author. A substantive content change still mismatches → the editor. (Trade-off:
+  whitespace edits inside string literals also read as reflow — rare, prior author kept.)
 - **Move** → a relocated line carries its prior author. Implemented as **FIFO-by-content pairing**
   (`detectMoves`): each unmatched new line pairs with the first unmatched old line of identical
   normalized content. A block an AI moves stays Human; an AI block a human moves stays AI. *(This
