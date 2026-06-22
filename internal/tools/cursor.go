@@ -20,9 +20,9 @@ import (
 // CursorWatcher observes Cursor's File History directory as a low-grade
 // "Cursor is active" signal. It does NOT emit per-file attribution rows.
 //
-//   macOS  : ~/Library/Application Support/Cursor/User/History/
-//   Linux  : ~/.config/Cursor/User/History/
-//   Windows: %APPDATA%/Cursor/User/History/
+//	macOS  : ~/Library/Application Support/Cursor/User/History/
+//	Linux  : ~/.config/Cursor/User/History/
+//	Windows: %APPDATA%/Cursor/User/History/
 //
 // Why no rows? File History fires on every save — manual typing, paste,
 // formatter reflow, AND AI Composer/Apply. There's no signal in the

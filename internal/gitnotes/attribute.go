@@ -627,12 +627,9 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 		}
 	}
 
-	// Phase 2 dual-run: log how the Attribution v2 working log differs from the v1
-	// note (flag-gated). Then Phase 3 flip: when the flag is on, rewrite the note's
-	// added-line attribution FROM the working log (diff-based truth, no hash
-	// guessing). Both are no-ops when the flag is off, so default behavior is
-	// unchanged.
-	logV2Divergence(repoPath, note)
+	// Attribution v2: rewrite the note's added-line attribution FROM the working log
+	// (diff-based truth, no hash guessing), then the deletions, GC, and migrate the
+	// logs forward on commit.
 	flipNoteToWorkingLog(repoPath, note)
 	flipDeletionsToWorkingLog(repoPath, note, change)
 	gcWorkingLogsIfEnabled(repoPath)

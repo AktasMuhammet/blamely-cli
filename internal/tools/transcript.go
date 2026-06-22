@@ -28,8 +28,8 @@ type ConvTurn struct {
 
 // transcriptEntry covers two transcript JSONL formats:
 //
-//   Claude Code:  {"type":"user"|"assistant", "message":{...}}
-//   Cursor:       {"role":"user"|"assistant", "message":{...}}
+//	Claude Code:  {"type":"user"|"assistant", "message":{...}}
+//	Cursor:       {"role":"user"|"assistant", "message":{...}}
 //
 // Both are emitted as JSONL; we merge role/type so callers see a unified view.
 type transcriptEntry struct {

@@ -6,7 +6,6 @@ import (
 	"testing"
 )
 
-
 func TestDisplayModel(t *testing.T) {
 	cases := map[string]string{
 		"copilot/gpt-5-mini":      "gpt-5-mini",

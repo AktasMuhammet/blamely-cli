@@ -289,7 +289,7 @@ func emitCopilotFetch(fetchKind, url, activeModel string, sink daemon.Sink) {
 		Confidence: "medium",
 		GenType:    gen,
 		Model:      model,
-		RawMeta: fmt.Sprintf(`{"source":"copilot_log_fetch","fetch":%q}`, fetchKind),
+		RawMeta:    fmt.Sprintf(`{"source":"copilot_log_fetch","fetch":%q}`, fetchKind),
 	}
 	if err := sink.Record(ev); err != nil {
 		log.Printf("copilot-log sink: %v", err)

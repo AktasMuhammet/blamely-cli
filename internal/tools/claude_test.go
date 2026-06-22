@@ -208,8 +208,8 @@ func TestExtractClaudeRanges_MultiEditMixedDeletion(t *testing.T) {
 	raw, _ := json.Marshal(map[string]any{
 		"file_path": "/tmp/m.go",
 		"edits": []map[string]any{
-			{"old_string": "x", "new_string": "x1\nx2"},                  // +2
-			{"old_string": "del1\ndel2\ndel3\ndel4", "new_string": ""},   // -4
+			{"old_string": "x", "new_string": "x1\nx2"},                // +2
+			{"old_string": "del1\ndel2\ndel3\ndel4", "new_string": ""}, // -4
 		},
 	})
 	p := claudeHookPayload{ToolName: "MultiEdit", ToolInput: raw}
@@ -291,8 +291,8 @@ func TestExtractClaudeRanges_WriteMultiScriptContent(t *testing.T) {
 		"Hello, World!",    // Latin
 		"Привет, мир!",     // Cyrillic
 		"Γειά σου, Κόσμε!", // Greek
-		"你好，世界！",          // CJK (Chinese)
-		"こんにちは世界",         // CJK (Japanese)
+		"你好，世界！",           // CJK (Chinese)
+		"こんにちは世界",          // CJK (Japanese)
 		"مرحبا بالعالم",    // Arabic (RTL)
 	}
 	content := strings.Join(lines, "\n") + "\n"
