@@ -156,3 +156,74 @@ func TestAttributePipelineE2E_TwoCommits(t *testing.T) {
 		t.Fatalf("cycle 2 line 3: want AI/codex, got %+v", r2)
 	}
 }
+
+// TestAttributePipelineE2E_Amend verifies the flip survives a `git commit --amend`:
+// the amended commit keeps the same parent, so the working log (keyed by that
+// parent) must still drive the note. A real history-rewrite case (Phase 5).
+func TestAttributePipelineE2E_Amend(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	t.Setenv("BLAMELY_ATTRIBUTION_V2", "1")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	repo := t.TempDir()
+	git := func(args ...string) string {
+		cmd := exec.Command("git", append([]string{"-C", repo, "-c", "core.hooksPath="}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	line3 := func(note *Note) *RangeEntry {
+		for fi := range note.Files {
+			if note.Files[fi].Path != "app.py" {
+				continue
+			}
+			for i := range note.Files[fi].Lines {
+				if r := &note.Files[fi].Lines[i]; r.Type == "add" && r.Start <= 3 && 3 <= r.End {
+					return r
+				}
+			}
+		}
+		return nil
+	}
+	git("init", "-q")
+	git("checkout", "-q", "-b", "main")
+	abs := filepath.Join(repo, "app.py")
+	os.WriteFile(abs, []byte("h1\nh2\n"), 0o644)
+	git("add", ".")
+	git("commit", "-q", "-m", "c1")
+	parent := git("rev-parse", "HEAD")
+
+	if _, err := authorship.Update(repo, "main", parent, "app.py", "h1\nh2\nai3\n", "h1\nh2\n",
+		authorship.Author{Type: authorship.AI, Tool: "claude", GenType: "chat"}, 1); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(abs, []byte("h1\nh2\nai3\n"), 0o644)
+	git("add", ".")
+	git("commit", "-q", "-m", "c2")
+	install.RemoveLegacyRepoHooks(repo)
+	if note, err := AttributeAndWrite(repo, git("rev-parse", "HEAD")); err != nil {
+		t.Fatal(err)
+	} else if r := line3(note); r == nil || r.AuthorType != "AI" {
+		t.Fatalf("pre-amend line 3: want AI, got %+v", r)
+	}
+
+	// Amend the commit message (sha changes, parent + tree unchanged).
+	git("commit", "-q", "--amend", "-m", "c2-amended")
+	amended := git("rev-parse", "HEAD")
+	install.RemoveLegacyRepoHooks(repo)
+	note, err := AttributeAndWrite(repo, amended)
+	if err != nil {
+		t.Fatalf("AttributeAndWrite (amended): %v", err)
+	}
+	if r := line3(note); r == nil || r.AuthorType != "AI" || r.Tool != "claude" {
+		t.Errorf("post-amend line 3: want AI/claude, got %+v", r)
+	}
+}
