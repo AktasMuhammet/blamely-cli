@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 
@@ -108,6 +110,7 @@ func main() {
 	root.AddCommand(cmdDetect())
 	root.AddCommand(cmdRecord())
 	root.AddCommand(cmdAttribute())
+	root.AddCommand(cmdAuthorship())
 	root.AddCommand(cmdReport())
 	root.AddCommand(cmdBlame())
 	root.AddCommand(cmdStats())
@@ -376,6 +379,42 @@ func cmdRecord() *cobra.Command {
 		},
 	}
 	c.Flags().Bool("pre", false, "PreToolUse mode: snapshot the target file's pre-edit content as the Attribution v2 baseline (no edit recorded)")
+	return c
+}
+
+// cmdAuthorship is the Attribution v2 gutter source (invariant I4: note and gutter
+// derive from the same working log). For a file it seeds the working log from
+// committed authorship when untracked, then prints the working log as JSON — so the
+// editor renders committed + uncommitted authorship from one place. Hidden; the
+// plugins call it only when blamely.attributionV2 is on.
+func cmdAuthorship() *cobra.Command {
+	c := &cobra.Command{
+		Use:    "authorship <file>",
+		Hidden: true,
+		Short:  "Internal: per-line authorship for a file (Attribution v2 gutter source)",
+		Args:   cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			abs, err := filepath.Abs(args[0])
+			if err != nil {
+				return err
+			}
+			ctx, ok := authorship.ResolveContext(abs)
+			if !ok {
+				return nil // not inside a work tree → nothing to report
+			}
+			// Seed from committed authorship if this file isn't tracked yet, so the
+			// gutter reflects the whole file (committed + any uncommitted edits).
+			_ = gitnotes.SeedCommittedWorkingLog(ctx.RepoRoot, ctx.Branch, ctx.BaseSHA, ctx.RelPath)
+			wl, err := authorship.LoadWorkingLog(ctx.RepoRoot, ctx.Branch, ctx.BaseSHA, ctx.RelPath)
+			if err != nil {
+				return err
+			}
+			if wl == nil {
+				wl = &authorship.WorkingLog{Schema: authorship.WorkingLogSchema, File: ctx.RelPath, BaseSHA: ctx.BaseSHA}
+			}
+			return json.NewEncoder(os.Stdout).Encode(wl)
+		},
+	}
 	return c
 }
 
