@@ -250,7 +250,7 @@ func withFileLock(target string, fn func() error) error {
 
 // AuthorTypesForFile loads relPath's working log and returns its per-line author
 // types (1-based line number → "ai"/"human"), plus whether a log was found. Used
-// by the Phase 2 dual-run comparison and, after the flip, by note generation.
+// after the flip, by note generation.
 func AuthorTypesForFile(repoRoot, branch, baseSHA, relPath string) (map[int]AuthorType, bool) {
 	wl, err := LoadWorkingLog(repoRoot, branch, baseSHA, relPath)
 	if err != nil || wl == nil {
@@ -266,7 +266,7 @@ func AuthorTypesForFile(repoRoot, branch, baseSHA, relPath string) (map[int]Auth
 }
 
 // AuthorsForFile is AuthorTypesForFile but returns the FULL author (tool, model,
-// gen_type), used by the Phase 3 flip to rewrite a note's per-line attribution.
+// gen_type), used by the flip to rewrite a note's per-line attribution.
 func AuthorsForFile(repoRoot, branch, baseSHA, relPath string) (map[int]Author, bool) {
 	wl, err := LoadWorkingLog(repoRoot, branch, baseSHA, relPath)
 	if err != nil || wl == nil {
@@ -282,7 +282,7 @@ func AuthorsForFile(repoRoot, branch, baseSHA, relPath string) (map[int]Author, 
 }
 
 // ListWorkingLogs returns every file's working log under (repoRoot, branch, baseSHA)
-// — the set of files with uncommitted v2 attribution this work cycle. Used to paint
+// — the set of files with uncommitted attribution this work cycle. Used to paint
 // the gutter/sidebar repo-wide from one source. Missing dir → empty, not an error.
 func ListWorkingLogs(repoRoot, branch, baseSHA string) ([]*WorkingLog, error) {
 	dir := workingLogDir(repoRoot, branch, baseSHA)

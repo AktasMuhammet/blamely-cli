@@ -21,7 +21,7 @@ import (
 //
 // Add (empty baseline → all `author`), edit (diff), and delete (lines vanish) all
 // fall out of the same alignment. Reflow (whitespace-only changes) is handled by
-// the normalized comparison in alignLines, and MOVE detection (Phase 4) carries a
+// the normalized comparison in alignLines, and MOVE detection carries a
 // relocated line's prior author to its new position: a block moved by an AI edit
 // stays Human (moving code is not authoring it). Genuine adds/changes still go to
 // `author`.
@@ -231,7 +231,7 @@ func splitLines(s string) []string {
 // resolve correctly (the unchanged occurrence matches in place; an extra copy is
 // reported as added) without any content-hash disambiguation.
 //
-// Lines are compared WHITESPACE-NORMALIZED (Phase 4 reflow): a line that changed
+// Lines are compared WHITESPACE-NORMALIZED (reflow): a line that changed
 // only in indentation / trailing or collapsed whitespace counts as unchanged and
 // keeps its prior author — reformatting is not authorship ("formatting
 // non-substantial"). A genuine content change still mismatches → the editor.

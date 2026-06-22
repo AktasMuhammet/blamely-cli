@@ -443,9 +443,9 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 		repoPath = wt
 	}
 
-	// Attribution v2 git-op robustness: make blamely notes follow history rewrites,
+	// Attribution git-op robustness: make blamely notes follow history rewrites,
 	// and skip recomputing while one is in progress so the inherited (correct) note
-	// isn't clobbered by a v1 fallback. No-ops when the v2 flag is off.
+	// isn't clobbered by a v1 fallback. No-ops when attribution is off.
 	ensureNotesFollowRewrites(repoPath)
 	if attributionShouldSkip(repoPath) {
 		return nil, nil
@@ -460,9 +460,9 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	if err != nil {
 		return nil, fmt.Errorf("diff commit: %w", err)
 	}
-	// Attribution v2: a merge commit's note should credit only the conflict
+	// Attribution: a merge commit's note should credit only the conflict
 	// resolution (lines added vs BOTH parents), not the merged-in branch's lines
-	// (authored elsewhere). No-op for non-merges / when v2 is off.
+	// (authored elsewhere). No-op for non-merges / when attribution is off.
 	restrictMergeToResolution(repoPath, sha, change)
 	commitNanos, err := CommitTimestampNanos(repoPath, sha)
 	if err != nil {
@@ -626,7 +626,7 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 		}
 	}
 
-	// Attribution v2: rewrite the note's added-line attribution FROM the working log
+	// Attribution: rewrite the note's added-line attribution FROM the working log
 	// (diff-based truth, no hash guessing), then the deletions, GC, and migrate the
 	// logs forward on commit.
 	flipNoteToWorkingLog(repoPath, note)
@@ -856,7 +856,7 @@ type moveAttr struct {
 
 func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []AddedLine, deleted map[string][]DeletedLine, renames map[string]string, fileChanges map[string]FileChangeType) (*Note, error) {
 	// baseSHA = the commit's parent (HEAD while the edits were made) — the key the
-	// v2 working-log flip reads.
+	// working-log flip reads.
 	baseSHA := gitutil.ParentCommitSHA(repoPath, sha)
 
 	// Intra-session lower bound: an edit already consumed by an earlier commit on
@@ -874,13 +874,13 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 	const sameSecondSlackNanos = int64(5 * 1e9)
 	maxNanos := commitNanos + sameSecondSlackNanos
 
-	// The legacy content_sha matcher fed off SQLite edits; with Attribution v2 the
+	// The legacy content_sha matcher fed off SQLite edits; with Attribution the
 	// only engine it never runs. deletionEditsForFile is kept (returns nil) because
 	// the deletion-skeleton path below still calls it; flipDeletionsToWorkingLog sets
 	// the AI deletions.
 	deletionEditsForFile := func(file string) []store.Edit { return nil }
 
-	// v2-only: lay down a Human skeleton for every added line. flipNoteToWorkingLog
+	// Lay down a Human skeleton for every added line. flipNoteToWorkingLog
 	// rewrites AI lines from the working log afterward and recomputes the added-line
 	// totals; deletions default Human and flipDeletionsToWorkingLog sets their AI.
 	resolved := make([]perLine, 0, len(added))

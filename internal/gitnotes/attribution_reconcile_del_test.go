@@ -45,7 +45,6 @@ func delRangeAuthor(t *testing.T, note *Note, path string, ln int) RangeEntry {
 // block, recording removed-line hashes in SQLite, but the deletions log is empty so
 // the flip leaves them Human. The SQLite removed hashes reattribute them to copilot.
 func TestReconcileDeletesFromEdits(t *testing.T) {
-	t.Setenv("BLAMELY_ATTRIBUTION_V2", "1")
 	db, err := store.OpenAt(filepath.Join(t.TempDir(), "test.sqlite"))
 	if err != nil {
 		t.Fatalf("OpenAt: %v", err)
@@ -127,7 +126,6 @@ func TestAddDeletedLinesToGenType(t *testing.T) {
 // TestReconcileDeletesFromEdits_NoFalsePositive: a human-deleted line whose content
 // no AI tool recorded stays Human.
 func TestReconcileDeletesFromEdits_NoFalsePositive(t *testing.T) {
-	t.Setenv("BLAMELY_ATTRIBUTION_V2", "1")
 	db, err := store.OpenAt(filepath.Join(t.TempDir(), "test.sqlite"))
 	if err != nil {
 		t.Fatalf("OpenAt: %v", err)

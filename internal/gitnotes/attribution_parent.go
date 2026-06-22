@@ -6,7 +6,7 @@ import (
 )
 
 // commitParentSHA returns sha's first parent, or "" for a root commit / on error.
-// The Attribution v2 flips key the working log by the commit's PARENT (HEAD at edit
+// The Attribution flips key the working log by the commit's PARENT (HEAD at edit
 // time), so they resolve it through here.
 func commitParentSHA(repoPath, sha string) string {
 	out, err := exec.Command("git", "-C", repoPath, "rev-parse", "--verify", "-q", sha+"^").Output()

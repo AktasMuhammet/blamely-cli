@@ -8,7 +8,7 @@ import (
 	"github.com/blamely/blamely/internal/gitutil"
 )
 
-// Git-op robustness for Attribution v2 (docs/attribution-v2-design.md §8, Phase 5).
+// Git-op robustness for Attribution (docs/attribution-v2-design.md §8, Phase 5).
 //
 // A history rewrite (amend/rebase/cherry-pick) changes commit SHAs, so the working
 // log — keyed by the pre-rewrite parent — no longer matches the rewritten commit's
@@ -20,7 +20,7 @@ import (
 //  2. attributionShouldSkip skips (re)attribution WHILE a rewrite is in progress, so
 //     the per-commit post-commit hook doesn't overwrite the note git is about to copy.
 //
-// Both are gated on the v2 flag, so default (v1) behavior is unchanged.
+//
 
 // ensureNotesFollowRewrites adds the blamely notes ref to notes.rewriteRef (local,
 // idempotent) so amend/rebase/cherry-pick carry the note onto the rewritten commit.

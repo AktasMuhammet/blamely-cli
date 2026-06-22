@@ -5,8 +5,8 @@ import (
 	"github.com/blamely/blamely/internal/store"
 )
 
-// flipDeletionsToWorkingLog attributes a commit's DELETED lines from the Attribution
-// v2 deletions log (who removed which line content), instead of the legacy hash
+// flipDeletionsToWorkingLog attributes a commit's DELETED lines from the
+// deletions log (who removed which line content), instead of the legacy hash
 // matcher. It matches each note delete-range line to its content (from the diff) and
 // then to the recorded deleter, rewrites the delete ranges, and recomputes the
 // deleted totals + per-tool deleted counts. Flag-gated; a line with no recorded

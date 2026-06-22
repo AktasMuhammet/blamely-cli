@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 )
 
-// Deletion attribution (Attribution v2). The per-file working log only describes
+// Deletion attribution (Attribution). The per-file working log only describes
 // SURVIVING content, so removed lines are recorded separately, here, in an
 // append-only JSONL per (repo, branch, base_sha): who deleted which line content.
 // A separate file (not the per-file <path>.json) means the editor plugins' whole-file

@@ -161,7 +161,7 @@ func isHex40(s string) bool {
 
 // UncommittedAddedLines returns the post-image line numbers of relPath that differ
 // from HEAD in the working tree (`git diff HEAD`), i.e. the current uncommitted
-// CHANGES. The v2 gutter intersects working-log authorship with this set so it marks
+// CHANGES. The gutter intersects working-log authorship with this set so it marks
 // only changed lines (not every committed line). Empty/no diff → empty set.
 func UncommittedAddedLines(repoPath, relPath string) map[int]bool {
 	set := map[int]bool{}

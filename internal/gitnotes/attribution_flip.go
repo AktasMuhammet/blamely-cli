@@ -7,13 +7,12 @@ import (
 	"github.com/blamely/blamely/internal/store"
 )
 
-// Phase 3 flip (docs/attribution-v2-design.md §10): when BLAMELY_ATTRIBUTION_V2 is
-// on, rewrite the note's ADDED-line attribution from the Attribution v2 working log
-// (the diff-based truth) instead of the content-hash matcher, and recompute the
-// AI/Human totals, by_gen_type, and by_tool line counts to match. Deleted-line
-// attribution stays v1 (the working log doesn't track deletions yet — Phase 4); a
-// file with no working log keeps its v1 attribution (degraded, not wrong). Behind
-// the flag, so default behavior is unchanged.
+// This file rewrites a note's ADDED-line attribution from the attribution working
+// log (the diff-based truth) instead of a content-hash guess, recomputing the
+// AI/Human totals, by_gen_type, and by_tool line counts to match. A file with no
+// working log keeps its prior attribution (degraded, not wrong). Deletions are
+// handled in attribution_deletions.go; the content_sha reconciliation in
+// attribution_gutter.go then recovers AI lines the working-log fold missed.
 
 // gcWorkingLogsIfEnabled prunes dangling-base working logs after a commit
 // (flag-gated, best-effort) so history-rewrite churn doesn't accumulate on disk.
@@ -66,12 +65,12 @@ func flipAddsAtBase(repoPath, branch, base string, note *Note) {
 		fe := &note.Files[fi]
 		authors, ok := authorship.AuthorsForFile(repoPath, branch, base, fe.Path)
 		if !ok {
-			continue // not tracked by v2 → keep this file's v1 attribution
+			continue // not tracked → keep this file's prior attribution
 		}
 		var rewritten []RangeEntry
 		for _, r := range fe.Lines {
 			if r.Type != "add" {
-				rewritten = append(rewritten, r) // deletions stay v1
+				rewritten = append(rewritten, r) // deletions handled in attribution_deletions.go
 				continue
 			}
 			for ln := r.Start; ln <= r.End; ln++ {

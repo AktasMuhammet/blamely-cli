@@ -14,7 +14,6 @@ func TestRestrictMergeToResolution(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
-	t.Setenv("BLAMELY_ATTRIBUTION_V2", "1")
 	repo := t.TempDir()
 	git := func(args ...string) string {
 		cmd := exec.Command("git", append([]string{"-C", repo, "-c", "core.hooksPath="}, args...)...)

@@ -22,7 +22,6 @@ func TestAttributePipelineE2E(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
-	t.Setenv("BLAMELY_ATTRIBUTION_V2", "1")
 	// Isolate the global store DB to a temp HOME (os.UserHomeDir honors HOME).
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -95,7 +94,6 @@ func TestAttributePipelineE2E_TwoCommits(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
-	t.Setenv("BLAMELY_ATTRIBUTION_V2", "1")
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
@@ -168,7 +166,6 @@ func TestAttributePipelineE2E_Amend(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
-	t.Setenv("BLAMELY_ATTRIBUTION_V2", "1")
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
@@ -247,7 +244,7 @@ func TestAttributePipelineE2E_Amend(t *testing.T) {
 	}
 }
 
-// TestAttributeSkipsDuringRewrite verifies the Phase 5 git-op guard: while a history
+// TestAttributeSkipsDuringRewrite verifies the git-op guard: while a history
 // rewrite is in progress, AttributeAndWrite skips (so the note git copies onto the
 // rewritten commit via notes.rewriteRef is not clobbered by a v1 fallback), and it
 // configures notes.rewriteRef so that copy happens.
@@ -255,7 +252,6 @@ func TestAttributeSkipsDuringRewrite(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
-	t.Setenv("BLAMELY_ATTRIBUTION_V2", "1")
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)

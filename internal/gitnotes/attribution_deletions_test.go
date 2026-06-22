@@ -11,13 +11,12 @@ import (
 	"github.com/blamely/blamely/internal/install"
 )
 
-// An AI-deleted line must be attributed AI in the commit note (v2 deletion log),
+// An AI-deleted line must be attributed AI in the commit note (deletion log),
 // not Human (the legacy default).
 func TestFlipDeletionsToWorkingLog(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
-	t.Setenv("BLAMELY_ATTRIBUTION_V2", "1")
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)

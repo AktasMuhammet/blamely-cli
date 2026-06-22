@@ -45,7 +45,7 @@ func editFromWholeFileWrite(e *store.Edit) bool {
 // authored it, by content_sha. It is the SINGLE matcher shared by the commit-note
 // reconciliation (reconcileAddsFromEdits) and the live-gutter reconciliation
 // (ReconcileGutterOverrides), so the two can never attribute the same line
-// differently — Attribution v2 invariant I4 (note and gutter agree). It holds a
+// differently — Attribution invariant I4 (note and gutter agree). It holds a
 // per-edit consume-once budget of the exact and whitespace-normalized content_shas
 // each in-window AI edit recorded as added lines.
 type editMatcher struct {
@@ -138,7 +138,7 @@ func editToAuthor(e *store.Edit) authorship.Author {
 // content can't be mis-attributed — the same guard the note path uses — and it
 // shares editMatcher/pickAddEdit with the note so gutter and note agree (I4).
 //
-// Returns nil when there is nothing to add (v2 off, no changes, file unreadable,
+// Returns nil when there is nothing to add (attribution off, no changes, file unreadable,
 // or no in-window AI edits), so callers can skip cheaply.
 func ReconcileGutterOverrides(db *store.DB, repoRoot, baseSHA string, wl *authorship.WorkingLog, changed map[int]bool) map[int]authorship.Author {
 	if db == nil || wl == nil || len(changed) == 0 || !authorship.Enabled() {

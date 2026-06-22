@@ -10,24 +10,24 @@ import (
 	"github.com/blamely/blamely/internal/authorship"
 )
 
-// captureV2 must derive the right author (human typing vs AI) and chain edits so a
+// captureAuthorship must derive the right author (human typing vs AI) and chain edits so a
 // human line an AI edit re-emits stays Human — the field repro, exercised through the
-// record-path helper end to end. (v2 is always on now; there is no flag to gate.)
-func TestCaptureV2_AuthorChaining(t *testing.T) {
+// record-path helper end to end. (attribution is always on; there is no flag to gate.)
+func TestCaptureAuthorship_AuthorChaining(t *testing.T) {
 	repo := gitInitRepo(t)
 	rel := "f.txt"
 	abs := filepath.Join(repo, rel)
 
 	// 1) Human types two lines.
 	os.WriteFile(abs, []byte("h1\nh2\n"), 0o644)
-	captureV2(repo, rel, "", "human", "")
+	captureAuthorship(repo, rel, "", "human", "")
 	ctx, ok := authorship.ResolveContext(abs) // resolves once the file exists
 	if !ok {
 		t.Fatal("ResolveContext failed inside repo")
 	}
 	// 2) AI re-emits them and appends its own.
 	os.WriteFile(abs, []byte("h1\nh2\nai3\n"), 0o644)
-	captureV2(repo, rel, "claude", "chat", "claude-opus-4-8")
+	captureAuthorship(repo, rel, "claude", "chat", "claude-opus-4-8")
 
 	wl, err := authorship.LoadWorkingLog(ctx.RepoRoot, ctx.Branch, ctx.BaseSHA, ctx.RelPath)
 	if err != nil || wl == nil {
@@ -48,11 +48,10 @@ func TestCaptureV2_AuthorChaining(t *testing.T) {
 }
 
 // record --pre (CaptureBaselineFromStdin) snapshots the pre-edit content so the
-// matching post-edit captureV2 diffs against it — the terminal-agent baseline
+// matching post-edit captureAuthorship diffs against it — the terminal-agent baseline
 // fallback. Here: human content exists, --pre captures it, then an AI edit appends;
 // the human lines must stay Human.
 func TestCaptureBaselineFromStdin_FeedsPostEditDiff(t *testing.T) {
-	t.Setenv("BLAMELY_ATTRIBUTION_V2", "1")
 	repo := gitInitRepo(t)
 	rel := "f.txt"
 	abs := filepath.Join(repo, rel)
@@ -65,7 +64,7 @@ func TestCaptureBaselineFromStdin_FeedsPostEditDiff(t *testing.T) {
 	}
 	// The agent then appends a line; PostToolUse records it.
 	os.WriteFile(abs, []byte("h1\nh2\nai3\n"), 0o644)
-	captureV2(repo, rel, "claude", "chat", "")
+	captureAuthorship(repo, rel, "claude", "chat", "")
 
 	ctx, ok := authorship.ResolveContext(abs)
 	if !ok {

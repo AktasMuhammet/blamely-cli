@@ -62,7 +62,6 @@ func addRangeAuthor(t *testing.T, note *Note, path string, ln int) RangeEntry {
 // can't tell which copy is the AI's, so it leaves the new lines Human. The
 // recorded content_shas (placeholder positions) reattribute them deterministically.
 func TestReconcileAddsFromEdits_DuplicateContentBlock(t *testing.T) {
-	t.Setenv("BLAMELY_ATTRIBUTION_V2", "1")
 	db, err := store.OpenAt(filepath.Join(t.TempDir(), "test.sqlite"))
 	if err != nil {
 		t.Fatalf("OpenAt: %v", err)
@@ -150,7 +149,6 @@ func TestReconcileAddsFromEdits_DuplicateContentBlock(t *testing.T) {
 // must NOT inherit a distant AI block's attribution. Only blanks contiguous with an
 // AI block inherit.
 func TestReconcileAddsFromEdits_IsolatedBlankNotInherited(t *testing.T) {
-	t.Setenv("BLAMELY_ATTRIBUTION_V2", "1")
 	db, err := store.OpenAt(filepath.Join(t.TempDir(), "test.sqlite"))
 	if err != nil {
 		t.Fatalf("OpenAt: %v", err)
@@ -194,7 +192,6 @@ func TestReconcileAddsFromEdits_IsolatedBlankNotInherited(t *testing.T) {
 // tool=copypaste while staying author_type Human (the AI/Human split is unchanged),
 // and shows up in by_tool. Repro of commit ae00d8ad.
 func TestReconcileAddsFromEdits_CopyPasteTag(t *testing.T) {
-	t.Setenv("BLAMELY_ATTRIBUTION_V2", "1")
 	db, err := store.OpenAt(filepath.Join(t.TempDir(), "test.sqlite"))
 	if err != nil {
 		t.Fatalf("OpenAt: %v", err)
@@ -242,7 +239,6 @@ func TestReconcileAddsFromEdits_CopyPasteTag(t *testing.T) {
 // ONCE can only attribute one committed copy of that line; a second identical
 // added line stays Human (we never over-credit beyond what the AI recorded).
 func TestReconcileAddsFromEdits_ConsumeOnce(t *testing.T) {
-	t.Setenv("BLAMELY_ATTRIBUTION_V2", "1")
 	db, err := store.OpenAt(filepath.Join(t.TempDir(), "test.sqlite"))
 	if err != nil {
 		t.Fatalf("OpenAt: %v", err)
@@ -280,7 +276,6 @@ func TestReconcileAddsFromEdits_ConsumeOnce(t *testing.T) {
 // claude Write (narrowed against a possibly-stale snapshot) re-emitted is NOT flipped
 // to AI — the Write's content_shas are excluded. Repro of commit ac7c0c3b lines 14-15.
 func TestReconcileAddsFromEdits_SkipsWholeFileWrite(t *testing.T) {
-	t.Setenv("BLAMELY_ATTRIBUTION_V2", "1")
 	db, err := store.OpenAt(filepath.Join(t.TempDir(), "test.sqlite"))
 	if err != nil {
 		t.Fatalf("OpenAt: %v", err)
@@ -332,7 +327,6 @@ func TestReconcileAddsFromEdits_SkipsWholeFileWrite(t *testing.T) {
 // TestReconcileAddsFromEdits_NoFalsePositive verifies a human-typed line whose
 // content was never recorded by any AI tool is left Human.
 func TestReconcileAddsFromEdits_NoFalsePositive(t *testing.T) {
-	t.Setenv("BLAMELY_ATTRIBUTION_V2", "1")
 	db, err := store.OpenAt(filepath.Join(t.TempDir(), "test.sqlite"))
 	if err != nil {
 		t.Fatalf("OpenAt: %v", err)

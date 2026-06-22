@@ -20,7 +20,6 @@ func TestAttributeWorkingTree_ReconcilesFromEdits(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
-	t.Setenv("BLAMELY_ATTRIBUTION_V2", "1")
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)

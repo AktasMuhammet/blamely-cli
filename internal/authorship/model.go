@@ -1,4 +1,4 @@
-// Package authorship implements Attribution v2 (see docs/attribution-v2-design.md):
+// Package authorship implements Attribution (see docs/attribution-v2-design.md):
 // per-line authorship is determined by DIFFING a pre-edit baseline against the
 // post-edit content and maintained in a stateful "working log" — never by
 // content-hash guessing. This package is the single, tool-agnostic engine; every
@@ -54,7 +54,7 @@ type LineAttribution struct {
 	End      int     `json:"end"`
 	Author   Author  `json:"-"` // flattened into the JSON object via MarshalJSON
 	Overrode *Author `json:"overrode,omitempty"`
-	// CharRanges is reserved for sub-line attribution (Decision A); absent in v2.
+	// CharRanges is reserved for sub-line attribution (Decision A); not yet implemented.
 }
 
 // LineAttribution serializes as a flat object: {start,end,author,tool,...} so the

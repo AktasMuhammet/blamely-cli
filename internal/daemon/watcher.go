@@ -180,24 +180,24 @@ func (s *dbSink) Record(ev Event) error {
 			log.Printf("watcher sink: upgrade completions: %v", err)
 		}
 	}
-	captureWatcherV2(ev)
+	captureWatcherAuthorship(ev)
 	return nil
 }
 
-// captureWatcherV2 feeds a LIVE watcher edit into the Attribution v2 working log, so
+// captureWatcherAuthorship feeds a LIVE watcher edit into the Attribution working log, so
 // tools with no hook/plugin signal (Copilot transcript, Codex/Cursor sessions,
-// antigravity) are v2-native instead of falling back to the legacy engine. Flag-gated
+// antigravity) are tracked. Flag-gated
 // and best-effort.
 //
 // It is skipped for HISTORICAL replay (old events parsed on daemon startup):
 // RecordEdit diffs the file's CURRENT content, which only corresponds to a recent
 // edit, so attributing a stale replayed event against today's content would
 // mis-credit lines. The liveness window keeps it to edits the file actually reflects.
-func captureWatcherV2(ev Event) {
+func captureWatcherAuthorship(ev Event) {
 	if !authorship.Enabled() || ev.RepoPath == "" || ev.FilePath == "" {
 		return
 	}
-	if !ev.When.IsZero() && time.Since(ev.When) > watcherV2LivenessWindow {
+	if !ev.When.IsZero() && time.Since(ev.When) > watcherLivenessWindow {
 		return // historical replay — the file no longer reflects this edit
 	}
 	author := authorship.Author{Type: authorship.AI, Tool: ev.Tool, GenType: ev.GenType, Model: ev.Model}
@@ -207,9 +207,9 @@ func captureWatcherV2(ev Event) {
 	_, _ = authorship.RecordEdit(filepath.Join(ev.RepoPath, ev.FilePath), author)
 }
 
-// watcherV2LivenessWindow bounds how recent a watcher event must be to feed the v2
+// watcherLivenessWindow bounds how recent a watcher event must be to feed the
 // working log (older = startup replay, whose stale diff would mis-attribute).
-const watcherV2LivenessWindow = 2 * time.Minute
+const watcherLivenessWindow = 2 * time.Minute
 
 // runWatchers fans the configured watchers out as goroutines. Errors are
 // logged but never bring the daemon down — a broken tailer for one tool

@@ -54,11 +54,9 @@ func firstNonEmpty(vs ...string) string {
 	return ""
 }
 
-// captureV2 mirrors a recorded edit into the Attribution v2 working log (the
+// captureAuthorship mirrors a recorded edit into the Attribution working log (the
 // pre-edit-baseline + diff engine in internal/authorship). It is:
-//   - gated behind authorship.Enabled() — a no-op when the flag is off, so v2 runs
-//     in DUAL with the existing recorder (Phase 1–2) and the note/gutter are
-//     unaffected until the Phase 3 flip;
+//   - gated behind authorship.Enabled() (a no-op when disabled);
 //   - best-effort and silent — a working-log failure must never affect the host
 //     tool (this runs inside a PostToolUse hook);
 //   - daemon-independent — it writes the working-log file directly, so call it
@@ -66,7 +64,7 @@ func firstNonEmpty(vs ...string) string {
 //
 // author is derived from (tool, genType): an empty tool or a human gen_type
 // (typing, copypaste) is Human; anything else is the AI tool.
-func captureV2(repoPath, rel, tool, genType, model string) {
+func captureAuthorship(repoPath, rel, tool, genType, model string) {
 	if !authorship.Enabled() || repoPath == "" || rel == "" {
 		return
 	}

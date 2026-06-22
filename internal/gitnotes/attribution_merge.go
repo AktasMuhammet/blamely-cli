@@ -15,7 +15,7 @@ import (
 // those were authored on that branch (and attributed in its own commits), not in the
 // merge, so crediting the merge with them inflates its report. A line added vs both
 // parents is genuinely new in the merge (a conflict resolution), and that is what we
-// keep. No-op for non-merge commits and when v2 is off (preserves legacy behavior).
+// keep. No-op for non-merge commits and when attribution is off (preserves legacy behavior).
 //
 // Line numbers from both diffs are post-image (positions in `sha`), so intersecting
 // by (file, line) is valid. Deletions/renames are left as the first-parent diff

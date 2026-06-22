@@ -66,7 +66,7 @@ func RenderStats(sha string) error {
 
 // RenderCurrentStats prints the same deep view for the CURRENT uncommitted change
 // (`blamely stats` with no argument): it attributes the working-tree diff against HEAD
-// from the v2 working logs, with no commit/note required.
+// from the working logs, with no commit/note required.
 func RenderCurrentStats() error {
 	repoPath, ok := gitutil.Toplevel(".")
 	if !ok {

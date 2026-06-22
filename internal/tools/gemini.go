@@ -104,9 +104,9 @@ func RecordGeminiFromStdin(r io.Reader) error {
 		sessionID:      p.SessionID,
 		tool:           "gemini",
 	})
-	// Attribution v2 (dual-run, flag-gated): mirror into the working log before the
+	// Attribution: mirror into the working log before the
 	// daemon POST so capture is daemon-independent. No-op when the flag is off.
-	captureV2(repoPath, rel, "gemini", genType, payload.Model)
+	captureAuthorship(repoPath, rel, "gemini", genType, payload.Model)
 	return postToDaemon(payload)
 }
 

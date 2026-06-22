@@ -23,7 +23,7 @@ import (
 	"github.com/blamely/blamely/internal/tools"
 )
 
-// Wire Attribution v2 note-seeding into the engine here, at the top level: main can
+// Wire Attribution note-seeding into the engine here, at the top level: main can
 // import both authorship and gitnotes without a cycle (gitnotes already imports
 // tools, so the hook can't live there). Before a file's first recorded edit, this
 // seeds its working log from committed authorship so unchanged committed lines keep
@@ -349,7 +349,7 @@ func cmdRecord() *cobra.Command {
 			// failed recording must never block the host tool.
 
 			// --pre: PreToolUse mode. Snapshot the target file's pre-edit content
-			// as the Attribution v2 baseline (flag-gated, best-effort) instead of
+			// as the Attribution baseline (flag-gated, best-effort) instead of
 			// recording an edit. The matching PostToolUse `record` then diffs the
 			// agent's write against this exact baseline.
 			if pre, _ := cmd.Flags().GetBool("pre"); pre {
@@ -380,15 +380,15 @@ func cmdRecord() *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().Bool("pre", false, "PreToolUse mode: snapshot the target file's pre-edit content as the Attribution v2 baseline (no edit recorded)")
+	c.Flags().Bool("pre", false, "PreToolUse mode: snapshot the target file's pre-edit content as the Attribution baseline (no edit recorded)")
 	return c
 }
 
-// cmdAuthorship is the Attribution v2 gutter source (invariant I4: note and gutter
+// cmdAuthorship is the Attribution gutter source (invariant I4: note and gutter
 // derive from the same working log). For a file it seeds the working log from
 // committed authorship when untracked, then prints the working log as JSON — so the
 // editor renders committed + uncommitted authorship from one place. Hidden; the
-// plugins call it only when blamely.attributionV2 is on.
+// plugins call it for the gutter.
 // restrictLinesToChanged keeps only the per-line authorship for lines in `changed`
 // (the uncommitted-diff set), re-collapsing runs that share an author. An empty
 // `changed` yields no lines — the gutter shows nothing once a file has no changes.
@@ -431,7 +431,7 @@ func cmdRecordDeletion() *cobra.Command {
 	c := &cobra.Command{
 		Use:    "record-deletion <file>",
 		Hidden: true,
-		Short:  "Internal: record AI-deleted baseline lines (Attribution v2). Current content on stdin.",
+		Short:  "Internal: record AI-deleted baseline lines (Attribution). Current content on stdin.",
 		Args:   cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !authorship.Enabled() {
@@ -472,7 +472,7 @@ func cmdAuthorship() *cobra.Command {
 	c := &cobra.Command{
 		Use:    "authorship <file>",
 		Hidden: true,
-		Short:  "Internal: per-line authorship for a file (Attribution v2 gutter source)",
+		Short:  "Internal: per-line authorship for a file (Attribution gutter source)",
 		Args:   cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			abs, err := filepath.Abs(args[0])
