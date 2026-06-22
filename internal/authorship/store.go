@@ -211,3 +211,20 @@ func withFileLock(target string, fn func() error) error {
 		time.Sleep(lockPoll)
 	}
 }
+
+// AuthorTypesForFile loads relPath's working log and returns its per-line author
+// types (1-based line number → "ai"/"human"), plus whether a log was found. Used
+// by the Phase 2 dual-run comparison and, after the flip, by note generation.
+func AuthorTypesForFile(repoRoot, branch, baseSHA, relPath string) (map[int]AuthorType, bool) {
+	wl, err := LoadWorkingLog(repoRoot, branch, baseSHA, relPath)
+	if err != nil || wl == nil {
+		return nil, false
+	}
+	m := make(map[int]AuthorType, len(wl.Lines))
+	for _, r := range wl.Lines {
+		for ln := r.Start; ln <= r.End; ln++ {
+			m[ln] = r.Author.Type
+		}
+	}
+	return m, true
+}
