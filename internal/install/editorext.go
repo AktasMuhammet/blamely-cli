@@ -122,6 +122,17 @@ func InstallEditorExtensions() []EditorExtensionResult {
 		// first time and updates it to latest on every subsequent run, so users
 		// never get stuck on a stale version.
 		wasPresent := extensionInstalled(cliPath, blamelyExtensionID)
+		// Uninstall the existing extension before reinstalling. `--install-extension
+		// --force` is supposed to overwrite, but several Code-OSS forks treat it as a
+		// no-op when the VSIX version isn't strictly newer (e.g. a republished same
+		// version, or a downgrade), so the user stays on the stale build. Removing it
+		// first — mirroring the JetBrains path, which wipes the plugin dir before
+		// extracting — guarantees the install below always lands the downloaded build.
+		if wasPresent {
+			if exactID := installedExtensionID(cliPath, blamelyExtensionID); exactID != "" {
+				_ = exec.Command(cliPath, "--uninstall-extension", exactID).Run()
+			}
+		}
 		out, err := installExtensionWithRetry(cliPath, source)
 		if err != nil {
 			r.Err = fmt.Errorf("%s --install-extension %s --force: %w: %s",

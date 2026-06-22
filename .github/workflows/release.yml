@@ -263,6 +263,73 @@ jobs:
           rm -rf sqlite-tools sqlite-tools.zip
           ls -la sqlite3.exe
 
+      - name: Sign Windows binaries (Authenticode)
+        # Authenticode-sign the Windows blamely.exe so Windows Defender /
+        # SmartScreen trust it — an unsigned, garble-obfuscated binary is what
+        # trips the Trojan:Win32/Gracing (Wacatac/Sabsik) false positives.
+        # osslsigncode signs PE files on a Linux host (signtool is Windows-only),
+        # so we sign here in the publish job rather than on the build runners.
+        #
+        # Signs the .exe INSIDE each Windows .zip and re-packs it, and runs BEFORE
+        # the SHA256SUMS step below so the published checksums cover the SIGNED
+        # artifact. No-ops with a loud warning when no signing cert is configured,
+        # so a release without the secret still publishes (just unsigned) — mirrors
+        # the repo's sign-windows.sh behavior.
+        #
+        # Secrets (in this private source repo):
+        #   BLAMELY_SIGN_PFX_BASE64  base64 of a .pfx/.p12 code-signing cert
+        #   BLAMELY_SIGN_PASS        the .pfx password (empty for a passwordless cert)
+        env:
+          BLAMELY_SIGN_PFX_BASE64: ${{ secrets.BLAMELY_SIGN_PFX_BASE64 }}
+          BLAMELY_SIGN_PASS: ${{ secrets.BLAMELY_SIGN_PASS }}
+          BLAMELY_SIGN_TIMESTAMP_URL: 'http://timestamp.digicert.com'
+        shell: bash
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=( *_windows_*.zip )
+          if [ -z "${BLAMELY_SIGN_PFX_BASE64:-}" ]; then
+            echo "::warning::No BLAMELY_SIGN_PFX_BASE64 secret — shipping Windows binaries UNSIGNED (Defender may flag them)."
+            exit 0
+          fi
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "No Windows archives found — nothing to sign."
+            exit 0
+          fi
+          sudo apt-get update
+          sudo apt-get install -y osslsigncode
+
+          # Materialize the .pfx from the base64 secret into a temp file.
+          pfx="$(mktemp)"
+          trap 'rm -f "$pfx"' EXIT
+          printf '%s' "$BLAMELY_SIGN_PFX_BASE64" | base64 -d > "$pfx" \
+            || { echo "::error::BLAMELY_SIGN_PFX_BASE64 is not valid base64"; exit 1; }
+          # Omit -pass entirely for a passwordless cert (osslsigncode dislikes -pass "").
+          passargs=()
+          [ -n "${BLAMELY_SIGN_PASS:-}" ] && passargs=(-pass "$BLAMELY_SIGN_PASS")
+
+          for zip in "${zips[@]}"; do
+            dir="${zip%.zip}"                       # e.g. blamely_v1.7.0_windows_amd64
+            rm -rf _sign && mkdir _sign
+            unzip -q -o "$zip" -d _sign
+            exe="_sign/$dir/blamely.exe"
+            [ -f "$exe" ] || { echo "::error::$exe not found inside $zip"; exit 1; }
+            # -h sha256 + -ts (RFC3161) is the modern Authenticode profile; the
+            # timestamp keeps the signature valid after the cert expires.
+            osslsigncode sign \
+              -pkcs12 "$pfx" "${passargs[@]}" \
+              -n "Blamely" -i "https://blamely.ai" \
+              -h sha256 -ts "$BLAMELY_SIGN_TIMESTAMP_URL" \
+              -in "$exe" -out "$exe.signed"
+            mv -f "$exe.signed" "$exe"
+            # Re-pack with the same top-level layout the build job produced.
+            rm -f "$zip"
+            ( cd _sign && zip -q -r -X "../$zip" "$dir" )
+            rm -rf _sign
+            echo "✓ signed and repacked $zip"
+          done
+
       - name: Generate SHA256SUMS
         shell: bash
         working-directory: dist
