@@ -388,6 +388,7 @@ func cmdRecord() *cobra.Command {
 // editor renders committed + uncommitted authorship from one place. Hidden; the
 // plugins call it only when blamely.attributionV2 is on.
 func cmdAuthorship() *cobra.Command {
+	var all bool
 	c := &cobra.Command{
 		Use:    "authorship <file>",
 		Hidden: true,
@@ -402,8 +403,17 @@ func cmdAuthorship() *cobra.Command {
 			if !ok {
 				return nil // not inside a work tree → nothing to report
 			}
-			// Seed from committed authorship if this file isn't tracked yet, so the
-			// gutter reflects the whole file (committed + any uncommitted edits).
+			// --all: every tracked file's working log for the repo (gutter + status
+			// bar + sidebar repo-wide from one source, so v2 owns them all, I4).
+			if all {
+				logs, lerr := authorship.ListWorkingLogs(ctx.RepoRoot, ctx.Branch, ctx.BaseSHA)
+				if lerr != nil {
+					return lerr
+				}
+				return json.NewEncoder(os.Stdout).Encode(map[string]any{"files": logs})
+			}
+			// Single file: seed from committed authorship if untracked, so the gutter
+			// reflects the whole file (committed + any uncommitted edits).
 			_ = gitnotes.SeedCommittedWorkingLog(ctx.RepoRoot, ctx.Branch, ctx.BaseSHA, ctx.RelPath)
 			wl, err := authorship.LoadWorkingLog(ctx.RepoRoot, ctx.Branch, ctx.BaseSHA, ctx.RelPath)
 			if err != nil {
@@ -415,6 +425,7 @@ func cmdAuthorship() *cobra.Command {
 			return json.NewEncoder(os.Stdout).Encode(wl)
 		},
 	}
+	c.Flags().BoolVar(&all, "all", false, "output working logs for ALL tracked files in the repo (gutter/sidebar repo-wide source)")
 	return c
 }
 

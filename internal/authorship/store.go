@@ -277,3 +277,39 @@ func AuthorsForFile(repoRoot, branch, baseSHA, relPath string) (map[int]Author, 
 	}
 	return m, true
 }
+
+// ListWorkingLogs returns every file's working log under (repoRoot, branch, baseSHA)
+// — the set of files with uncommitted v2 attribution this work cycle. Used to paint
+// the gutter/sidebar repo-wide from one source. Missing dir → empty, not an error.
+func ListWorkingLogs(repoRoot, branch, baseSHA string) ([]*WorkingLog, error) {
+	dir := workingLogDir(repoRoot, branch, baseSHA)
+	var out []*WorkingLog
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			// Skip the .baselines subtree (raw content, not logs).
+			if d.Name() == ".baselines" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".json") {
+			return nil
+		}
+		wl, lerr := loadWorkingLogFile(path)
+		if lerr != nil || wl == nil {
+			return nil // skip unreadable/partial entries; never fail the whole scan
+		}
+		out = append(out, wl)
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		return out, err
+	}
+	return out, nil
+}
