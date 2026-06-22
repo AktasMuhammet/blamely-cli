@@ -74,6 +74,37 @@ func Attribute(prior *WorkingLog, baseline, newContent string, author Author, no
 	}
 }
 
+// DeletedBaselineLines returns the contents of baseline lines that this edit REMOVED
+// — present in baseline but neither LCS-matched nor moved into newContent. Used to
+// attribute deletions to the editing author (the working log itself only describes
+// surviving content). Uses the same alignment + move detection as Attribute, so a
+// moved or reflowed line is NOT reported as a deletion.
+func DeletedBaselineLines(baseline, newContent string) []string {
+	oldLines := splitLines(baseline)
+	newLines := splitLines(newContent)
+	matchedOld := alignLines(oldLines, newLines)
+	movedFrom := detectMoves(oldLines, newLines, matchedOld)
+
+	keptOld := make([]bool, len(oldLines))
+	for _, j := range matchedOld {
+		if j >= 0 {
+			keptOld[j] = true
+		}
+	}
+	for _, mf := range movedFrom {
+		if mf >= 0 {
+			keptOld[mf] = true
+		}
+	}
+	var deleted []string
+	for i, line := range oldLines {
+		if !keptOld[i] {
+			deleted = append(deleted, line)
+		}
+	}
+	return deleted
+}
+
 // detectMoves pairs each unmatched NEW line with an unmatched OLD line of identical
 // (whitespace-normalized) content — a relocated line. Matching is FIFO by content
 // (first available old line of that content), which is deterministic and identical

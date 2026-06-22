@@ -633,6 +633,7 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	// unchanged.
 	logV2Divergence(repoPath, note)
 	flipNoteToWorkingLog(repoPath, note)
+	flipDeletionsToWorkingLog(repoPath, note, change)
 	gcWorkingLogsIfEnabled(repoPath)
 	migrateWorkingLogsOnCommit(repoPath, note)
 

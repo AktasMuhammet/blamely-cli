@@ -341,6 +341,7 @@ setting `false`. With v2 off (opt-out), behavior is the legacy engine, unchanged
 | Phase 3 **gutter + sidebar** flip (plugins paint from `authorship`) | ◐ | both IDEs paint gutter/status/sidebar repo-wide from `authorship --all` (one v2 source); needs an IDE run to verify icons |
 | History-rewrite robustness (amend/rebase/cherry-pick) | ✅ | notes.rewriteRef + skip-while-in-progress; real-rebase e2e |
 | Merge-conflict-resolution attribution | ✅ | merge note keeps only lines added vs BOTH parents (resolution); real-merge e2e |
+| Deletion attribution (who removed a line) | ✅ CLI | edits record removed lines + author in a separate .deletions.jsonl; the note's delete ranges flip from it. Editor-originated deletions degrade to v1 (follow-up) |
 | Phase 6 retire old engine | ☐ | gated on §12 |
 | PreToolUse `--pre` install wiring | ☐ deferred | per-call hook cost while experimental |
 

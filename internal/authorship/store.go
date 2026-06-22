@@ -175,6 +175,9 @@ func Update(repoRoot, branch, baseSHA, relPath, newContent, fallbackBaseline str
 		if err := atomicWrite(basePath, []byte(newContent)); err != nil {
 			return err
 		}
+		// Record lines this edit removed (attributed to `author`) in the separate
+		// deletions log, so the commit note can attribute deletions too.
+		_ = AppendDeletions(repoRoot, branch, baseSHA, rel, DeletedBaselineLines(baseline, newContent), author)
 		result = wl
 		return nil
 	})
