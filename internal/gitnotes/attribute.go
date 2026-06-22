@@ -643,6 +643,13 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	// Fold deletions into the generation breakdown (the add-recompute above reset it
 	// to additions only), so the Generation bars cover all changed lines.
 	addDeletedLinesToGenType(note)
+	// Token usage: the Human skeleton attaches no edit per line, so buildNote's
+	// token aggregation never runs for AI tools (leaving tokens nil). Now that the
+	// flip has settled which tools contributed, sum their recorded usage from the
+	// in-window edits. Gated on the same config as the strip above.
+	if cfg.Note.Tokens {
+		applyEditTokens(db, repoID, commitNanos, note)
+	}
 	gcWorkingLogsIfEnabled(repoPath)
 	migrateWorkingLogsOnCommit(repoPath, note)
 
@@ -696,6 +703,87 @@ func applyChatUsage(note *Note, tool store.Tool, u *tools.TranscriptUsage) {
 	}
 	note.Totals.Tokens.Input += u.InputTokens
 	note.Totals.Tokens.Output += u.OutputTokens
+}
+
+// applyEditTokens fills per-tool and total token usage from the SQLite edits in
+// this commit's window. The v2 note builder lays a Human skeleton with no edit
+// attached per line, so buildNote's resolved-loop token aggregation never runs for
+// AI tools (tokens stay nil); this restores them after the flip determined which
+// tools contributed. Only tools that actually authored committed lines are
+// credited, and only edits that recorded usage count.
+//
+// Tokens are deduped PER TURN (tool + timestamp), not per edit row: Codex stamps
+// the same turn-usage on every file it edited in a turn (identical ts), so a
+// per-row sum would multiply by the file count. Claude/Copilot use distinct
+// per-edit timestamps, so each genuine edit still counts once.
+func applyEditTokens(db *store.DB, repoID string, commitNanos int64, note *Note) {
+	if db == nil || note == nil {
+		return
+	}
+	contributing := map[string]bool{}
+	for name := range note.ByTool {
+		if authorTypeFor(store.Tool(name)) == "AI" {
+			contributing[name] = true
+		}
+	}
+	if len(contributing) == 0 {
+		return
+	}
+	sinceNanos := db.PreviousCommitTimestampNanos(repoID, commitNanos)
+	const slack = int64(5 * 1e9)
+	maxNanos := commitNanos + slack
+
+	perTool := map[string]*Tokens{}
+	var total Tokens
+	seenTurn := map[string]bool{}
+	any := false
+	for fi := range note.Files {
+		edits, err := db.EditsForFileSince(repoID, note.Files[fi].Path, sinceNanos)
+		if err != nil {
+			continue
+		}
+		for i := range edits {
+			e := &edits[i]
+			if e.TimestampNanos <= sinceNanos || e.TimestampNanos > maxNanos {
+				continue
+			}
+			tool := string(e.Tool)
+			if !contributing[tool] || !hasUsage(e) {
+				continue
+			}
+			turnKey := fmt.Sprintf("%s:%d", tool, e.TimestampNanos)
+			if seenTurn[turnKey] {
+				continue
+			}
+			seenTurn[turnKey] = true
+			t := perTool[tool]
+			if t == nil {
+				t = &Tokens{}
+				perTool[tool] = t
+			}
+			in, out := nullInt64(e.InputTokens), nullInt64(e.OutputTokens)
+			cr, cw := nullInt64(e.CacheReadTokens), nullInt64(e.CacheWriteTokens)
+			t.Input += in
+			t.Output += out
+			t.CacheRead += cr
+			t.CacheWrite += cw
+			total.Input += in
+			total.Output += out
+			total.CacheRead += cr
+			total.CacheWrite += cw
+			any = true
+		}
+	}
+	if !any {
+		return
+	}
+	for tool, t := range perTool {
+		bt := note.ByTool[tool]
+		bt.Tokens = t
+		note.ByTool[tool] = bt
+	}
+	tot := total
+	note.Totals.Tokens = &tot
 }
 
 // inheritBlankLineAttribution reassigns blank (empty/whitespace-only) lines to
