@@ -188,6 +188,10 @@ func toolLabel(tool string) string {
 // when unknown). Deletions (no AuthorType) render as a dim "—".
 func formatAttribution(l gitnotes.RangeEntry) string {
 	switch {
+	case l.Tool == "copypaste":
+		// copypaste is human-authored (author_type Human) — render in the human
+		// colour with a copy-paste note, not as a green AI tool.
+		return blue("human") + dim(" · copy-paste")
 	case l.Tool != "":
 		s := green(toolLabel(l.Tool))
 		var extra []string

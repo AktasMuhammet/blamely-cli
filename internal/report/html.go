@@ -326,8 +326,8 @@ func topModelAndAccepted(note *gitnotes.Note) (string, *htmlAccepted) {
 func fileTopAITool(f gitnotes.FileEntry) (string, int) {
 	counts := map[string]int{}
 	for _, l := range f.Lines {
-		if l.Type != "add" || l.Tool == "" || l.Tool == "human" {
-			continue
+		if l.Type != "add" || l.Tool == "" || l.Tool == "human" || l.Tool == "copypaste" {
+			continue // copypaste is human-authored, not an AI tool
 		}
 		counts[l.Tool] += l.NumLines()
 	}
@@ -554,6 +554,11 @@ func fileRanges(f gitnotes.FileEntry) []htmlRange {
 
 // rangeAttr renders one range's authorship and whether it's AI-attributed.
 func rangeAttr(l gitnotes.RangeEntry) (string, bool) {
+	// copypaste is a Human-side tool tag (author_type stays Human): render it as
+	// human with a copy-paste note, never as an AI generator.
+	if l.Tool == "copypaste" {
+		return "human · copy-paste", false
+	}
 	if l.Tool != "" && l.Tool != "human" {
 		s := toolLabel(l.Tool)
 		var extra []string

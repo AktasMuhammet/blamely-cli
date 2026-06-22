@@ -369,6 +369,10 @@ func fileRangesBody(note *gitnotes.Note) []string {
 // AI tool in green with a dimmed model · gen_type tail, "human" in amber, and a
 // faint dash for unattributed deletions.
 func termRangeAttr(l gitnotes.RangeEntry) string {
+	if l.Tool == "copypaste" {
+		// copypaste is human-authored — human colour with a copy-paste note.
+		return blue("human") + dim(" · copy-paste")
+	}
 	if l.Tool != "" && l.Tool != "human" {
 		s := green(toolLabel(l.Tool))
 		var extra []string
