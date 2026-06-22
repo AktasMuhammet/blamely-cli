@@ -456,6 +456,13 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 		repoID = repoPath
 	}
 
+	// Capture any note already on this SHA before we recompute. On a plain `git commit
+	// --amend` git copies the pre-amend note here (notes.rewriteRef), but an amend isn't
+	// an in-progress op so we don't skip — reconcileAddsFromInheritedNote below restores
+	// the inherited AI attribution the recompute would otherwise clobber. nil on a fresh
+	// commit (no note yet).
+	inheritedNote := loadNoteForSeed(repoPath, sha)
+
 	change, err := DiffCommit(repoPath, sha)
 	if err != nil {
 		return nil, fmt.Errorf("diff commit: %w", err)
@@ -635,6 +642,11 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	// positions), so it drops them to Human. Scoped to this commit's added lines,
 	// the recorded content_shas reattribute them deterministically. Human→AI only.
 	reconcileAddsFromEdits(db, repoID, commitNanos, note, change.Added)
+	// Amend recovery: restore AI added-line attribution from the note git inherited onto
+	// this SHA when the working-log flip and edit reconcile couldn't (the original commit
+	// deleted the working log and the edits are out of window). Human→AI only, no-op
+	// without an inherited note.
+	reconcileAddsFromInheritedNote(inheritedNote, note)
 	flipDeletionsToWorkingLog(repoPath, note, change)
 	// Lossless cross-check for deletions: the deletions log misses chat/cli tools
 	// that removed lines (recorded only in SQLite edit_removed_lines), so reattribute

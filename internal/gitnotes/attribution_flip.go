@@ -185,6 +185,125 @@ func reconcileAddsFromEdits(db *store.DB, repoID string, commitNanos int64, note
 	}
 }
 
+// reconcileAddsFromInheritedNote preserves AI added-line attribution across a plain
+// `git commit --amend`. git copies the pre-amend commit's note onto the amended SHA
+// (notes.rewriteRef), but — unlike rebase/cherry-pick — an amend is not an in-progress
+// op, so attributionShouldSkip doesn't fire and AttributeAndWrite recomputes. By then
+// the committed file's working log was deleted by the original commit and its source
+// edits sit outside this commit's window, so the recompute drops AI lines back to
+// Human. This restores them from the note git inherited: for each added line the
+// recompute left Human, if the inherited note attributed the SAME post-image line to an
+// AI tool, re-apply that attribution. Human→AI ONLY, line-for-line — consistent with
+// reconcileAddsFromEdits.
+//
+// Guard against a content-changing amend: a file is reconciled only when its added-line
+// number set is identical in the inherited and freshly-built notes. If the amend altered
+// the file's diff, the line numbers no longer describe the same content, so we keep the
+// recompute's result rather than risk crediting a human-typed line to AI. A fresh commit
+// (no inherited note) or one that inherited nothing as AI is a no-op.
+func reconcileAddsFromInheritedNote(inherited, note *Note) {
+	if inherited == nil || note == nil {
+		return
+	}
+	type aiAttr struct {
+		tool    string
+		model   *string
+		genType *string
+	}
+	// Inherited AI added-line attribution and the full inherited added-line set, per file.
+	aiByLine := map[string]map[int]aiAttr{}
+	inhAddSet := map[string]map[int]bool{}
+	for _, f := range inherited.Files {
+		for _, r := range f.Lines {
+			if r.Type != "add" {
+				continue
+			}
+			if inhAddSet[f.Path] == nil {
+				inhAddSet[f.Path] = map[int]bool{}
+			}
+			for ln := r.Start; ln <= r.End; ln++ {
+				inhAddSet[f.Path][ln] = true
+			}
+			if r.AuthorType != "AI" || r.Tool == "" {
+				continue
+			}
+			if aiByLine[f.Path] == nil {
+				aiByLine[f.Path] = map[int]aiAttr{}
+			}
+			for ln := r.Start; ln <= r.End; ln++ {
+				aiByLine[f.Path][ln] = aiAttr{tool: r.Tool, model: r.Model, genType: r.GenType}
+			}
+		}
+	}
+	if len(aiByLine) == 0 {
+		return
+	}
+
+	changedAny := false
+	for fi := range note.Files {
+		fe := &note.Files[fi]
+		ai := aiByLine[fe.Path]
+		if len(ai) == 0 {
+			continue
+		}
+		// Same-content guard: the file's added-line set must match the inherited note's,
+		// or the amend changed this file and line numbers can't be trusted.
+		freshAddSet := map[int]bool{}
+		for _, r := range fe.Lines {
+			if r.Type != "add" {
+				continue
+			}
+			for ln := r.Start; ln <= r.End; ln++ {
+				freshAddSet[ln] = true
+			}
+		}
+		if !sameIntSet(freshAddSet, inhAddSet[fe.Path]) {
+			continue
+		}
+
+		var rewritten []RangeEntry
+		changed := false
+		for _, r := range fe.Lines {
+			if r.Type != "add" {
+				rewritten = append(rewritten, r)
+				continue
+			}
+			for ln := r.Start; ln <= r.End; ln++ {
+				single := RangeEntry{Start: ln, End: ln, Type: "add", AuthorType: r.AuthorType, Tool: r.Tool, Model: r.Model, GenType: r.GenType}
+				if single.AuthorType != "AI" {
+					if a, ok := ai[ln]; ok {
+						single.AuthorType = "AI"
+						single.Tool = a.tool
+						single.Model = a.model
+						single.GenType = a.genType
+						changed = true
+					}
+				}
+				rewritten = append(rewritten, single)
+			}
+		}
+		if changed {
+			fe.Lines = collapseAddRanges(rewritten)
+			changedAny = true
+		}
+	}
+	if changedAny {
+		recomputeAddedAggregates(note)
+	}
+}
+
+func sameIntSet(a, b map[int]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
+}
+
 // inheritBlankAddRanges gives each blank Human added line the AI attribution of
 // its nearest non-blank added neighbour (backward first, then forward), matching
 // buildNote's inheritBlankLineAttribution. Operates on the expanded single-line
