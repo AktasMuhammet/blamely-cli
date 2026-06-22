@@ -1,6 +1,6 @@
 # Attribution v2 — Design
 
-**Status:** Implemented behind a flag (engine + CLI pipeline complete; editor display + git-op lifecycle in progress) · **Owner:** Blamely · **Scope:** blamely-cli + VS Code plugin + IntelliJ plugin
+**Status:** On by default (engine + CLI pipeline + editor gutter/sidebar complete; §12 soak + Phase 6 retire pending) · **Owner:** Blamely · **Scope:** blamely-cli + VS Code plugin + IntelliJ plugin
 
 > **Project constraints (apply to all of v2):**
 > - **Naming:** do not reference any external project by name in code, comments, or docs — describe approaches generically.
