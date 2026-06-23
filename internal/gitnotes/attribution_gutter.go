@@ -144,6 +144,25 @@ func ReconcileGutterOverrides(db *store.DB, repoRoot, baseSHA string, wl *author
 	if db == nil || wl == nil || len(changed) == 0 || !authorship.Enabled() {
 		return nil
 	}
+	repoID, _ := gitutil.RepoID(repoRoot)
+	if repoID == "" {
+		repoID = repoRoot
+	}
+	// Window: edits recorded AFTER HEAD was committed are the uncommitted ones the
+	// gutter shows; no upper bound — every such edit up to now is a candidate.
+	sinceNanos, _ := CommitTimestampNanos(repoRoot, baseSHA)
+	return ReconcileGutterOverridesAt(db, repoRoot, repoID, sinceNanos, wl, changed)
+}
+
+// ReconcileGutterOverridesAt is ReconcileGutterOverrides with the two per-request
+// CONSTANTS — the repo id and the base-SHA commit timestamp — passed in instead of
+// recomputed. The repo-wide `--all` path resolves them ONCE and reuses them for every
+// file, avoiding two `git` subprocess spawns per working log (the dominant cost on
+// Windows, where process creation is expensive).
+func ReconcileGutterOverridesAt(db *store.DB, repoRoot, repoID string, sinceNanos int64, wl *authorship.WorkingLog, changed map[int]bool) map[int]authorship.Author {
+	if db == nil || wl == nil || len(changed) == 0 || !authorship.Enabled() {
+		return nil
+	}
 	data, err := os.ReadFile(filepath.Join(repoRoot, filepath.FromSlash(wl.File)))
 	if err != nil {
 		return nil
@@ -156,13 +175,6 @@ func ReconcileGutterOverrides(db *store.DB, repoRoot, baseSHA string, wl *author
 		return strings.TrimRight(fileLines[ln-1], "\r")
 	}
 
-	repoID, _ := gitutil.RepoID(repoRoot)
-	if repoID == "" {
-		repoID = repoRoot
-	}
-	// Window: edits recorded AFTER HEAD was committed are the uncommitted ones the
-	// gutter shows; no upper bound — every such edit up to now is a candidate.
-	sinceNanos, _ := CommitTimestampNanos(repoRoot, baseSHA)
 	m := newEditMatcher(db, repoID, wl.File, sinceNanos, math.MaxInt64, aiEligible)
 	if m.empty() {
 		return nil

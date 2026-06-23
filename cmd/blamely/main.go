@@ -17,6 +17,7 @@ import (
 	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/daemon"
 	"github.com/blamely/blamely/internal/gitnotes"
+	"github.com/blamely/blamely/internal/gitutil"
 	"github.com/blamely/blamely/internal/install"
 	"github.com/blamely/blamely/internal/report"
 	"github.com/blamely/blamely/internal/store"
@@ -528,14 +529,36 @@ func cmdAuthorship() *cobra.Command {
 				wl.Lines = restrictLinesToChanged(wl.Lines, changed, overrides)
 			}
 
-			// --all: every tracked file's working log for the repo (sidebar aggregate).
+			// --all: the repo-wide gutter/sidebar source. The gutter only marks
+			// UNCOMMITTED changes, so a committed, unchanged file's working log restricts
+			// to nothing and need not be touched. Rather than diff every working log on
+			// disk one-by-one (3–4 git spawns each — slow on Windows, and the set grew
+			// once committed logs became retained), resolve the whole change-set and the
+			// two per-request constants (repo id, base-SHA timestamp) ONCE, then only do
+			// work for files that currently changed or are untracked.
 			if all {
 				logs, lerr := authorship.ListWorkingLogs(ctx.RepoRoot, ctx.Branch, ctx.BaseSHA)
 				if lerr != nil {
 					return lerr
 				}
+				changedByFile := gitnotes.UncommittedAddedLinesAll(ctx.RepoRoot)
+				untracked := gitnotes.UntrackedFiles(ctx.RepoRoot)
+				repoID, _ := gitutil.RepoID(ctx.RepoRoot)
+				if repoID == "" {
+					repoID = ctx.RepoRoot
+				}
+				sinceNanos, _ := gitnotes.CommitTimestampNanos(ctx.RepoRoot, ctx.BaseSHA)
 				for _, wl := range logs {
-					restrict(wl)
+					changed := changedByFile[wl.File]
+					if len(changed) == 0 {
+						if !untracked[wl.File] {
+							wl.Lines = nil // unchanged → empty gutter, same as before but no git/db work
+							continue
+						}
+						changed = allWorkingLogLines(wl)
+					}
+					overrides := gitnotes.ReconcileGutterOverridesAt(db, ctx.RepoRoot, repoID, sinceNanos, wl, changed)
+					wl.Lines = restrictLinesToChanged(wl.Lines, changed, overrides)
 				}
 				return json.NewEncoder(os.Stdout).Encode(map[string]any{"files": logs})
 			}

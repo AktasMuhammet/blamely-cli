@@ -24,7 +24,12 @@ func RepoID(p string) (string, bool) {
 		p = r
 	}
 	dir := p
-	if fi, err := pathStat(p); err == nil && !fi.IsDir() {
+	if fi, err := pathStat(p); err != nil || !fi.IsDir() {
+		// A regular file, OR a path that doesn't exist yet — e.g. an AI `create_file`
+		// whose transcript event is tailed before the file is flushed to disk. Resolve
+		// from the parent directory (which exists and is in the same work tree); without
+		// this `git -C <missing-file>` fails, RepoID returns "", and the brand-new file's
+		// AI edit is silently dropped → it falls to Human at commit.
 		dir = filepath.Dir(p)
 	}
 	out, err := exec.Command("git", "-C", dir, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
@@ -54,7 +59,10 @@ func Toplevel(p string) (string, bool) {
 		p = r
 	}
 	dir := p
-	if fi, err := pathStat(p); err == nil && !fi.IsDir() {
+	if fi, err := pathStat(p); err != nil || !fi.IsDir() {
+		// See RepoID: descend to the parent dir for files and not-yet-written paths so a
+		// streamed `create_file` resolves a correct repo-relative path instead of an
+		// absolute one (which wouldn't match `git diff` at commit → Human).
 		dir = filepath.Dir(p)
 	}
 	out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output()
