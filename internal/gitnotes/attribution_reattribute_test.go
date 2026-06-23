@@ -34,6 +34,10 @@ func TestReattribution_RecoversFromKeptWorkingLog(t *testing.T) {
 		return string(out[:40])
 	}
 	git("init", "-q")
+	// Set identity in the repo config (not just env) so AttributeAndWrite's internal
+	// `git notes add` has an author identity on CI runners with no global config.
+	git("config", "user.email", "t@t")
+	git("config", "user.name", "t")
 	git("checkout", "-q", "-b", "main")
 	git("commit", "-q", "--allow-empty", "-m", "c0")
 	parent := rev()
