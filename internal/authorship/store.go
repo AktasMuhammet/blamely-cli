@@ -340,10 +340,15 @@ func MigrateWorkingLogs(repoRoot, branch, oldBase, newBase string, committed map
 	for _, wl := range logs {
 		rel := wl.File
 		if committed[rel] {
-			// Committed in this commit: drop the working log (note + SQLite hold the
-			// attribution now) instead of stranding it at the parent base forever.
-			_ = os.Remove(WorkingLogPath(repoRoot, branch, oldBase, rel))
-			_ = os.Remove(BaselinePath(repoRoot, branch, oldBase, rel))
+			// Committed in this commit: KEEP the working log at the parent base. It is
+			// the durable, deterministic source a later re-attribution re-flips from —
+			// an amend/rebase of THIS commit, or a divergent sibling commit on the same
+			// parent that re-adds the same content. Deleting it here (the behavior added
+			// in 300fdf81) forced re-attribution to fall back to SQLite content-sha
+			// recovery, which SILENTLY loses AI attribution when the source edit is
+			// outside the commit's time window (divergent history / watermark) — the
+			// note then ships all-Human with no way back. Disk growth from retaining
+			// these is bounded by GCWorkingLogs pruning bases deep behind HEAD.
 			continue
 		}
 		oldWL := WorkingLogPath(repoRoot, branch, oldBase, rel)
@@ -369,8 +374,9 @@ func MigrateWorkingLogs(repoRoot, branch, oldBase, newBase string, committed map
 		_ = os.Remove(oldWL)
 		_ = os.Remove(oldBaseline)
 	}
-	// Drop the old base dir once empty (committed logs deleted, uncommitted moved
-	// forward). A non-empty dir — e.g. an unmigrated log — is left intact (harmless).
+	// Drop the old base dir only if it's now empty (every log migrated forward and
+	// no committed-file logs retained). A dir holding retained committed-file logs is
+	// kept for re-attribution; GCWorkingLogs prunes it once it's deep behind HEAD.
 	if remaining, rerr := ListWorkingLogs(repoRoot, branch, oldBase); rerr == nil && len(remaining) == 0 {
 		_ = os.RemoveAll(workingLogDir(repoRoot, branch, oldBase))
 	}

@@ -392,6 +392,20 @@ func cmdRecord() *cobra.Command {
 // restrictLinesToChanged keeps only the per-line authorship for lines in `changed`
 // (the uncommitted-diff set), re-collapsing runs that share an author. An empty
 // `changed` yields no lines — the gutter shows nothing once a file has no changes.
+// allWorkingLogLines returns the set of every line number covered by the working
+// log's authorship ranges. Used as the "changed" set for untracked files, which
+// don't appear in `git diff HEAD` — so the gutter shows their full attribution on
+// creation instead of staying blank until `git add`.
+func allWorkingLogLines(wl *authorship.WorkingLog) map[int]bool {
+	set := map[int]bool{}
+	for _, r := range wl.Lines {
+		for ln := r.Start; ln <= r.End; ln++ {
+			set[ln] = true
+		}
+	}
+	return set
+}
+
 func restrictLinesToChanged(lines []authorship.LineAttribution, changed map[int]bool, overrides map[int]authorship.Author) []authorship.LineAttribution {
 	if len(changed) == 0 {
 		return nil
@@ -498,6 +512,15 @@ func cmdAuthorship() *cobra.Command {
 					return
 				}
 				changed := gitnotes.UncommittedAddedLines(ctx.RepoRoot, wl.File)
+				// A brand-new, untracked file (e.g. one Copilot just wrote) isn't in
+				// `git diff HEAD`, so `changed` is empty and the gutter would stay blank
+				// until `git add`. Treat every working-log line as changed for
+				// untracked-but-not-ignored files so AI attribution shows on creation
+				// — mirroring the uncommitted-working-tree scoping the plugin's V1 path
+				// applied for untracked files.
+				if len(changed) == 0 && gitnotes.IsUntracked(ctx.RepoRoot, wl.File) {
+					changed = allWorkingLogLines(wl)
+				}
 				// Live twin of the commit-note reconciliation: upgrade Human lines the
 				// working-log fold couldn't resolve to AI when their content matches a
 				// recorded AI edit, so the gutter and the eventual note agree (I4).

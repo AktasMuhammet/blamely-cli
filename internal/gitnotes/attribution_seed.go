@@ -198,3 +198,17 @@ func UncommittedAddedLines(repoPath, relPath string) map[int]bool {
 	}
 	return set
 }
+
+// IsUntracked reports whether relPath exists in the working tree but is NOT tracked
+// by git and is not ignored — i.e. a brand-new file. Such files never appear in
+// `git diff HEAD` (they're absent from both HEAD and the index until `git add`), so
+// UncommittedAddedLines returns an empty set for them; callers use this to fall back
+// to "every line changed" instead of showing a blank gutter. `git ls-files --others
+// --exclude-standard` lists exactly the untracked-and-not-ignored paths.
+func IsUntracked(repoPath, relPath string) bool {
+	out, err := exec.Command("git", "-C", repoPath, "ls-files", "--others", "--exclude-standard", "--", relPath).Output()
+	if err != nil {
+		return false
+	}
+	return len(bytes.TrimSpace(out)) > 0
+}

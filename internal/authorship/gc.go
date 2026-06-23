@@ -4,7 +4,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 )
+
+// workingLogRetainDepth bounds how many commits behind HEAD a base-SHA working-log
+// dir is kept. Committed files' logs are retained at their parent base as the durable
+// re-attribution source (amend/rebase, or a divergent sibling on the same base); this
+// caps the disk that retention costs. The bound is deliberately generous — far beyond
+// any realistic amend/rebase/sibling reach — so attribution recovery is never the
+// thing GC breaks. Bases that are NOT ancestors of HEAD (divergent siblings) have no
+// "depth" and are never pruned by this rule.
+const workingLogRetainDepth = 200
 
 // GCWorkingLogs prunes working-log trees whose base commit git no longer has —
 // i.e. base_sha directories whose object is gone after an amend / rebase / `git gc`
@@ -42,7 +53,16 @@ func GCWorkingLogs(repoRoot string) (pruned int, err error) {
 				continue // keep non-SHA bases (INITIAL/DETACHED) and stray files
 			}
 			if objectExists(repoRoot, sd.Name()) {
-				continue // base object still present → keep (conservative)
+				// Base object still present. Keep it unless it's an ANCESTOR of HEAD that
+				// sits deeper than the retain depth — that far back, no amend/rebase or
+				// sibling re-attribution targets it, so its retained committed-file logs
+				// can go. Non-ancestors (divergent siblings) and shallow bases are kept.
+				if d, ok := baseDepthBehindHead(repoRoot, sd.Name()); ok && d > workingLogRetainDepth {
+					if os.RemoveAll(filepath.Join(branchPath, sd.Name())) == nil {
+						pruned++
+					}
+				}
+				continue
 			}
 			if os.RemoveAll(filepath.Join(branchPath, sd.Name())) == nil {
 				pruned++
@@ -68,6 +88,25 @@ func looksLikeSHA(s string) bool {
 		}
 	}
 	return true
+}
+
+// baseDepthBehindHead returns how many commits HEAD is ahead of sha (i.e. sha's
+// distance behind HEAD) and true, but ONLY when sha is an ancestor of HEAD. For a
+// non-ancestor (a divergent sibling base, or when HEAD is unresolvable) it returns
+// false so the caller keeps the dir — a sibling base may still back live work.
+func baseDepthBehindHead(repoRoot, sha string) (int, bool) {
+	if exec.Command("git", "-C", repoRoot, "merge-base", "--is-ancestor", sha, "HEAD").Run() != nil {
+		return 0, false // not an ancestor of HEAD (or no HEAD) → no meaningful depth
+	}
+	out, err := exec.Command("git", "-C", repoRoot, "rev-list", "--count", sha+"..HEAD").Output()
+	if err != nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // objectExists reports whether git still has the object (any type). Existence, not

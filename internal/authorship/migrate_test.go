@@ -6,8 +6,9 @@ func TestMigrateWorkingLogs(t *testing.T) {
 	repo := t.TempDir()
 	ai := Author{Type: AI, Tool: "claude", GenType: "chat"}
 	// a.txt + b.txt: uncommitted → should migrate. committed.txt: in this commit →
-	// its working log is DELETED (note + SQLite hold the attribution now). dup.txt: a
-	// fresher log already at baseB → the migrate must not overwrite it.
+	// its working log is KEPT at baseA as the durable re-attribution source (amend/
+	// rebase or a divergent sibling re-flips from it). dup.txt: a fresher log already
+	// at baseB → the migrate must not overwrite it.
 	for _, f := range []string{"a.txt", "b.txt", "committed.txt", "dup.txt"} {
 		if _, err := Update(repo, "main", "baseA", f, "x\n", "", ai, 1); err != nil {
 			t.Fatal(err)
@@ -31,9 +32,12 @@ func TestMigrateWorkingLogs(t *testing.T) {
 			t.Errorf("%s lost its AI attribution after migrate: %+v", f, wl.Lines)
 		}
 	}
-	// committed.txt is deleted from baseA (note + SQLite hold it) and not at baseB.
-	if kept, _ := LoadWorkingLog(repo, "main", "baseA", "committed.txt"); kept != nil {
-		t.Error("committed.txt working log should be deleted from baseA after commit")
+	// committed.txt is KEPT at baseA (durable re-attribution source) and not migrated
+	// forward to baseB.
+	if kept, _ := LoadWorkingLog(repo, "main", "baseA", "committed.txt"); kept == nil {
+		t.Error("committed.txt working log should be KEPT at baseA for re-attribution")
+	} else if len(kept.Lines) == 0 || kept.Lines[0].Author.Type != AI {
+		t.Errorf("committed.txt kept log lost its AI attribution: %+v", kept.Lines)
 	}
 	if moved, _ := LoadWorkingLog(repo, "main", "baseB", "committed.txt"); moved != nil {
 		t.Error("committed.txt should NOT have migrated to baseB")
