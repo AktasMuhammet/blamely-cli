@@ -39,7 +39,7 @@ func init() {
 // JetBrains plugins. The release workflow can still override it at link time via
 // `-ldflags "-X main.version=<tag>"`; otherwise this hardcoded value is what
 // `blamely --version` reports.
-var version = "1.6.3"
+var version = "1.6.4"
 
 // resolveVersion returns the effective CLI version. Precedence:
 //  1. an explicit -ldflags override (release builds);
@@ -529,18 +529,17 @@ func cmdAuthorship() *cobra.Command {
 				wl.Lines = restrictLinesToChanged(wl.Lines, changed, overrides)
 			}
 
-			// --all: the repo-wide gutter/sidebar source. The gutter only marks
-			// UNCOMMITTED changes, so a committed, unchanged file's working log restricts
-			// to nothing and need not be touched. Rather than diff every working log on
-			// disk one-by-one (3–4 git spawns each — slow on Windows, and the set grew
-			// once committed logs became retained), resolve the whole change-set and the
-			// two per-request constants (repo id, base-SHA timestamp) ONCE, then only do
-			// work for files that currently changed or are untracked.
+			// --all: the repo-wide gutter/sidebar source. The gutter only ever marks
+			// UNCOMMITTED changes, so the ONLY files that can contribute are those that
+			// currently differ from HEAD (modified) or are untracked (new). We resolve
+			// that change-set once (one `git diff HEAD` + one `git ls-files --others`) and
+			// load ONLY those files' working logs — we do NOT enumerate every working log
+			// on disk (that set grew once committed logs became retained, and walking it
+			// plus a git spawn per file was the Windows slowness). Committed, unchanged
+			// files would restrict to an empty gutter anyway, so they're simply omitted;
+			// the plugin replaces its whole map each refresh, so an omitted file == a
+			// cleared gutter, identical in effect.
 			if all {
-				logs, lerr := authorship.ListWorkingLogs(ctx.RepoRoot, ctx.Branch, ctx.BaseSHA)
-				if lerr != nil {
-					return lerr
-				}
 				changedByFile := gitnotes.UncommittedAddedLinesAll(ctx.RepoRoot)
 				untracked := gitnotes.UntrackedFiles(ctx.RepoRoot)
 				repoID, _ := gitutil.RepoID(ctx.RepoRoot)
@@ -548,19 +547,29 @@ func cmdAuthorship() *cobra.Command {
 					repoID = ctx.RepoRoot
 				}
 				sinceNanos, _ := gitnotes.CommitTimestampNanos(ctx.RepoRoot, ctx.BaseSHA)
-				for _, wl := range logs {
-					changed := changedByFile[wl.File]
-					if len(changed) == 0 {
-						if !untracked[wl.File] {
-							wl.Lines = nil // unchanged → empty gutter, same as before but no git/db work
-							continue
-						}
+
+				relevant := make(map[string]bool, len(changedByFile)+len(untracked))
+				for f := range changedByFile {
+					relevant[f] = true
+				}
+				for f := range untracked {
+					relevant[f] = true
+				}
+				out := make([]*authorship.WorkingLog, 0, len(relevant))
+				for file := range relevant {
+					wl, lerr := authorship.LoadWorkingLog(ctx.RepoRoot, ctx.Branch, ctx.BaseSHA, file)
+					if lerr != nil || wl == nil {
+						continue // no working log for this changed file → no AI gutter
+					}
+					changed := changedByFile[file]
+					if len(changed) == 0 { // untracked (new) file: every line is uncommitted
 						changed = allWorkingLogLines(wl)
 					}
 					overrides := gitnotes.ReconcileGutterOverridesAt(db, ctx.RepoRoot, repoID, sinceNanos, wl, changed)
 					wl.Lines = restrictLinesToChanged(wl.Lines, changed, overrides)
+					out = append(out, wl)
 				}
-				return json.NewEncoder(os.Stdout).Encode(map[string]any{"files": logs})
+				return json.NewEncoder(os.Stdout).Encode(map[string]any{"files": out})
 			}
 			// Single file: seed from committed authorship if untracked (so changed
 			// lines that were authored earlier still resolve), then restrict to the

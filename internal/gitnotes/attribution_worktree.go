@@ -69,7 +69,7 @@ func AttributeWorkingTree(repoPath string) (*Note, error) {
 	}
 	// Fold deletions into the generation breakdown so `blamely stats` bars cover all
 	// changed lines, not just additions (mirrors AttributeAndWrite).
-	addDeletedLinesToGenType(note)
+	recomputeByGenType(note)
 	return note, nil
 }
 

@@ -380,7 +380,7 @@ func buildLeaders(note *gitnotes.Note, total int, authorName string) ([]htmlLead
 			}
 			entries = append(entries, entry{m, t.Models[m] + share, true})
 		}
-	} else if aiByTool := buildLeaderToolEntries(note, aiDeleted); len(aiByTool) > 0 {
+	} else if aiByTool := buildLeaderToolEntries(note); len(aiByTool) > 0 {
 		// No per-model rollup (e.g. an Antigravity edit recorded before its model
 		// was resolvable). Fall back to by_tool so the AI still appears, labeled
 		// by its model if known, else the tool name.
@@ -427,16 +427,14 @@ func buildLeaders(note *gitnotes.Note, total int, authorName string) ([]htmlLead
 // per-model rollup is empty: one entry per contributing AI tool, labeled by its
 // model when known else the tool name (which toolForModel maps back to the same
 // tool glyph), with the commit's AI deletions apportioned by added-line share.
-func buildLeaderToolEntries(note *gitnotes.Note, aiDeleted int) []struct {
+func buildLeaderToolEntries(note *gitnotes.Note) []struct {
 	name  string
 	lines int
 } {
-	type row struct {
+	out := make([]struct {
 		name  string
 		lines int
-	}
-	var rows []row
-	var addedTotal int
+	}, 0, 5)
 	for _, name := range []string{"claude", "cursor", "codex", "copilot", "gemini"} {
 		tl, ok := note.ByTool[name]
 		if !ok || (tl.Lines == 0 && tl.DeletedLines == 0) {
@@ -446,29 +444,14 @@ func buildLeaderToolEntries(note *gitnotes.Note, aiDeleted int) []struct {
 		if tl.Model != nil && *tl.Model != "" {
 			label = *tl.Model
 		}
-		// Count added + deleted so a tool that only removed code still ranks.
-		rows = append(rows, row{label, tl.Lines + tl.DeletedLines})
-		addedTotal += tl.Lines + tl.DeletedLines
-	}
-	out := make([]struct {
-		name  string
-		lines int
-	}, 0, len(rows))
-	remaining := aiDeleted
-	for i, r := range rows {
-		share := 0
-		if aiDeleted > 0 {
-			if i == len(rows)-1 || addedTotal == 0 {
-				share = remaining
-			} else {
-				share = aiDeleted * r.lines / addedTotal
-				remaining -= share
-			}
-		}
+		// Count added + deleted so a tool that only removed code still ranks. by_tool
+		// already includes THIS tool's deletions, so we must NOT also distribute the
+		// commit's aiDeleted total on top — that double-counted (a 12-line deletion
+		// showed as 24 in the leaderboard).
 		out = append(out, struct {
 			name  string
 			lines int
-		}{r.name, r.lines + share})
+		}{label, tl.Lines + tl.DeletedLines})
 	}
 	return out
 }

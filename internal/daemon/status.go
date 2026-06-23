@@ -26,6 +26,27 @@ func healthClient() (*http.Client, string, string, error) {
 	return c, url, fmt.Sprintf("127.0.0.1:%d", port), nil
 }
 
+// AnotherDaemonHealthy does ONE quick /health probe of an already-running daemon.
+// Used at startup as a single-instance guard: the editor plugins spawn a daemon
+// whenever a /health ping fails, so redundant spawns can accumulate — each running
+// every watcher and writing the SAME SQLite DB (extra CPU + DB contention). The
+// daemon binds an ephemeral TCP port on Windows, so the OS won't reject the duplicate;
+// this catches the common case where a healthy daemon is already up. Returns false on
+// any error (no port/socket file, or the existing daemon doesn't answer).
+func AnotherDaemonHealthy() bool {
+	client, url, _, err := healthClient()
+	if err != nil {
+		return false
+	}
+	client.Timeout = 700 * time.Millisecond
+	resp, err := client.Get(url)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
 // WaitForReady blocks until the daemon answers /health with 200, or timeout
 // elapses. Tries the Unix socket first, falls back to TCP port. Returns the
 // listening address string ("~/.blamely/daemon.sock" or "127.0.0.1:PORT").

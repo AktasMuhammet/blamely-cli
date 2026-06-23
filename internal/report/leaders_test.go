@@ -27,6 +27,27 @@ func TestBuildLeaders_HumanDeletionOnly(t *testing.T) {
 	}
 }
 
+// Regression: an AI tool that ONLY deleted lines (recorded in by_tool, no per-model
+// rollup) must rank with its actual deleted count — not double it. by_tool already
+// includes the tool's DeletedLines, so the leaderboard must not also distribute the
+// commit's AIDeletedLines on top (which showed a 12-line deletion as 24 / 200%).
+func TestBuildLeaders_ToolDeletionOnly_NoDoubleCount(t *testing.T) {
+	note := &gitnotes.Note{
+		Totals: gitnotes.Totals{DeletedLines: 12, AIDeletedLines: 12},
+		ByTool: map[string]gitnotes.Tool{"claude": {Lines: 0, DeletedLines: 12}},
+	}
+	got, n := buildLeaders(note, 12, "alice")
+	if n != 1 || len(got) != 1 {
+		t.Fatalf("want 1 contributor, got %d", len(got))
+	}
+	if got[0].Lines != 12 {
+		t.Errorf("claude lines: want 12 (not double-counted), got %d", got[0].Lines)
+	}
+	if got[0].Pct != "100.0" {
+		t.Errorf("want 100.0%%, got %s", got[0].Pct)
+	}
+}
+
 func TestBuildLeaders_AIDeletionOnly(t *testing.T) {
 	// AI removed 20 lines, added none, no per-model data → a generic "AI" entry.
 	note := &gitnotes.Note{Totals: gitnotes.Totals{

@@ -186,20 +186,25 @@ func aiDeleteRange(ln int, e *store.Edit) RangeEntry {
 	return re
 }
 
-// addDeletedLinesToGenType folds DELETED lines into by_gen_type so the generation
-// breakdown (and the bars rendered from it) reflect deletions, not just additions.
-// recomputeAddedAggregates rebuilds by_gen_type from ADDED lines only (overwriting
-// the deleted-line contribution buildNote had folded in), so this re-adds it as the
-// final step. Each AI deletion contributes its gen_type (chat/cli/completion);
-// human deletions count as human. MUST be called exactly once, after both the
-// add-recompute and deletion attribution are final, or deletions double-count.
-func addDeletedLinesToGenType(note *Note) {
+// recomputeByGenType rebuilds by_gen_type FROM SCRATCH off the final per-line ranges —
+// every added AND deleted line, by its author/gen_type — so the generation breakdown
+// (and the bars rendered from it) covers all changed lines.
+//
+// It resets and recomputes rather than incrementally adding because several earlier
+// steps touch by_gen_type (buildNote's attribution, flipFileToAI's Human→AI moves,
+// recomputeAddedAggregates' adds-only rebuild). Those overlap inconsistently — for a
+// PURE-DELETION commit recomputeAddedAggregates never runs, so an incremental "add the
+// deletions" step double-counted them (a 12-line deletion showed as 24). Deriving the
+// whole breakdown from the settled ranges is idempotent and can't double-count. MUST
+// be the FINAL by_gen_type step, after both add-recompute and deletion attribution.
+func recomputeByGenType(note *Note) {
 	if note == nil {
 		return
 	}
+	var gt ByGenType
 	for _, fe := range note.Files {
 		for _, r := range fe.Lines {
-			if r.Type != "delete" {
+			if r.Type != "add" && r.Type != "delete" {
 				continue
 			}
 			n := r.End - r.Start + 1
@@ -209,19 +214,20 @@ func addDeletedLinesToGenType(note *Note) {
 			if r.AuthorType == "AI" {
 				switch ptrStr(r.GenType) {
 				case "chat":
-					note.ByGenType.Chat += n
+					gt.Chat += n
 				case "cli":
-					note.ByGenType.CLI += n
+					gt.CLI += n
 				case "completion":
-					note.ByGenType.Completion += n
+					gt.Completion += n
 				default:
-					note.ByGenType.Unknown += n
+					gt.Unknown += n
 				}
 			} else {
-				note.ByGenType.Human += n
+				gt.Human += n
 			}
 		}
 	}
+	note.ByGenType = gt
 }
 
 // recomputeDeletedAggregates rebuilds the deleted-line totals + per-tool deleted

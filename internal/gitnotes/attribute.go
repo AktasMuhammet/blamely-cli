@@ -654,7 +654,7 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	reconcileDeletesFromEdits(db, repoID, commitNanos, note, change)
 	// Fold deletions into the generation breakdown (the add-recompute above reset it
 	// to additions only), so the Generation bars cover all changed lines.
-	addDeletedLinesToGenType(note)
+	recomputeByGenType(note)
 	// Token usage: the Human skeleton attaches no edit per line, so buildNote's
 	// token aggregation never runs for AI tools (leaving tokens nil). Now that the
 	// flip has settled which tools contributed, sum their recorded usage from the
@@ -1081,7 +1081,7 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 			// this file's deletions, even when it recorded no removed lines (its
 			// record-time "before" snapshot was stale). See synthesizeWriteRemovals.
 			synthesizeWriteRemovals(repoPath, sha, curFileEntry.Path, delEdits, delLines, remSHA, remNorm)
-			curFileEntry.acc = append(curFileEntry.acc, attributeDeletedLines(delLines, delEdits, sinceNanos, maxNanos, remSHA, remNorm, &note.Totals, &note.ByGenType, movedAI)...)
+			curFileEntry.acc = append(curFileEntry.acc, attributeDeletedLines(delLines, delEdits, sinceNanos, maxNanos, remSHA, remNorm, &note.Totals, movedAI)...)
 		}
 		curFileEntry.Deleted = len(delLines)
 		note.Totals.DeletedLines += curFileEntry.Deleted
@@ -1197,7 +1197,7 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 		// reach this path instead of flushFile — apply the same Write-removal
 		// synthesis so those deletions attribute to the AI, not Human.
 		synthesizeWriteRemovals(repoPath, sha, path, delEdits, delLines, remSHA, remNorm)
-		acc := attributeDeletedLines(delLines, delEdits, sinceNanos, maxNanos, remSHA, remNorm, &note.Totals, &note.ByGenType, movedAI)
+		acc := attributeDeletedLines(delLines, delEdits, sinceNanos, maxNanos, remSHA, remNorm, &note.Totals, movedAI)
 		fe.Lines = collapseToRanges(acc)
 		note.Files = append(note.Files, fe)
 		note.Totals.DeletedLines += fe.Deleted
@@ -1545,16 +1545,20 @@ func attributeDeletedLine(d DeletedLine, sessionEdits []store.Edit, sinceNanos, 
 // attributeDeletedLine), runs inheritBlankDeletedLineAttribution so blank
 // deleted lines pick up an adjacent AI-attributed deletion's attribution, and
 // finally bumps by_gen_type for each line's (possibly reassigned) gen_type.
-func attributeDeletedLines(delLines []DeletedLine, sessionEdits []store.Edit, sinceNanos, maxNanos int64, remainingSHA, remainingNorm map[int64]map[string]int, totals *Totals, byGenType *ByGenType, movedAI map[string]*moveAttr) []LineEntry {
+// attributeDeletedLines attributes each deleted line to its tool/gen_type and folds
+// the per-line deletion totals. It deliberately does NOT touch by_gen_type: deletions
+// are folded into the generation breakdown exactly once, by recomputeByGenType as
+// the final step. Counting them here too double-counts pure-deletion commits, because
+// recomputeAddedAggregates (which would have reset by_gen_type) only runs when the
+// commit has added lines — a delete-only commit leaves this fold in place, then the
+// final fold adds it again (observed as 24 deleted lines for a 12-line deletion).
+func attributeDeletedLines(delLines []DeletedLine, sessionEdits []store.Edit, sinceNanos, maxNanos int64, remainingSHA, remainingNorm map[int64]map[string]int, totals *Totals, movedAI map[string]*moveAttr) []LineEntry {
 	entries := make([]LineEntry, len(delLines))
 	gts := make([]store.GenType, len(delLines))
 	for i, d := range delLines {
 		entries[i], gts[i] = attributeDeletedLine(d, sessionEdits, sinceNanos, maxNanos, remainingSHA, remainingNorm, totals, movedAI)
 	}
 	inheritBlankDeletedLineAttribution(delLines, entries, gts, totals)
-	for _, gt := range gts {
-		bumpGenType(byGenType, gt)
-	}
 	return entries
 }
 

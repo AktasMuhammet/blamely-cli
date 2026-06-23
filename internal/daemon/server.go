@@ -111,6 +111,16 @@ func Run(ctx context.Context) error {
 	// including on Windows, where the hidden-VBScript launcher discards stderr.
 	closeLog := setupLogging(ctx)
 	defer closeLog()
+
+	// Single instance: if a daemon is already answering /health, don't start a
+	// second one. Plugins (re)spawn a daemon on a failed health ping; without this
+	// guard those redundant spawns pile up — each running all watchers and writing
+	// the same SQLite DB, multiplying CPU and DB contention. (Best-effort: a busy or
+	// just-crashed daemon may not answer, in which case we proceed.)
+	if AnotherDaemonHealthy() {
+		log.Printf("another blamelyd is already healthy — exiting (single instance)")
+		return nil
+	}
 	log.Printf("blamelyd starting (pid=%d, os=%s)", os.Getpid(), runtime.GOOS)
 
 	db, err := store.Open()

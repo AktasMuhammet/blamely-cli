@@ -261,7 +261,7 @@ func TestAttributeDeletedLines_MoveCreditsAITool(t *testing.T) {
 	}
 	totals := &Totals{DeletedLines: 1}
 	sha, norm := emptyBudget()
-	got := attributeDeletedLines([]DeletedLine{{LineNum: 17, Content: content}}, noEdits, 0, 1<<62, sha, norm, totals, &ByGenType{}, movedAI)
+	got := attributeDeletedLines([]DeletedLine{{LineNum: 17, Content: content}}, noEdits, 0, 1<<62, sha, norm, totals, movedAI)
 	if len(got) != 1 || got[0].AuthorType != "AI" || got[0].Tool != string(store.ToolCursor) {
 		t.Fatalf("move deletion: got %+v, want AI/cursor", got)
 	}
@@ -272,7 +272,7 @@ func TestAttributeDeletedLines_MoveCreditsAITool(t *testing.T) {
 	// Consume-once: a second identical deletion with the budget spent stays Human.
 	totals2 := &Totals{DeletedLines: 1}
 	sha, norm = emptyBudget()
-	got2 := attributeDeletedLines([]DeletedLine{{LineNum: 30, Content: content}}, noEdits, 0, 1<<62, sha, norm, totals2, &ByGenType{}, movedAI)
+	got2 := attributeDeletedLines([]DeletedLine{{LineNum: 30, Content: content}}, noEdits, 0, 1<<62, sha, norm, totals2, movedAI)
 	if got2[0].AuthorType != "Human" {
 		t.Fatalf("budget exhausted: got %s, want Human", got2[0].AuthorType)
 	}
@@ -280,7 +280,7 @@ func TestAttributeDeletedLines_MoveCreditsAITool(t *testing.T) {
 	// No move, no recorded removal → Human (baseline unchanged).
 	totals3 := &Totals{DeletedLines: 1}
 	sha, norm = emptyBudget()
-	got3 := attributeDeletedLines([]DeletedLine{{LineNum: 5, Content: "<p>unrelated</p>"}}, noEdits, 0, 1<<62, sha, norm, totals3, &ByGenType{}, map[string]*moveAttr{})
+	got3 := attributeDeletedLines([]DeletedLine{{LineNum: 5, Content: "<p>unrelated</p>"}}, noEdits, 0, 1<<62, sha, norm, totals3, map[string]*moveAttr{})
 	if got3[0].AuthorType != "Human" {
 		t.Fatalf("unrelated deletion: got %s, want Human", got3[0].AuthorType)
 	}
@@ -289,7 +289,7 @@ func TestAttributeDeletedLines_MoveCreditsAITool(t *testing.T) {
 	totals4 := &Totals{DeletedLines: 1}
 	sha, norm = emptyBudget()
 	blankMap := map[string]*moveAttr{"   ": {tool: store.ToolCursor, remaining: 1}}
-	got4 := attributeDeletedLines([]DeletedLine{{LineNum: 9, Content: "   "}}, noEdits, 0, 1<<62, sha, norm, totals4, &ByGenType{}, blankMap)
+	got4 := attributeDeletedLines([]DeletedLine{{LineNum: 9, Content: "   "}}, noEdits, 0, 1<<62, sha, norm, totals4, blankMap)
 	if got4[0].AuthorType != "Human" {
 		t.Fatalf("blank move: got %s, want Human", got4[0].AuthorType)
 	}

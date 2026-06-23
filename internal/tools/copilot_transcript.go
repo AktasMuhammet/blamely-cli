@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -511,6 +512,41 @@ type copilotPatchFile struct {
 // This records the raw +/- lines as-is; unchanged lines an agent re-emits as
 // matching -X/+X pairs (whole-file rewrites) are netted out centrally in
 // netUnchangedEditLines at daemon ingestion, so every tool shares that rule.
+// deletedFileLines returns one removed-line hash per non-blank line of the file at
+// absPath — the content a `*** Delete File:` directive removes but doesn't spell out.
+// It reads the working copy if it's still there, falling back to the HEAD version once
+// the file has actually been removed from disk. Used so an AI file deletion is credited
+// to the assistant at commit instead of defaulting to Human.
+func deletedFileLines(absPath string) []daemon.RemovedLineHash {
+	abs := strings.TrimSpace(absPath)
+	if r, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = r
+	}
+	data, err := os.ReadFile(abs)
+	if err != nil || len(data) == 0 {
+		// Already removed on disk — read the version HEAD still has.
+		if wt, ok := gitutil.Toplevel(abs); ok {
+			if rel, rerr := filepath.Rel(wt, abs); rerr == nil && !strings.HasPrefix(rel, "..") {
+				if out, gerr := exec.Command("git", "-C", wt, "show", "HEAD:"+filepath.ToSlash(rel)).Output(); gerr == nil {
+					data = out
+				}
+			}
+		}
+	}
+	var removed []daemon.RemovedLineHash
+	for _, line := range strings.Split(string(data), "\n") {
+		text := strings.TrimRight(line, "\r")
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		removed = append(removed, daemon.RemovedLineHash{
+			ContentSHA:     sha256Hex([]byte(text)),
+			ContentSHANorm: sha256HexNorm(text),
+		})
+	}
+	return removed
+}
+
 func parseApplyPatchPerLine(body string) []copilotPatchFile {
 	var out []copilotPatchFile
 	var cur *copilotPatchFile
@@ -543,7 +579,16 @@ func parseApplyPatchPerLine(body string) []copilotPatchFile {
 		case strings.HasPrefix(line, "*** Add File: "):
 			setFile(strings.TrimPrefix(line, "*** Add File: "))
 		case strings.HasPrefix(line, "*** Delete File: "):
-			setFile(strings.TrimPrefix(line, "*** Delete File: "))
+			p := strings.TrimPrefix(line, "*** Delete File: ")
+			setFile(p)
+			// A delete-file directive carries NO -lines — the removed content isn't in
+			// the patch. Without recording it, the AI deletion has no edit and the
+			// commit credits the removal to Human. Record every line of the file (read
+			// from disk, or from HEAD if it's already gone) as removed, attributed to
+			// the AI like any other apply_patch removal.
+			if cur != nil {
+				cur.removed = append(cur.removed, deletedFileLines(p)...)
+			}
 		case strings.HasPrefix(line, "*** End Patch"):
 			flush()
 		case cur == nil:

@@ -63,8 +63,7 @@ func TestSynthesizeWriteRemovals_CreditsMatchingWrite(t *testing.T) {
 
 	// End-to-end: the deletion now attributes to cursor.
 	var totals Totals
-	var bg ByGenType
-	entries := attributeDeletedLines(delLines, delEdits, 0, 1<<62, remSHA, remNorm, &totals, &bg, map[string]*moveAttr{})
+	entries := attributeDeletedLines(delLines, delEdits, 0, 1<<62, remSHA, remNorm, &totals, map[string]*moveAttr{})
 	if len(entries) != 1 || entries[0].AuthorType != "AI" || entries[0].Tool != string(store.ToolCursor) {
 		t.Fatalf("deletion not attributed to cursor: %+v", entries)
 	}

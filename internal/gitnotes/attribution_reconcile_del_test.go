@@ -102,18 +102,19 @@ func TestReconcileDeletesFromEdits(t *testing.T) {
 	}
 }
 
-// TestAddDeletedLinesToGenType verifies deleted lines fold into the generation
-// breakdown (AI deletions by their gen_type, human deletions as human).
-func TestAddDeletedLinesToGenType(t *testing.T) {
+// TestRecomputeByGenType verifies by_gen_type is rebuilt from ALL ranges — added and
+// deleted, AI by gen_type and human as human — and is idempotent (any prior value is
+// discarded), so it can't double-count deletions on a pure-deletion commit.
+func TestRecomputeByGenType(t *testing.T) {
 	gt := "chat"
 	note := &Note{Schema: 2, Files: []FileEntry{{Path: "f", Lines: []RangeEntry{
-		{Start: 1, End: 1, Type: "add", AuthorType: "AI", GenType: &gt},     // already in by_gen_type
-		{Start: 4, End: 6, Type: "delete", AuthorType: "AI", GenType: &gt},  // 3 AI chat deletions
-		{Start: 9, End: 10, Type: "delete", AuthorType: "Human"},            // 2 human deletions
+		{Start: 1, End: 1, Type: "add", AuthorType: "AI", GenType: &gt},    // 1 AI chat add
+		{Start: 4, End: 6, Type: "delete", AuthorType: "AI", GenType: &gt}, // 3 AI chat deletions
+		{Start: 9, End: 10, Type: "delete", AuthorType: "Human"},           // 2 human deletions
 	}}}}
-	note.ByGenType = ByGenType{Chat: 1} // adds-only starting point (the add line)
+	note.ByGenType = ByGenType{Chat: 99, Human: 99} // garbage prior value — must be discarded
 
-	addDeletedLinesToGenType(note)
+	recomputeByGenType(note)
 
 	if note.ByGenType.Chat != 4 { // 1 add + 3 deletes
 		t.Errorf("chat: want 4, got %d", note.ByGenType.Chat)
