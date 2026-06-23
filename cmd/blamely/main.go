@@ -39,7 +39,7 @@ func init() {
 // JetBrains plugins. The release workflow can still override it at link time via
 // `-ldflags "-X main.version=<tag>"`; otherwise this hardcoded value is what
 // `blamely --version` reports.
-var version = "1.6.4"
+var version = "1.6.5"
 
 // resolveVersion returns the effective CLI version. Precedence:
 //  1. an explicit -ldflags override (release builds);
@@ -272,6 +272,11 @@ func cmdInstall() *cobra.Command {
 		Use:   "install",
 		Short: "Install Blamely (Claude hook, global git hook, daemon agent)",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// `sudo blamely install` would set up the per-user daemon under root;
+			// drop back to the invoking user so it installs in their session.
+			if err := install.DropToInvokingUserIfRoot(); err != nil {
+				return err
+			}
 			if err := install.Run(!skipPlugins); err != nil {
 				return err
 			}
