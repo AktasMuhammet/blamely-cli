@@ -235,6 +235,56 @@ func TestReconcileAddsFromEdits_CopyPasteTag(t *testing.T) {
 	}
 }
 
+// TestReconcileAddsFromEdits_CopyPasteOfAIContentStaysHuman verifies a line the human
+// copied from AI-generated code and PASTED stays Human/copypaste — even though its
+// content also matches an AI content_sha. Copy-paste must win over the AI matcher;
+// otherwise the AI re-claims the paste. Repro of commit 9a73263c (a codex <input> line
+// copied+pasted showed codex). The codex ORIGINAL of that line stays AI.
+func TestReconcileAddsFromEdits_CopyPasteOfAIContentStaysHuman(t *testing.T) {
+	db, err := store.OpenAt(filepath.Join(t.TempDir(), "test.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	defer db.Close()
+
+	const repo, file = "/repo", "lead-register.html"
+	dup := `      <input id="password" type="password">`
+	// Codex generated the line (its original, at line 50).
+	if _, err := db.InsertEdit(store.Edit{
+		TimestampNanos: 1000, RepoPath: repo, FilePath: file,
+		Tool: "codex", Confidence: "high", GenType: "chat", Model: sql.NullString{String: "gpt-5.5", Valid: true},
+		Lines: editLines(dup),
+	}); err != nil {
+		t.Fatalf("InsertEdit codex: %v", err)
+	}
+	// Human copied it and pasted a second copy (at line 116).
+	if _, err := db.InsertEdit(store.Edit{
+		TimestampNanos: 1500, RepoPath: repo, FilePath: file,
+		Tool: "copypaste", Confidence: "high", GenType: "human",
+		Lines: editLines(dup),
+	}); err != nil {
+		t.Fatalf("InsertEdit copypaste: %v", err)
+	}
+
+	fe := &FileEntry{Path: file}
+	addRange(fe, 50, 50, "AI", "codex", "chat") // codex original (fold already AI)
+	addRange(fe, 116, 116, "Human", "", "")     // the paste (fold marked Human)
+	note := &Note{Schema: 2, Files: []FileEntry{*fe}}
+	added := []AddedLine{
+		{File: file, LineNum: 50, Content: dup},
+		{File: file, LineNum: 116, Content: dup},
+	}
+
+	reconcileAddsFromEdits(db, repo, 2000, note, added)
+
+	if r := addRangeAuthor(t, note, file, 50); r.AuthorType != "AI" || r.Tool != "codex" {
+		t.Errorf("line 50 (codex original): want AI/codex, got %s/%s", r.AuthorType, r.Tool)
+	}
+	if r := addRangeAuthor(t, note, file, 116); r.AuthorType != "Human" || r.Tool != "copypaste" {
+		t.Errorf("line 116 (paste): want Human/copypaste, got %s/%s", r.AuthorType, r.Tool)
+	}
+}
+
 // TestReconcileAddsFromEdits_ConsumeOnce verifies an AI edit that recorded a line
 // ONCE can only attribute one committed copy of that line; a second identical
 // added line stays Human (we never over-credit beyond what the AI recorded).

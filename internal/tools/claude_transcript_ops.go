@@ -195,7 +195,8 @@ var winDeleteRe = regexp.MustCompile(`(?i)(?:^|[\s&|;(])(?:del|erase|remove-item
 func shellDeleteTargets(cmd string) []string {
 	out := bashRmTargets(cmd)
 	for _, m := range winDeleteRe.FindAllStringSubmatch(cmd, -1) {
-		for _, tok := range strings.Fields(m[1]) {
+		// Windows: backslash is a PATH SEPARATOR, not an escape (`C:\proj\x.html`).
+		for _, tok := range splitShellFields(m[1], false) {
 			tok = cleanTarget(tok)
 			if tok == "" || strings.HasPrefix(tok, "-") || strings.HasPrefix(tok, "/") {
 				continue
@@ -211,7 +212,7 @@ func shellDeleteTargets(cmd string) []string {
 func bashRmTargets(cmd string) []string {
 	var out []string
 	for _, m := range rmArgsRe.FindAllStringSubmatch(cmd, -1) {
-		for _, tok := range strings.Fields(m[1]) {
+		for _, tok := range splitShellFields(m[1], true) {
 			tok = cleanTarget(tok)
 			if tok == "" || strings.HasPrefix(tok, "-") {
 				continue
@@ -224,6 +225,65 @@ func bashRmTargets(cmd string) []string {
 
 func cleanTarget(s string) string {
 	return strings.Trim(strings.TrimSpace(s), `'"`)
+}
+
+// splitShellFields splits a command-argument string into shell-style fields,
+// keeping single/double-quoted spans (and backslash-escaped spaces) together so
+// a path containing spaces — e.g. `'login page.html'` — stays ONE token instead
+// of being shredded by whitespace into `login` and `page.html` (which match no
+// file at HEAD, so the deletion silently falls back to Human). Quotes and
+// escapes are removed from the returned tokens. This is a minimal tokenizer, not
+// a full shell parser: it covers the quoting forms tools emit for file paths.
+//
+// bashEscapes controls UNQUOTED backslash handling: true for POSIX shells (so
+// `login\ page.html` is one token), false for Windows del/Remove-Item where a
+// backslash is a path separator (`C:\proj\x.html` must stay literal).
+func splitShellFields(s string, bashEscapes bool) []string {
+	var out []string
+	var cur strings.Builder
+	inSingle, inDouble, hasTok := false, false, false
+	flush := func() {
+		if hasTok {
+			out = append(out, cur.String())
+			cur.Reset()
+			hasTok = false
+		}
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case inSingle:
+			if c == '\'' {
+				inSingle = false
+			} else {
+				cur.WriteByte(c)
+			}
+		case inDouble:
+			if c == '\\' && i+1 < len(s) && (s[i+1] == '"' || s[i+1] == '\\') {
+				i++
+				cur.WriteByte(s[i])
+			} else if c == '"' {
+				inDouble = false
+			} else {
+				cur.WriteByte(c)
+			}
+		case c == '\'':
+			inSingle, hasTok = true, true
+		case c == '"':
+			inDouble, hasTok = true, true
+		case bashEscapes && c == '\\' && i+1 < len(s):
+			i++
+			cur.WriteByte(s[i])
+			hasTok = true
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
+			flush()
+		default:
+			cur.WriteByte(c)
+			hasTok = true
+		}
+	}
+	flush()
+	return out
 }
 
 func parseTranscriptTime(s string) int64 {

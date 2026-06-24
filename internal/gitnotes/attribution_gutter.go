@@ -179,6 +179,11 @@ func ReconcileGutterOverridesAt(db *store.DB, repoRoot, repoID string, sinceNano
 	if m.empty() {
 		return nil
 	}
+	// A copy-paste matcher guards against re-claiming a human paste as AI: a line the
+	// human explicitly pasted stays Human even when its content matches an AI
+	// content_sha (copying AI output is common). Mirrors reconcileAddsFromEdits so the
+	// gutter and note agree (I4). Only built when there are AI edits to upgrade against.
+	cp := newEditMatcher(db, repoID, wl.File, sinceNanos, math.MaxInt64, copyPasteEligible)
 
 	// Lines the fold already attributed to AI keep that attribution (and don't
 	// spend match budget); every other changed line is a Human upgrade candidate.
@@ -200,6 +205,11 @@ func ReconcileGutterOverridesAt(db *store.DB, repoRoot, repoID string, sinceNano
 	overrides := map[int]authorship.Author{}
 	for _, ln := range changedSorted {
 		if alreadyAI[ln] {
+			continue
+		}
+		// Copy-paste first: an explicitly-pasted line keeps its Human (fold)
+		// attribution rather than being upgraded to the AI whose code was copied.
+		if e := cp.match(lineText(ln)); e != nil {
 			continue
 		}
 		if e := m.match(lineText(ln)); e != nil {

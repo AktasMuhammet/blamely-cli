@@ -156,12 +156,19 @@ func reconcileAddsFromEdits(db *store.DB, repoID string, commitNanos int64, note
 			for ln := r.Start; ln <= r.End; ln++ {
 				single := RangeEntry{Start: ln, End: ln, Type: "add", AuthorType: r.AuthorType, Tool: r.Tool, Model: r.Model, GenType: r.GenType}
 				if single.AuthorType != "AI" {
-					if e := m.match(lineContent[ln]); e != nil {
-						single = aiAddRange(ln, e)
-						changed = true
-					} else if e := cp.match(lineContent[ln]); e != nil {
+					// Copy-paste is tried FIRST: a line the human explicitly pasted
+					// stays Human (tagged), even though its content also matches an AI
+					// content_sha — copying AI-generated code and pasting it is the
+					// COMMON case, and the AI matcher would otherwise re-claim the paste
+					// as AI (repro: 9a73263c — a codex line copied+pasted showed codex).
+					// cp.match only fires when a real copypaste edit recorded this
+					// content (consume-once), so a genuinely-AI line is never withheld.
+					if e := cp.match(lineContent[ln]); e != nil {
 						// Copy-paste: keep author_type Human, tag the tool.
 						single.Tool = string(e.Tool)
+						changed = true
+					} else if e := m.match(lineContent[ln]); e != nil {
+						single = aiAddRange(ln, e)
 						changed = true
 					}
 				}

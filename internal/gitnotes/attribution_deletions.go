@@ -1,6 +1,8 @@
 package gitnotes
 
 import (
+	"strings"
+
 	"github.com/blamely/blamely/internal/authorship"
 	"github.com/blamely/blamely/internal/store"
 )
@@ -79,6 +81,10 @@ func flipDeletesAtBase(repoPath, branch, base string, note *Note, change *Commit
 				rewritten = append(rewritten, re)
 			}
 		}
+		// Blank deleted lines never carry a content hash, so the loop above leaves
+		// them Human even when an AI removed the surrounding block — let them
+		// inherit an adjacent AI deletion before collapsing.
+		inheritBlankDeleteRanges(rewritten, byLineContent)
 		fe.Lines = collapseAddRanges(rewritten) // collapse is type-aware; safe for deletes
 		changed = true
 	}
@@ -162,6 +168,20 @@ func reconcileDeletesFromEdits(db *store.DB, repoID string, commitNanos int64, n
 				rewritten = append(rewritten, re)
 			}
 		}
+		// Let blank deleted lines (never content-hashed, so left Human above)
+		// inherit an adjacent AI deletion, matching flipDeletesAtBase and the
+		// legacy inheritBlankDeletedLineAttribution.
+		inheritBlankDeleteRanges(rewritten, byLineContent)
+		if !changed {
+			// inheritBlankDeleteRanges may have flipped a blank line even when the
+			// content matcher found nothing — detect that so the file is rewritten.
+			for i := range rewritten {
+				if rewritten[i].Type == "delete" && rewritten[i].AuthorType == "AI" {
+					changed = true
+					break
+				}
+			}
+		}
 		if changed {
 			fe.Lines = collapseAddRanges(rewritten) // type-aware; safe for deletes
 			changedAny = true
@@ -169,6 +189,65 @@ func reconcileDeletesFromEdits(db *store.DB, repoID string, commitNanos int64, n
 	}
 	if changedAny {
 		recomputeDeletedAggregates(note)
+	}
+}
+
+// inheritBlankDeleteRanges gives each blank Human deleted line the AI attribution
+// of its nearest non-blank deleted neighbour (backward first, then forward),
+// matching buildNote's inheritBlankDeletedLineAttribution. The v2 deletion paths
+// (flipDeletesAtBase, reconcileDeletesFromEdits) attribute a deleted line only by
+// matching its CONTENT to a recorded deletion — but tools.RemovedLineHashes never
+// records a hash for blank/whitespace-only lines, so a blank line an AI removed as
+// part of a block (or a whole-file deletion) can never match and is left Human.
+// That fragments an otherwise-contiguous AI deletion (repro: a3ca5c50 — codex
+// deleted a 74-line file, blank lines 41 and 58 stayed Human, splitting the range
+// into 1-40 / 42-57 / 59-74). The deletion twin of inheritBlankAddRanges.
+//
+// The neighbour search walks CONTIGUOUS deleted line numbers only (ln±1, ln±2, …)
+// and stops at the first gap, so a blank line isolated by unchanged content never
+// inherits a distant AI block's attribution. A blank whose nearest non-blank
+// deleted neighbour is Human stays Human.
+func inheritBlankDeleteRanges(entries []RangeEntry, lineContent map[int]string) {
+	delAt := make(map[int]int, len(entries)) // line → index in entries
+	for i := range entries {
+		if entries[i].Type == "delete" {
+			delAt[entries[i].Start] = i
+		}
+	}
+	blank := func(ln int) bool { return strings.TrimSpace(lineContent[ln]) == "" }
+	nearestNonBlankDelete := func(ln int) (RangeEntry, bool) {
+		for k := ln - 1; ; k-- {
+			i, ok := delAt[k]
+			if !ok {
+				break // gap → try forward
+			}
+			if !blank(k) {
+				return entries[i], true
+			}
+		}
+		for k := ln + 1; ; k++ {
+			i, ok := delAt[k]
+			if !ok {
+				break
+			}
+			if !blank(k) {
+				return entries[i], true
+			}
+		}
+		return RangeEntry{}, false
+	}
+	for i := range entries {
+		if entries[i].Type != "delete" || !blank(entries[i].Start) || entries[i].AuthorType == "AI" {
+			continue
+		}
+		src, ok := nearestNonBlankDelete(entries[i].Start)
+		if !ok || src.AuthorType != "AI" {
+			continue
+		}
+		entries[i].AuthorType = "AI"
+		entries[i].Tool = src.Tool
+		entries[i].Model = src.Model
+		entries[i].GenType = src.GenType
 	}
 }
 

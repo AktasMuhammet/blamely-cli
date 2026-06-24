@@ -35,6 +35,20 @@ func TestBashRedirectAndRmTargets(t *testing.T) {
 	if !eq(d2, []string{"hello*.html", "welcome.html"}) {
 		t.Errorf("rm targets2 = %v", d2)
 	}
+	// A quoted path with a space must stay one token, not split into `login`
+	// and `page.html` (repro: codex `rm 'login page.html'` attributed to Human).
+	d3 := bashRmTargets("rm 'login page.html'")
+	if !eq(d3, []string{"login page.html"}) {
+		t.Errorf("rm quoted-space target = %v", d3)
+	}
+	d4 := bashRmTargets(`rm -f "my report.html" plain.html`)
+	if !eq(d4, []string{"my report.html", "plain.html"}) {
+		t.Errorf("rm mixed-quote targets = %v", d4)
+	}
+	d5 := bashRmTargets(`rm login\ page.html && git commit`)
+	if !eq(d5, []string{"login page.html"}) {
+		t.Errorf("rm escaped-space target = %v", d5)
+	}
 }
 
 func TestMatchesFileOp(t *testing.T) {

@@ -102,6 +102,65 @@ func TestReconcileDeletesFromEdits(t *testing.T) {
 	}
 }
 
+// TestReconcileDeletesFromEdits_BlankLines reproduces commit a3ca5c50: codex deleted
+// a whole 74-line file, recording removed-line hashes for the non-blank lines only
+// (tools.RemovedLineHashes never hashes blank lines). The content matcher credits
+// the non-blank deleted lines to codex but leaves the interior BLANK lines Human,
+// fragmenting one contiguous AI deletion into three ranges. inheritBlankDeleteRanges
+// lets each blank line inherit its adjacent AI deletion, restoring one AI range.
+func TestReconcileDeletesFromEdits_BlankLines(t *testing.T) {
+	db, err := store.OpenAt(filepath.Join(t.TempDir(), "test.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	defer db.Close()
+
+	const repo, file = "/repo", "simple-mail-send.html"
+	// Lines 1,2,4,5 are real content; line 3 is blank (never hashed).
+	gone := []string{"<html>", "<body>", "</body>", "</html>"}
+	if _, err := db.InsertEdit(store.Edit{
+		TimestampNanos: 1000, RepoPath: repo, FilePath: file,
+		Tool: "codex", Confidence: "high", GenType: "chat",
+		Model:        sql.NullString{String: "gpt-5.5", Valid: true},
+		RemovedLines: removedLines(gone...),
+	}); err != nil {
+		t.Fatalf("InsertEdit: %v", err)
+	}
+
+	fe := &FileEntry{Path: file}
+	delRange(fe, 1, 5)
+	note := &Note{Schema: 2, Files: []FileEntry{*fe}}
+	note.Totals.DeletedLines = 5
+	note.Totals.HumanDeletedLines = 5
+
+	change := &CommitChange{
+		Deleted: map[string][]DeletedLine{
+			file: {
+				{LineNum: 1, Content: gone[0]},
+				{LineNum: 2, Content: gone[1]},
+				{LineNum: 3, Content: ""}, // blank — no hash, can't content-match
+				{LineNum: 4, Content: gone[2]},
+				{LineNum: 5, Content: gone[3]},
+			},
+		},
+		Renames: map[string]string{},
+	}
+
+	reconcileDeletesFromEdits(db, repo, 2000, note, change)
+
+	for ln := 1; ln <= 5; ln++ {
+		r := delRangeAuthor(t, note, file, ln)
+		if r.AuthorType != "AI" || r.Tool != "codex" || ptrStr(r.GenType) != "chat" {
+			t.Errorf("deleted line %d: want AI/codex/chat, got author=%q tool=%q gen=%q",
+				ln, r.AuthorType, r.Tool, ptrStr(r.GenType))
+		}
+	}
+	if note.Totals.AIDeletedLines != 5 || note.Totals.HumanDeletedLines != 0 {
+		t.Errorf("totals: want AIdel=5 humandel=0, got AIdel=%d humandel=%d",
+			note.Totals.AIDeletedLines, note.Totals.HumanDeletedLines)
+	}
+}
+
 // TestRecomputeByGenType verifies by_gen_type is rebuilt from ALL ranges — added and
 // deleted, AI by gen_type and human as human — and is idempotent (any prior value is
 // discarded), so it can't double-count deletions on a pure-deletion commit.
