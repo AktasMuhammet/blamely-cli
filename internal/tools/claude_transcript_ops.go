@@ -47,16 +47,16 @@ func ClaudeCommitFileOps(repoRoot string, sinceNanos, untilNanos int64) (written
 // one of the transcript file targets, matching on exact path, basename, or a
 // shell glob (so `rm hello*.html` covers hello.html).
 func MatchesFileOp(rel string, targets []string) bool {
-	base := filepath.Base(rel)
+	base := baseAnySep(rel)
 	for _, t := range targets {
 		t = strings.TrimPrefix(t, "./")
-		if t == rel || t == base || filepath.Base(t) == base {
+		if t == rel || t == base || baseAnySep(t) == base {
 			return true
 		}
 		if ok, _ := filepath.Match(t, rel); ok {
 			return true
 		}
-		if ok, _ := filepath.Match(filepath.Base(t), base); ok {
+		if ok, _ := filepath.Match(baseAnySep(t), base); ok {
 			return true
 		}
 	}
@@ -271,7 +271,7 @@ func splitShellFields(s string, bashEscapes bool) []string {
 			inSingle, hasTok = true, true
 		case c == '"':
 			inDouble, hasTok = true, true
-		case bashEscapes && c == '\\' && i+1 < len(s):
+		case bashEscapes && c == '\\' && i+1 < len(s) && shellEscapable(s[i+1]):
 			i++
 			cur.WriteByte(s[i])
 			hasTok = true
@@ -284,6 +284,33 @@ func splitShellFields(s string, bashEscapes bool) []string {
 	}
 	flush()
 	return out
+}
+
+// shellEscapable reports whether a backslash preceding b is a POSIX shell escape
+// worth honouring (drop the backslash, keep b literal). We deliberately do NOT
+// treat a backslash before an ordinary character as an escape: on Windows an
+// `rm`/`del` target is an absolute path like `C:\proj\register.html`, and
+// consuming those separators would merge it into one token
+// (`C:projregister.html`) whose basename no longer matches the deleted file —
+// so the deletion silently falls back to Human. Only genuinely shell-meaningful
+// escapes (an escaped space in a path, an escaped quote or metacharacter) are
+// honoured; a backslash before a path character is kept literal.
+func shellEscapable(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\r', '\'', '"', '\\', '&', '|', ';', '$', '(', ')', '`', '*', '?':
+		return true
+	}
+	return false
+}
+
+// baseAnySep is filepath.Base that splits on BOTH separators regardless of host
+// OS, so a Windows-style target (`C:\proj\x.html`) yields `x.html` even when the
+// matching runs on a non-Windows host.
+func baseAnySep(p string) string {
+	if i := strings.LastIndexAny(p, `/\`); i >= 0 {
+		return p[i+1:]
+	}
+	return p
 }
 
 func parseTranscriptTime(s string) int64 {
