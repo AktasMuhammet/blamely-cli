@@ -462,9 +462,12 @@ func processCodexWrappedLine(env *codexWrappedLine, st *codexState) {
 }
 
 // codexShellNames are the function-call names Codex uses to run a shell
-// command. exec_command is the current one; the others cover older / variant
-// builds so a shell deletion is caught regardless of the wrapper.
+// command. shell_command is what current Codex builds emit (observed with the
+// VS Code surface, cli_version 0.142.0 — it names every PowerShell/bash exec
+// "shell_command"); exec_command and the rest cover other / older builds so a
+// shell deletion is caught regardless of the wrapper.
 var codexShellNames = map[string]bool{
+	"shell_command":    true,
 	"exec_command":     true,
 	"shell":            true,
 	"local_shell":      true,

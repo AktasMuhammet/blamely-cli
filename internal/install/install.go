@@ -367,6 +367,11 @@ func Uninstall(keepDB bool) error {
 		return err
 	}
 
+	// On Windows an open editor (holding the plugin / bundled sqlite3.exe) or a
+	// live daemon keeps files locked, so removal silently leaves them behind.
+	// Surface that up front and offer to close them. No-op off Windows.
+	promptCloseBlockers()
+
 	var firstErr error
 	report := func(label string, err error) {
 		if err == nil {

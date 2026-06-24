@@ -177,8 +177,10 @@ func toolsBody(note *gitnotes.Note) []string {
 			head += dim("  ·  " + *tl.Model)
 		}
 		// Acceptance: the model proposed SuggestedLines; the user kept AcceptedLines.
+		// Clamp at 100% — kept lines from edits that didn't measure a suggestion can
+		// push accepted past the measured suggested.
 		if tl.SuggestedLines > 0 {
-			pct := int64(tl.AcceptedLines) * 100 / tl.SuggestedLines
+			pct := min(int64(tl.AcceptedLines)*100/tl.SuggestedLines, 100)
 			head += dim(fmt.Sprintf("  ·  kept %d/%d (%d%%)", tl.AcceptedLines, tl.SuggestedLines, pct))
 		}
 		out = append(out, head)

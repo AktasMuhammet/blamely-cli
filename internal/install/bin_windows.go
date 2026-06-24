@@ -111,7 +111,15 @@ func removeInstalledBinary(p string, extraFiles []string, purgeRoot string) erro
 	// killProcess(pid) above already killed the recorded daemon, including a
 	// renamed/dev one this /im can't match. Safe here: it runs only after the ping
 	// wait, once this uninstaller process has exited.
-	killClean := fmt.Sprintf(`taskkill /f /t /im "%s" >nul 2>&1 & %srmdir /s /q "%s" >nul 2>&1`, exeName, dels, wipeDir)
+	// Delete the respawn tasks IN the cleanup script too, not just via
+	// UninstallDaemonAgent before this. The keepalive watchdog fires every 2
+	// minutes; if its schtasks deletion didn't take (or raced), it would spawn a
+	// fresh daemon mid-cleanup that re-locks blamely.exe / db.sqlite and defeats
+	// the rmdir. Re-deleting both tasks at the top of each pass guarantees no
+	// resurrection between the taskkill and the rmdir.
+	taskDel := fmt.Sprintf(`schtasks /delete /f /tn "%s" >nul 2>&1 & schtasks /delete /f /tn "%s" >nul 2>&1 & `,
+		scheduledTaskName, watchdogTaskName)
+	killClean := fmt.Sprintf(`%staskkill /f /t /im "%s" >nul 2>&1 & %srmdir /s /q "%s" >nul 2>&1`, taskDel, exeName, dels, wipeDir)
 	// First wait is short (~1s): the daemon is already dead (killed synchronously
 	// in killRunningDaemon), so the ONLY lock left on the bin is this uninstaller's
 	// own image, which releases the instant it exits — right after this returns.

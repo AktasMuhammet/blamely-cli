@@ -312,8 +312,11 @@ func topModelAndAccepted(note *gitnotes.Note) (string, *htmlAccepted) {
 	}
 	var acc *htmlAccepted
 	if best.SuggestedLines > 0 {
+		// Clamp at 100%: suggested_lines is the watcher's measured proposal, but a
+		// tool can also have committed lines from edits that didn't measure one, so
+		// accepted (all kept lines) can exceed it — show "100%", not ">100%".
 		acc = &htmlAccepted{
-			Pct:       int(int64(best.AcceptedLines) * 100 / best.SuggestedLines),
+			Pct:       min(int(int64(best.AcceptedLines)*100/best.SuggestedLines), 100),
 			Suggested: best.SuggestedLines,
 			Kept:      int64(best.AcceptedLines),
 		}
@@ -508,7 +511,7 @@ func buildTools(note *gitnotes.Note) []htmlTool {
 			ht.HasAccept = true
 			ht.Suggested = tl.SuggestedLines
 			ht.Kept = int64(tl.AcceptedLines)
-			ht.AcceptPct = int(int64(tl.AcceptedLines) * 100 / tl.SuggestedLines)
+			ht.AcceptPct = min(int(int64(tl.AcceptedLines)*100/tl.SuggestedLines), 100)
 		}
 		if tk := tl.Tokens; tk != nil && (tk.Input|tk.Output|tk.CacheRead|tk.CacheWrite) != 0 {
 			ht.HasTokens = true

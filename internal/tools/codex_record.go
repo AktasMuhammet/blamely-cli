@@ -55,10 +55,13 @@ func RecordCodexFromStdin(r io.Reader) error {
 	filePath, ranges, suggested, removed, newFullContent := extractCodexHookRanges(p)
 	if filePath == "" {
 		// No edit range and no structured delete directive — but Codex also
-		// deletes via a shell `rm`. Fingerprint whatever git now reports as
-		// deleted and credit it to codex. Skipped when the patch already named
-		// its deletions above (avoids recording the same removal twice).
-		if len(deletedViaPatch) == 0 && looksLikePatch(strings.ToLower(p.ToolName)) {
+		// deletes via a shell command (`rm` on Unix, `Remove-Item`/`del` on
+		// Windows, run through its shell_command/exec_command tool). Fingerprint
+		// whatever git now reports as deleted and credit it to codex. Skipped
+		// when the patch already named its deletions above (avoids recording the
+		// same removal twice).
+		name := strings.ToLower(p.ToolName)
+		if len(deletedViaPatch) == 0 && (looksLikePatch(name) || codexShellNames[name]) {
 			if root := findRepoRoot(p.Cwd, p.Cwd); root != "" {
 				return recordShellDeletions(root, shellCommandFromInput(p.ToolInput), "codex", gt, p.Model, p.SessionID, p.TranscriptPath, "codex_shell_delete")
 			}

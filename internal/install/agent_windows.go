@@ -16,6 +16,15 @@ import (
 
 const scheduledTaskName = "Blamely Daemon"
 
+// watchdogTaskName is a periodic Scheduled Task that re-launches the hidden
+// daemon every couple of minutes. Windows has no launchd KeepAlive / systemd
+// Restart=always equivalent, so the ONLOGON task (or Startup-folder entry)
+// only revives the daemon at logon — a single mid-session crash would leave it
+// dead until the next login. The daemon's single-instance guard
+// (AnotherDaemonHealthy) makes a redundant launch a fast no-op, so firing this
+// on a fixed interval simply resurrects the daemon whenever it isn't running.
+const watchdogTaskName = "Blamely Daemon Watchdog"
+
 const startupVBSName = "blamely-daemon.vbs"
 
 // createNoWindow (CREATE_NO_WINDOW) launches a console process with no console
@@ -101,11 +110,43 @@ func installScheduledTask(binaryPath string) (string, error) {
 	if out, err := exec.Command("schtasks", args...).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("schtasks /Create: %w: %s", err, strings.TrimSpace(string(out)))
 	}
+	// Register the periodic keepalive watchdog so a mid-session crash is revived
+	// without waiting for the next logon. Best-effort: the ONLOGON task already
+	// covers login, so a watchdog failure must not fail the whole install.
+	_ = installWatchdogTask(vbs)
+
 	// Kill any prior running instance so a reinstall picks up the new binary,
 	// then start the daemon now (hidden, via CREATE_NO_WINDOW). Both best-effort.
 	_ = exec.Command("schtasks", "/End", "/TN", scheduledTaskName).Run()
 	_ = startDaemonNow(binaryPath)
 	return scheduledTaskName, nil
+}
+
+// installWatchdogTask registers (idempotently) the periodic keepalive task that
+// relaunches the daemon via the hidden VBS launcher every 2 minutes. A per-user
+// time-triggered task does not require elevation (unlike ONLOGON), so this also
+// gives the non-admin Startup-folder install crash recovery, not just logon
+// recovery. Best-effort by contract: callers ignore the error.
+func installWatchdogTask(vbs string) error {
+	// Clear any stale task from a prior install under a different security
+	// context; a missing task also errors, so this is best-effort.
+	_ = exec.Command("schtasks", "/Delete", "/F", "/TN", watchdogTaskName).Run()
+
+	// /SC MINUTE /MO 2 = fire every 2 minutes, indefinitely. The launched daemon
+	// self-exits when another instance is already healthy, so this is a no-op
+	// while the daemon is up and a resurrection once it has died.
+	args := []string{
+		"/Create", "/F",
+		"/TN", watchdogTaskName,
+		"/TR", fmt.Sprintf("wscript.exe //B //Nologo \"%s\"", vbs),
+		"/SC", "MINUTE",
+		"/MO", "2",
+		"/RL", "LIMITED",
+	}
+	if out, err := exec.Command("schtasks", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("schtasks /Create watchdog: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func installStartupAgent(binaryPath string) (string, error) {
@@ -120,6 +161,10 @@ func installStartupAgent(binaryPath string) (string, error) {
 	if err := atomicWrite(vbsPath, []byte(daemonLauncherVBSContent(binaryPath)), 0o644); err != nil {
 		return "", err
 	}
+	// Crash recovery between logons: a per-user time-triggered task needs no
+	// elevation, so even this non-admin path gets keepalive. Best-effort — the
+	// Startup entry still covers the next logon if the watchdog can't register.
+	_ = installWatchdogTask(vbsPath)
 	if err := startDaemonNow(binaryPath); err != nil {
 		return vbsPath, fmt.Errorf("startup entry written but daemon failed to start: %w", err)
 	}
@@ -166,6 +211,9 @@ func UninstallDaemonAgent() error {
 	if vbs, err := launcherVBSPath(); err == nil {
 		_ = os.Remove(vbs)
 	}
+	// Remove the periodic keepalive watchdog. Best-effort: it won't exist on
+	// installs that predate it, and a missing task makes /Delete error.
+	_ = exec.Command("schtasks", "/Delete", "/F", "/TN", watchdogTaskName).Run()
 	err := exec.Command("schtasks", "/Delete", "/F", "/TN", scheduledTaskName).Run()
 	if err != nil {
 		var ee *exec.ExitError

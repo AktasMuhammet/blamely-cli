@@ -121,6 +121,28 @@ func Run(ctx context.Context) error {
 		log.Printf("another blamelyd is already healthy — exiting (single instance)")
 		return nil
 	}
+	// Authoritative single-instance guard: an exclusive OS lock held for our whole
+	// lifetime. The /health probe above is only a fast pre-check — it races when
+	// launchers (logon/launchd, editor-plugin spawns, the keepalive watchdog,
+	// install) start daemons concurrently and all see "no healthy daemon" before
+	// any binds, then each binds its own ephemeral port / re-creates the unix
+	// socket and they ALL keep running. The lock can be held by exactly one
+	// process, so the losers exit here instead of becoming the extra 8-thread
+	// duplicates seen in the process list. If the lock mechanism itself fails
+	// (unusual FS), fall back to the old best-effort behaviour rather than refusing
+	// to start.
+	if lockPath, lerr := config.LockFile(); lerr == nil {
+		lockFile, ok, err := acquireInstanceLock(lockPath)
+		switch {
+		case err != nil:
+			log.Printf("single-instance lock unavailable (%v) — continuing without it", err)
+		case !ok:
+			log.Printf("another blamelyd holds the instance lock — exiting (single instance)")
+			return nil
+		default:
+			defer lockFile.Close()
+		}
+	}
 	log.Printf("blamelyd starting (pid=%d, os=%s)", os.Getpid(), runtime.GOOS)
 
 	db, err := store.Open()

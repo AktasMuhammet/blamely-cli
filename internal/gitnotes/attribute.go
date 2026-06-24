@@ -662,6 +662,11 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	if cfg.Note.Tokens {
 		applyEditTokens(db, repoID, commitNanos, note)
 	}
+	// Same story for suggested_lines: the flip records WHICH tool authored each
+	// line but not the model's original proposal size, so the "kept X of Y"
+	// denominator would stay 0 for every tool. Restore it from the in-window
+	// edits now that the flip has settled which tools contributed.
+	applyEditSuggested(db, repoID, commitNanos, note)
 	gcWorkingLogsIfEnabled(repoPath)
 	migrateWorkingLogsOnCommit(repoPath, note)
 
@@ -796,6 +801,60 @@ func applyEditTokens(db *store.DB, repoID string, commitNanos int64, note *Note)
 	}
 	tot := total
 	note.Totals.Tokens = &tot
+}
+
+// applyEditSuggested backfills each AI tool's suggested_lines from its SQLite
+// edits after the working-log flip set by_tool. The flip records WHICH tool
+// authored each committed line but not the model's original proposal size, so
+// suggested_lines — the denominator of the "kept X of Y" acceptance metric —
+// would otherwise stay 0 for every tool (e.g. a Claude chat Edit records
+// SuggestedLines at hook time, but it was lost between the dead SQLite matcher
+// and the working-log flip). Mirrors applyEditTokens: only tools that authored
+// committed lines are credited, and each edit row counts its suggestion once
+// (deduped by edit ID) so an edit spanning several committed lines isn't summed
+// per line.
+func applyEditSuggested(db *store.DB, repoID string, commitNanos int64, note *Note) {
+	if db == nil || note == nil {
+		return
+	}
+	contributing := map[string]bool{}
+	for name := range note.ByTool {
+		if authorTypeFor(store.Tool(name)) == "AI" {
+			contributing[name] = true
+		}
+	}
+	if len(contributing) == 0 {
+		return
+	}
+	sinceNanos := db.PreviousCommitTimestampNanos(repoID, commitNanos)
+	const slack = int64(5 * 1e9)
+	maxNanos := commitNanos + slack
+
+	perTool := map[string]int64{}
+	seenEdit := map[int64]bool{}
+	for fi := range note.Files {
+		edits, err := db.EditsForFileSince(repoID, note.Files[fi].Path, sinceNanos)
+		if err != nil {
+			continue
+		}
+		for i := range edits {
+			e := &edits[i]
+			if e.TimestampNanos <= sinceNanos || e.TimestampNanos > maxNanos {
+				continue
+			}
+			tool := string(e.Tool)
+			if !contributing[tool] || e.SuggestedLines <= 0 || seenEdit[e.ID] {
+				continue
+			}
+			seenEdit[e.ID] = true
+			perTool[tool] += e.SuggestedLines
+		}
+	}
+	for tool, n := range perTool {
+		bt := note.ByTool[tool]
+		bt.SuggestedLines = n
+		note.ByTool[tool] = bt
+	}
 }
 
 // inheritBlankLineAttribution reassigns blank (empty/whitespace-only) lines to
