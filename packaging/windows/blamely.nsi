@@ -44,6 +44,23 @@ SetCompressor /SOLID lzma
 
 Name "Blamely CLI"
 OutFile "${OUTFILE}"
+
+; Version-info resource. Anonymous installers (no publisher/version metadata)
+; score much higher on Defender's ML heuristics (Trojan:Script/Wacatac.C!ml
+; false positives) — embedding proper metadata is the cheapest mitigation short
+; of Authenticode signing, which remains the real fix.
+; VIProductVersion needs a numeric X.X.X.X — the caller derives it from VERSION.
+!ifndef VERSION_NUM
+  !define VERSION_NUM "0.0.0.0"
+!endif
+VIProductVersion "${VERSION_NUM}"
+VIAddVersionKey "ProductName" "Blamely CLI"
+VIAddVersionKey "CompanyName" "Blamely"
+VIAddVersionKey "FileDescription" "Blamely CLI installer"
+VIAddVersionKey "FileVersion" "${VERSION}"
+VIAddVersionKey "ProductVersion" "${VERSION}"
+VIAddVersionKey "LegalCopyright" "Blamely"
+VIAddVersionKey "Comments" "https://blamely.ai"
 ; Per-user install: no admin prompt, matching Blamely's per-user daemon/hook model.
 RequestExecutionLevel user
 InstallDir "$LOCALAPPDATA\Programs\Blamely"

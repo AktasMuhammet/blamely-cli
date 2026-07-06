@@ -152,6 +152,47 @@ func newEditMatcher(db *store.DB, repoID, file string, sinceNanos, maxNanos int6
 	return m
 }
 
+// newEditMatcherAll is newEditMatcher WITHOUT the time window: it loads every
+// recorded edit for repo/file via EditsForFileAny, preserving the same
+// confidence-then-recency order, eligibility filters, and consume-once budgets.
+// A cherry-picked or squashed commit gets a new SHA and committer timestamp,
+// but the line content is unchanged — matching across all edits is what
+// preserves AI authorship the windowed query misses. Callers MUST gate this to
+// replay-shaped commits (detectReplayOp) — on an ordinary commit the unbounded
+// window would let a human's retype of old AI content re-attribute to AI.
+func newEditMatcherAll(db *store.DB, repoID, file string, eligible func(*store.Edit) bool) *editMatcher {
+	m := &editMatcher{remSHA: map[int64]map[string]int{}, remNorm: map[int64]map[string]int{}}
+	if db == nil {
+		return m
+	}
+	edits, err := db.EditsForFileAny(repoID, file)
+	if err != nil {
+		return m
+	}
+	for i := range edits {
+		e := &edits[i]
+		if !eligible(e) {
+			continue
+		}
+		sha, norm := map[string]int{}, map[string]int{}
+		for _, l := range e.Lines {
+			if l.ContentSHA != "" {
+				sha[l.ContentSHA]++
+			}
+			if l.ContentSHANorm != "" {
+				norm[l.ContentSHANorm]++
+			}
+		}
+		if len(sha) == 0 && len(norm) == 0 {
+			continue
+		}
+		m.edits = append(m.edits, *e)
+		m.remSHA[e.ID] = sha
+		m.remNorm[e.ID] = norm
+	}
+	return m
+}
+
 func (m *editMatcher) empty() bool { return len(m.edits) == 0 }
 
 // match returns the AI edit that recorded content and still has budget, consuming

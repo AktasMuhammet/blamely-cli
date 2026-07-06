@@ -490,6 +490,17 @@ func flipFileToAI(note *Note, f *FileEntry, kind, tool string, gen *string) {
 // lookups we use the canonical repo identity from `git rev-parse
 // --git-common-dir`, so worktrees of the same repo share attribution.
 func AttributeAndWrite(repoPath, sha string) (*Note, error) {
+	return attributeAndWriteEx(repoPath, sha, nil)
+}
+
+// attributeAndWriteEx is AttributeAndWrite with an optional replay override.
+// The post-rewrite hook passes an explicit {rebaseSquash, oldSHAs} context —
+// the rebase markers are gone by then, so detection can't see the fold — which
+// routes the squashed commit through the same source-note + wide reconciles a
+// detected cherry-pick/squash-merge gets. When the override is set the
+// in-progress skip is bypassed too (the rewrite has already finished; the
+// caller explicitly wants a rebuild).
+func attributeAndWriteEx(repoPath, sha string, replayOverride *replayCtx) (*Note, error) {
 	if wt, ok := gitutil.Toplevel(repoPath); ok {
 		repoPath = wt
 	}
@@ -498,7 +509,7 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	// and skip recomputing while one is in progress so the inherited (correct) note
 	// isn't clobbered by a v1 fallback. No-ops when attribution is off.
 	ensureNotesFollowRewrites(repoPath)
-	if attributionShouldSkip(repoPath) {
+	if replayOverride == nil && attributionShouldSkip(repoPath) {
 		return nil, nil
 	}
 
@@ -696,12 +707,34 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	// added lines that duplicate existing content (chat edits carry placeholder
 	// positions), so it drops them to Human. Scoped to this commit's added lines,
 	// the recorded content_shas reattribute them deterministically. Human→AI only.
-	reconcileAddsFromEdits(db, repoID, commitNanos, note, change.Added)
+	// The window is per-file: it opens at the last commit that touched the file
+	// (not the repo-wide previous commit), so AI edits that predate an unrelated
+	// commit — the stash-pop→commit shape — remain eligible while content the
+	// file already committed stays excluded.
+	reconcileParent := commitParentSHA(repoPath, sha)
+	reconcileAddsFromEditsWindowed(db, repoID, commitNanos, note, change.Added, func(relPath string) int64 {
+		return lastFileTouchNanos(repoPath, reconcileParent, relPath)
+	})
 	// Amend recovery: restore AI added-line attribution from the note git inherited onto
 	// this SHA when the working-log flip and edit reconcile couldn't (the original commit
 	// deleted the working log and the edits are out of window). Human→AI only, no-op
 	// without an inherited note.
 	reconcileAddsFromInheritedNote(inheritedNote, note)
+	// Replay recovery (cherry-pick / squash): this commit re-commits content that
+	// was AUTHORED earlier, possibly on another branch — the working log and the
+	// windowed reconcile can't see it. Carry the SOURCE commits' settled notes
+	// over by content first (no guessing), then fall back to the unbounded edit
+	// match, hard-gated to detected replays. Human→AI only, consume-once.
+	replay := replayCtx{}
+	if replayOverride != nil {
+		replay = *replayOverride
+	} else {
+		replay = detectReplayOp(repoPath, sha)
+	}
+	if replay.Kind != replayNone {
+		reconcileAddsFromSourceNotes(sourceNoteContentIndex(repoPath, replay.SourceSHAs), note, change.Added)
+		reconcileAddsFromEditsWide(db, repoID, note, change.Added, replay)
+	}
 	flipDeletionsToWorkingLog(repoPath, note, change)
 	// Lossless cross-check for deletions: the deletions log misses chat/cli tools
 	// that removed lines (recorded only in SQLite edit_removed_lines), so reattribute

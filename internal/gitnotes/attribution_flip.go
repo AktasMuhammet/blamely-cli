@@ -106,6 +106,29 @@ func flipAddsAtBase(repoPath, branch, base string, note *Note) {
 // line. The committed diff + the recorded edits are both exact artifacts, so this
 // is a deterministic set operation, not a heuristic.
 func reconcileAddsFromEdits(db *store.DB, repoID string, commitNanos int64, note *Note, added []AddedLine) {
+	reconcileAddsFromEditsWindowed(db, repoID, commitNanos, note, added, nil)
+}
+
+// fileHasHumanAddLines reports whether any added range in the file is still
+// attributed to a human — i.e. whether the per-file window widening (a git
+// spawn) can possibly change anything for this file.
+func fileHasHumanAddLines(fe *FileEntry) bool {
+	for i := range fe.Lines {
+		if fe.Lines[i].Type == "add" && fe.Lines[i].AuthorType != "AI" {
+			return true
+		}
+	}
+	return false
+}
+
+// reconcileAddsFromEditsWindowed is reconcileAddsFromEdits with an optional
+// PER-FILE lower-bound resolver. When fileTouchNanos is non-nil, each file's
+// window opens at min(repo-wide previous-commit bound, last commit that touched
+// THIS file) — so edits that predate the repo's last commit (stash pop, long
+// work sessions interleaved with commits to other files) stay eligible, while
+// content the file already committed remains excluded. nil keeps the legacy
+// repo-wide bound exactly.
+func reconcileAddsFromEditsWindowed(db *store.DB, repoID string, commitNanos int64, note *Note, added []AddedLine, fileTouchNanos func(relPath string) int64) {
 	if db == nil || note == nil || !authorship.Enabled() || len(added) == 0 {
 		return
 	}
@@ -117,6 +140,48 @@ func reconcileAddsFromEdits(db *store.DB, repoID string, commitNanos int64, note
 	const sameSecondSlackNanos = int64(5 * 1e9)
 	maxNanos := commitNanos + sameSecondSlackNanos
 
+	reconcileAddsWithMatchers(note, added, func(fe *FileEntry) (m, cp, ct *editMatcher) {
+		// Per-file window: widen the lower bound to the last commit that touched
+		// this file (never raise it). Only resolved when the file still has
+		// Human-attributed added lines — the git spawn is skipped otherwise. ALL
+		// THREE matchers share the same bound so copypaste/cursor-tab pins keep
+		// their precedence over generic AI matches across the widened window.
+		fileSince := sinceNanos
+		if fileTouchNanos != nil && fileHasHumanAddLines(fe) {
+			if ft := fileTouchNanos(fe.Path); ft < fileSince {
+				fileSince = ft
+			}
+		}
+		return newEditMatcher(db, repoID, fe.Path, fileSince, maxNanos, aiEligible),
+			newEditMatcher(db, repoID, fe.Path, fileSince, maxNanos, copyPasteEligible),
+			newEditMatcher(db, repoID, fe.Path, fileSince, maxNanos, cursorTabEligible)
+	})
+}
+
+// reconcileAddsFromEditsWide is the LAST-RESORT reconcile for replay-shaped
+// commits (cherry-pick / squash): the same Human→AI, consume-once content match,
+// but over EVERY recorded edit for the file (EditsForFileAny) instead of a time
+// window — a replayed line's original edit can be arbitrarily old and from
+// another branch. HARD-GATED to detected replays: on an ordinary commit the
+// unbounded window would let a human's retype of old AI content re-attribute.
+// Runs after the source-note reconcile, so it only claims lines the settled
+// notes couldn't explain (never-noted source commits, rewritten squash message).
+func reconcileAddsFromEditsWide(db *store.DB, repoID string, note *Note, added []AddedLine, replay replayCtx) {
+	if db == nil || note == nil || !authorship.Enabled() || len(added) == 0 || replay.Kind == replayNone {
+		return
+	}
+	reconcileAddsWithMatchers(note, added, func(fe *FileEntry) (m, cp, ct *editMatcher) {
+		return newEditMatcherAll(db, repoID, fe.Path, aiEligible),
+			newEditMatcherAll(db, repoID, fe.Path, copyPasteEligible),
+			newEditMatcherAll(db, repoID, fe.Path, cursorTabEligible)
+	})
+}
+
+// reconcileAddsWithMatchers is the shared expand→upgrade→re-collapse loop over
+// the note's added ranges. matchersFor supplies the (AI, copypaste, cursorTab)
+// matchers per file — windowed or unbounded — so precedence and blank-line
+// inheritance behave identically for every reconcile variant.
+func reconcileAddsWithMatchers(note *Note, added []AddedLine, matchersFor func(fe *FileEntry) (m, cp, ct *editMatcher)) {
 	// Committed content of each added line, keyed by file then line number.
 	contentByLine := map[string]map[int]string{}
 	for _, a := range added {
@@ -133,18 +198,16 @@ func reconcileAddsFromEdits(db *store.DB, repoID string, commitNanos int64, note
 		if len(lineContent) == 0 {
 			continue
 		}
-		// AI edits for this file in-window, each with a consume-once budget of the
-		// exact and whitespace-normalized content_shas it recorded as ADDED lines.
+		// AI edits for this file, each with a consume-once budget of the exact
+		// and whitespace-normalized content_shas it recorded as ADDED lines.
 		// A second matcher tags copy-pasted lines: author_type stays Human, but the
 		// distinct copypaste tool is preserved (matching v1's by_tool nuance).
-		m := newEditMatcher(db, repoID, fe.Path, sinceNanos, maxNanos, aiEligible)
-		cp := newEditMatcher(db, repoID, fe.Path, sinceNanos, maxNanos, copyPasteEligible)
 		// Cursor Tab-log edits get their OWN matcher, tried before copy-paste: an
 		// accepted Cursor Tab (inline) suggestion is recorded both by the editor
 		// plugin (often mis-tagged copypaste — its content matches the clipboard
 		// during repetitive edits) AND by Cursor's own Tab log. The Tab log is
 		// authoritative that the line was a live completion, not a paste, so it wins.
-		ct := newEditMatcher(db, repoID, fe.Path, sinceNanos, maxNanos, cursorTabEligible)
+		m, cp, ct := matchersFor(fe)
 		if m.empty() && cp.empty() && ct.empty() {
 			continue
 		}

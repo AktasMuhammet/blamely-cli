@@ -1,6 +1,7 @@
 package gitutil
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -88,6 +89,27 @@ func MergeBase(p, ref string) string {
 // editor observes during these are replays of existing content, not fresh
 // authorship, so detectors pause recording while one is in progress.
 func InProgressOp(p string) bool {
+	return anyMarker(p,
+		"CHERRY_PICK_HEAD", "MERGE_HEAD", "REVERT_HEAD",
+		"rebase-merge", "rebase-apply",
+	)
+}
+
+// InProgressRewrite is InProgressOp WITHOUT the cherry-pick marker. Used by the
+// attribution skip: rebase/amend commits inherit their note via notes.rewriteRef
+// so recomputing mid-rewrite must be skipped — but git does NOT copy notes for
+// cherry-pick, and CHERRY_PICK_HEAD is still present when the post-commit hook
+// fires for a clean pick, so skipping there would leave the picked commit with
+// no note at all. Cherry-picked commits attribute normally (the replay detection
+// carries the source note's AI attribution over).
+func InProgressRewrite(p string) bool {
+	return anyMarker(p,
+		"MERGE_HEAD", "REVERT_HEAD",
+		"rebase-merge", "rebase-apply",
+	)
+}
+
+func anyMarker(p string, markers ...string) bool {
 	dir := repoDir(p)
 	gitDir, err := exec.Command("git", "-C", dir, "rev-parse", "--path-format=absolute", "--git-dir").Output()
 	if err != nil {
@@ -97,15 +119,39 @@ func InProgressOp(p string) bool {
 	if g == "" {
 		return false
 	}
-	for _, marker := range []string{
-		"CHERRY_PICK_HEAD", "MERGE_HEAD", "REVERT_HEAD",
-		"rebase-merge", "rebase-apply",
-	} {
+	for _, marker := range markers {
 		if _, err := pathStat(filepath.Join(g, marker)); err == nil {
 			return true
 		}
 	}
 	return false
+}
+
+// CherryPickHead returns the SOURCE commit sha of an in-flight cherry-pick —
+// the content of .git/CHERRY_PICK_HEAD — and whether the marker exists. The
+// marker is still present when the post-commit hook fires for a clean
+// cherry-pick (pinned by TestReplayMarkerTiming_CherryPickHeadPresentAtPostCommit),
+// which is what lets commit-time attribution identify the source commit and
+// carry its AI attribution over.
+func CherryPickHead(p string) (sha string, ok bool) {
+	dir := repoDir(p)
+	gitDir, err := exec.Command("git", "-C", dir, "rev-parse", "--path-format=absolute", "--git-dir").Output()
+	if err != nil {
+		return "", false
+	}
+	g := strings.TrimSpace(string(gitDir))
+	if g == "" {
+		return "", false
+	}
+	data, err := os.ReadFile(filepath.Join(g, "CHERRY_PICK_HEAD"))
+	if err != nil {
+		return "", false
+	}
+	s := strings.TrimSpace(string(data))
+	if len(s) < 40 {
+		return "", false
+	}
+	return s, true
 }
 
 // repoDir resolves `p` to a directory git can run in (the dir itself, or the

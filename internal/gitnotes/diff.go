@@ -519,3 +519,31 @@ func CommitTimestampNanos(repoPath, sha string) (int64, error) {
 	}
 	return secs * 1e9, nil
 }
+
+// lastFileTouchNanos returns the committer timestamp (nanoseconds) of the last
+// commit reachable from ref that touched relPath, or 0 when no such commit
+// exists (new file / empty ref / error). It is the PER-FILE lower bound for the
+// added-line content reconcile: any content already committed necessarily
+// touched the file, so a human retyping committed AI code stays out of the
+// window — while AI edits recorded any time since the file last changed in
+// history stay eligible. That widened (but still bounded) window is what lets a
+// stash-pop→commit — whose edits predate the repo-wide previous-commit bound —
+// keep its AI attribution.
+func lastFileTouchNanos(repoPath, ref, relPath string) int64 {
+	if ref == "" || relPath == "" {
+		return 0
+	}
+	out, err := exec.Command("git", "-C", repoPath, "log", "-1", "--format=%ct", ref, "--", relPath).Output()
+	if err != nil {
+		return 0
+	}
+	s := strings.TrimSpace(string(out))
+	if s == "" {
+		return 0
+	}
+	var secs int64
+	if _, err := fmt.Sscanf(s, "%d", &secs); err != nil {
+		return 0
+	}
+	return secs * 1e9
+}

@@ -112,6 +112,7 @@ func main() {
 	root.AddCommand(cmdDetect())
 	root.AddCommand(cmdRecord())
 	root.AddCommand(cmdAttribute())
+	root.AddCommand(cmdPostRewrite())
 	root.AddCommand(cmdAuthorship())
 	root.AddCommand(cmdRecordDeletion())
 	root.AddCommand(cmdReport())
@@ -624,6 +625,24 @@ func cmdAttribute() *cobra.Command {
 	}
 	c.Flags().BoolVarP(&quiet, "quiet", "q", false, "suppress the AI/Human bar after writing the note")
 	return c
+}
+
+func cmdPostRewrite() *cobra.Command {
+	return &cobra.Command{
+		Use: "post-rewrite <repo> <kind>",
+		// Hidden: called by the global post-rewrite hook (see
+		// internal/install/hookspath.go) with git's old→new sha mapping on
+		// stdin. Rebuilds a single valid note for each interactive-rebase
+		// squash/fixup target (N→1 fold) from the folded commits' notes.
+		Hidden: true,
+		Short:  "Internal: merge attribution notes across a history rewrite (rebase squash/fixup)",
+		Args:   cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			pairs := gitnotes.ParseRewritePairs(cmd.InOrStdin())
+			gitnotes.HandlePostRewrite(args[0], args[1], pairs)
+			return nil // best-effort by contract: never fail the user's rebase
+		},
+	}
 }
 
 func cmdReport() *cobra.Command {
