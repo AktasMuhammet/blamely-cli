@@ -225,6 +225,17 @@ jobs:
           [ -f "$bin" ] || { echo "binary missing: $bin"; ls -R work; exit 1; }
           echo "path=$bin" >> "$GITHUB_OUTPUT"
 
+      # signtool.exe ships with the Windows SDK but is not on the runner's PATH —
+      # locate the newest SDK's x64 copy and expose its directory to later steps.
+      - name: Add signtool to PATH
+        if: env.PFX != ''
+        shell: pwsh
+        run: |
+          $st = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.*\x64\signtool.exe" |
+            Sort-Object { [version]$_.Directory.Parent.Name } | Select-Object -Last 1
+          if (-not $st) { throw 'signtool.exe not found in any Windows SDK under Windows Kits\10' }
+          Add-Content $env:GITHUB_PATH $st.DirectoryName
+
       # Sign the binary BEFORE it's packaged, so the .exe inside the installer is
       # also signed (Defender scans the extracted exe, not just the installer).
       - name: Sign blamely.exe (Authenticode)
