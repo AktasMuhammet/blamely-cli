@@ -7,11 +7,22 @@ import (
 	"testing"
 )
 
+// pinCursorHome makes CursorCommitFileOps read `home` as the user home for the rest
+// of the test — hermetic, independent of the process-global HOME env that sibling
+// tests in this package mutate via t.Setenv. Restored on cleanup.
+func pinCursorHome(t *testing.T, home string) {
+	t.Helper()
+	prev := cursorHomeDir
+	cursorHomeDir = func() (string, error) { return home, nil }
+	t.Cleanup(func() { cursorHomeDir = prev })
+}
+
 // writeCursorTranscript lays out a Cursor agent transcript for repoRoot under a
 // fake HOME and returns the repoRoot. Lines are the real Cursor shape:
 // {"role":"assistant","message":{"content":[{"type":"tool_use",...}]}}.
 func writeCursorTranscript(t *testing.T, home, repoRoot string, lines ...string) {
 	t.Helper()
+	pinCursorHome(t, home)
 	proj := strings.ReplaceAll(strings.TrimPrefix(filepath.ToSlash(repoRoot), "/"), "/", "-")
 	dir := filepath.Join(home, ".cursor", "projects", proj, "agent-transcripts", "sess-uuid")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -90,6 +101,7 @@ func TestCursorCommitFileOps_WindowsDriveColonSubstitution(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("HOME", home)
+	pinCursorHome(t, home)
 
 	// git-style repo root: lowercase drive, forward slashes -> encodes to "c:-dev-proj".
 	_, deleted := CursorCommitFileOps("C:/dev/proj", 0)

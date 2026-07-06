@@ -25,8 +25,15 @@ import (
 // This is safe because the caller only flips files ACTUALLY added/deleted in the
 // commit whose exact path the transcript named; an unrelated stale op in the same
 // session file can't claim a file the commit didn't touch.
+// cursorHomeDir resolves the user's home directory. It's a package var rather than
+// a direct os.UserHomeDir call so tests can pin it to a temp dir and stay hermetic —
+// independent of the process-global HOME env, which sibling tests in this package
+// mutate via t.Setenv (a momentarily-empty HOME there made os.UserHomeDir error and
+// this function return nothing, flaking the transcript tests under CI load).
+var cursorHomeDir = os.UserHomeDir
+
 func CursorCommitFileOps(repoRoot string, sinceNanos int64) (written, deleted []string) {
-	home, err := os.UserHomeDir()
+	home, err := cursorHomeDir()
 	if err != nil {
 		return nil, nil
 	}
