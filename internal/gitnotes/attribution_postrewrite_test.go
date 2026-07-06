@@ -19,10 +19,13 @@ func rebaseInteractive(t *testing.T, repo, action string) {
 	if err := os.WriteFile(seq, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// Git runs the editor through sh, which eats backslashes in Windows paths —
+	// use forward slashes and an explicit `sh` so the script runs on all platforms.
+	seqEditor := "sh '" + filepath.ToSlash(seq) + "'"
 	cmd := exec.Command("git", "-C", repo, "-c", "core.hooksPath=", "rebase", "-i", "HEAD~2")
 	cmd.Env = append(os.Environ(),
 		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
-		"GIT_SEQUENCE_EDITOR="+seq, "GIT_EDITOR=true")
+		"GIT_SEQUENCE_EDITOR="+seqEditor, "GIT_EDITOR=true")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git rebase -i (%s): %v\n%s", action, err, out)
 	}

@@ -194,6 +194,9 @@ func replayE2E(t *testing.T) (repo string, git func(args ...string) string) {
 		return strings.TrimSpace(string(out))
 	}
 	git("init", "-q")
+	// Git for Windows defaults to core.autocrlf=true, which rewrites LF→CRLF on
+	// checkout/cherry-pick/merge and breaks exact line comparisons in lineOf.
+	git("config", "core.autocrlf", "false")
 	git("config", "user.email", "t@t")
 	git("config", "user.name", "t")
 	git("checkout", "-q", "-b", "main")
