@@ -261,7 +261,9 @@ jobs:
           Invoke-WebRequest -Uri $env:SQLITE_WIN_URL -OutFile sqlite-tools.zip
           Expand-Archive -Force sqlite-tools.zip sqlite-tools
           $sqlite = (Get-ChildItem -Recurse sqlite-tools -Filter sqlite3.exe | Select-Object -First 1).FullName
-          $src = Split-Path "${{ steps.bin.outputs.path }}"
+          # Absolute path: ISCC resolves relative {#SourceDir} against the .iss
+          # script's directory (packaging\windows\), not the runner's workdir.
+          $src = (Resolve-Path (Split-Path "${{ steps.bin.outputs.path }}")).Path
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
             "/DAppVersion=${{ steps.tag.outputs.ver }}" "/DArch=${{ matrix.arch }}" `
             "/DSourceDir=$src" "/DSqlite=$sqlite" `
