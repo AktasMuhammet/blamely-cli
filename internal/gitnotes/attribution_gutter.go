@@ -41,6 +41,33 @@ func editFromWholeFileWrite(e *store.Edit) bool {
 	return false
 }
 
+// editFromCursorTabLog reports whether an edit was recorded by the Cursor Tab
+// completion-log watcher (tools.tailCursorTabLog stamps raw_meta.source =
+// "cursor_tab_log"). Such an edit is AUTHORITATIVE that its lines were an
+// accepted Cursor Tab (inline) suggestion — Cursor's own log, not a heuristic.
+// The editor plugin, seeing the same insert first, often mis-records it as a
+// clipboard paste (its content coincidentally matches the clipboard during
+// repetitive edits), so the add reconcile lets a Tab-log edit override that
+// copypaste record for the same content.
+func editFromCursorTabLog(e *store.Edit) bool {
+	if e == nil || e.Tool != store.ToolCursor || !e.RawMeta.Valid || e.RawMeta.String == "" {
+		return false
+	}
+	var meta struct {
+		Source string `json:"source"`
+	}
+	if json.Unmarshal([]byte(e.RawMeta.String), &meta) != nil {
+		return false
+	}
+	return meta.Source == "cursor_tab_log"
+}
+
+// cursorTabEligible selects Cursor Tab-log edits for the add reconcile's
+// highest-precedence matcher (it runs before the copy-paste matcher).
+func cursorTabEligible(e *store.Edit) bool {
+	return editFromCursorTabLog(e)
+}
+
 // editMatcher resolves a committed/current line's content to the AI edit that
 // authored it, by content_sha. It is the SINGLE matcher shared by the commit-note
 // reconciliation (reconcileAddsFromEdits) and the live-gutter reconciliation
@@ -56,8 +83,26 @@ type editMatcher struct {
 
 // aiEligible selects AI edits whose per-line content is reliable authorship
 // evidence: an AI tool, and NOT a snapshot-narrowed whole-file Write.
+//
+// Cursor is the exception. Its agent (composer) applies every edit through a
+// "Write" tool call, so an agent apply is ALWAYS recorded as a whole-file write.
+// Unlike Claude/Copilot, Cursor's editor plugin can't distinguish an agent apply
+// from a human paste on a multi-AI host — no chat-apply command fires — so it
+// mis-records those ADDED lines as Human in the working log and never corrects
+// them. That leaves the PostToolUse-hook content_shas (already narrowed to the
+// genuinely-new lines by ResolveWholeFileWrite) as the only reliable evidence,
+// so we trust them here for Cursor. The add reconcile stays safe: it is Human→AI
+// only, requires an exact content_sha match, runs the copy-paste matcher first
+// (so a genuine human paste still wins), and is consume-once + commit-scoped.
+// Claude/Copilot keep the whole-file-Write exclusion (stale-snapshot guard).
 func aiEligible(e *store.Edit) bool {
-	return authorTypeFor(e.Tool) == "AI" && !editFromWholeFileWrite(e)
+	if authorTypeFor(e.Tool) != "AI" {
+		return false
+	}
+	if e.Tool == store.ToolCursor {
+		return true
+	}
+	return !editFromWholeFileWrite(e)
 }
 
 // copyPasteEligible selects copy-paste edits. These roll up to author_type Human

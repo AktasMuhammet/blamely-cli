@@ -139,7 +139,13 @@ func reconcileAddsFromEdits(db *store.DB, repoID string, commitNanos int64, note
 		// distinct copypaste tool is preserved (matching v1's by_tool nuance).
 		m := newEditMatcher(db, repoID, fe.Path, sinceNanos, maxNanos, aiEligible)
 		cp := newEditMatcher(db, repoID, fe.Path, sinceNanos, maxNanos, copyPasteEligible)
-		if m.empty() && cp.empty() {
+		// Cursor Tab-log edits get their OWN matcher, tried before copy-paste: an
+		// accepted Cursor Tab (inline) suggestion is recorded both by the editor
+		// plugin (often mis-tagged copypaste — its content matches the clipboard
+		// during repetitive edits) AND by Cursor's own Tab log. The Tab log is
+		// authoritative that the line was a live completion, not a paste, so it wins.
+		ct := newEditMatcher(db, repoID, fe.Path, sinceNanos, maxNanos, cursorTabEligible)
+		if m.empty() && cp.empty() && ct.empty() {
 			continue
 		}
 
@@ -156,14 +162,26 @@ func reconcileAddsFromEdits(db *store.DB, repoID string, commitNanos int64, note
 			for ln := r.Start; ln <= r.End; ln++ {
 				single := RangeEntry{Start: ln, End: ln, Type: "add", AuthorType: r.AuthorType, Tool: r.Tool, Model: r.Model, GenType: r.GenType}
 				if single.AuthorType != "AI" {
-					// Copy-paste is tried FIRST: a line the human explicitly pasted
+					// Precedence: Cursor Tab log → copy-paste → generic AI.
+					//
+					// A Cursor Tab-log edit is tried FIRST: Cursor's own log proves
+					// the line was an accepted inline (Tab) completion, which overrides
+					// the plugin's heuristic copypaste record for the same content
+					// (the plugin sees the insert first and mis-reads it as a paste
+					// when the clipboard happens to match during repetitive edits —
+					// repro: 7e1f1912, Tab-completed <option>/label lines shown Human).
+					//
+					// Copy-paste is tried next: a line the human explicitly pasted
 					// stays Human (tagged), even though its content also matches an AI
 					// content_sha — copying AI-generated code and pasting it is the
 					// COMMON case, and the AI matcher would otherwise re-claim the paste
 					// as AI (repro: 9a73263c — a codex line copied+pasted showed codex).
 					// cp.match only fires when a real copypaste edit recorded this
 					// content (consume-once), so a genuinely-AI line is never withheld.
-					if e := cp.match(lineContent[ln]); e != nil {
+					if e := ct.match(lineContent[ln]); e != nil {
+						single = aiAddRange(ln, e)
+						changed = true
+					} else if e := cp.match(lineContent[ln]); e != nil {
 						// Copy-paste: keep author_type Human, tag the tool.
 						single.Tool = string(e.Tool)
 						changed = true

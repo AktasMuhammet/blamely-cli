@@ -328,6 +328,57 @@ func backfillFromClaudeTranscript(db *store.DB, note *Note, repoRoot, repoID str
 	note.Totals.AddedLines = note.Totals.AILines + note.Totals.HumanLines
 }
 
+// backfillFromCursorTranscript credits whole-file creates/deletes a Cursor agent
+// made and committed in a single Shell command (e.g. `git rm f && git commit`).
+// Those land here as Human because the commit — and this note — preceded (or ran
+// entirely without) the PostToolUse Shell hook that would have recorded the edit,
+// and afterwards the tree is clean. Cursor's agent transcript still records the
+// Shell `rm`/`git rm`, `Delete`, or `Write` tool call. This is the Cursor analogue
+// of backfillFromClaudeTranscript; we only touch ADDED files the AI wrote and
+// DELETED files the AI removed, so per-line MODIFIED attribution is never overridden.
+func backfillFromCursorTranscript(db *store.DB, note *Note, repoRoot, repoID string, commitNanos int64) {
+	if note == nil || len(note.Files) == 0 {
+		return
+	}
+	// Cursor transcript lines have no per-line timestamp, so CursorCommitFileOps
+	// windows by transcript-file mtime: any session touched since the previous
+	// commit is a candidate. The path-exact match against THIS commit's files below
+	// keeps that safe.
+	since := db.PreviousCommitTimestampNanos(repoID, commitNanos)
+	written, deleted := tools.CursorCommitFileOps(repoRoot, since)
+	if len(written) == 0 && len(deleted) == 0 {
+		return
+	}
+	chat := string(store.GenTypeChat)
+	if note.ByTool == nil {
+		note.ByTool = map[string]Tool{}
+	}
+	for i := range note.Files {
+		f := &note.Files[i]
+		switch f.Type {
+		case "ADDED":
+			if tools.MatchesFileOp(f.Path, written) {
+				flipFileToAI(note, f, "add", "cursor", &chat)
+			}
+		case "DELETED":
+			if tools.MatchesFileOp(f.Path, deleted) {
+				flipFileToAI(note, f, "delete", "cursor", &chat)
+			}
+		case "MODIFIED":
+			// A whole-file overwrite (`cat > f` / Write) the agent committed in one
+			// command: it replaced the whole file, so every added AND removed line is
+			// the AI's. A partial edit is NOT in `written`, so mixed files still rely
+			// on per-line matching.
+			if tools.MatchesFileOp(f.Path, written) {
+				flipFileToAI(note, f, "add", "cursor", &chat)
+				flipFileToAI(note, f, "delete", "cursor", &chat)
+			}
+		}
+	}
+	note.Totals.AddedLines = note.Totals.AILines + note.Totals.HumanLines
+	note.Totals.HumanDeletedLines = note.Totals.DeletedLines - note.Totals.AIDeletedLines
+}
+
 // backfillFromChatSessions credits whole-file deletions a Copilot or Cursor AGENT
 // performed via an apply_patch `*** Delete File:` tool call. Such a deletion
 // produces no edit (no textEditGroup to record), and the editor plugin only
@@ -490,6 +541,10 @@ func AttributeAndWrite(repoPath, sha string) (*Note, error) {
 	// Human because the commit — and this note — preceded the PostToolUse hook
 	// that would have recorded the edit; the AI's transcript still proves it.
 	backfillFromClaudeTranscript(db, note, repoPath, repoID, commitNanos)
+	// Same idea for a Cursor agent: a `git rm f && git commit` run through its Shell
+	// tool commits with no surviving edit row, so the deletion would attribute to
+	// Human. Cursor's agent transcript records the Shell/Delete/Write op; credit it.
+	backfillFromCursorTranscript(db, note, repoPath, repoID, commitNanos)
 	// Same idea for Copilot/Cursor agents: a `*** Delete File:` tool call in the
 	// chat session removes a file with no edit record, so the deletion would
 	// otherwise attribute to Human. Credit it to the owning AI tool.

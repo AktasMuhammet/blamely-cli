@@ -24,7 +24,7 @@ func writeConfig(t *testing.T, body string) {
 func TestLoadConfig_DefaultsWhenMissing(t *testing.T) {
 	fakeHome(t)
 	cfg := LoadConfig()
-	if cfg != DefaultConfig() {
+	if cfg.Note != DefaultConfig().Note {
 		t.Fatalf("missing config should yield defaults; got %+v", cfg)
 	}
 	n := cfg.Note
@@ -64,7 +64,7 @@ func TestLoadConfig_PerRoleConversation(t *testing.T) {
 
 func TestLoadConfig_MalformedFallsBackToDefaults(t *testing.T) {
 	writeConfig(t, `{not valid json`)
-	if cfg := LoadConfig(); cfg != DefaultConfig() {
+	if cfg := LoadConfig(); cfg.Note != DefaultConfig().Note {
 		t.Fatalf("malformed config must fall back to defaults; got %+v", cfg)
 	}
 }

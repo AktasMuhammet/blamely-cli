@@ -1,0 +1,55 @@
+#!/bin/bash
+#
+# macOS .pkg postinstall — finish Blamely's PER-USER setup and show the report.
+#
+# The Installer runs this as root, but Blamely's daemon (a launchd LaunchAgent)
+# and its git/AI-tool hooks live under the user's home (~/.blamely). So we resolve
+# the human logged in at the GUI (the "console user") and run `blamely install` AS
+# THAT USER (via `sudo -u`, non-root euid → install stays per-user).
+#
+# blamely writes its own step-by-step report (detected IDEs, installed plugins,
+# git hooks, background agent) to ~/.blamely/last-install.log — NO shell
+# redirection needed. The macOS graphical Installer can't show a postinstall's
+# output inline, so we surface that report in the user's GUI session with a native
+# summary dialog whose "Show Details" opens the full report. `launchctl asuser` is
+# the reliable way to reach the Aqua session from a root pkg script.
+#
+# Best-effort: a failure here must never fail the package install (exit 0).
+
+BLAMELY="/usr/local/bin/blamely"
+log() { echo "blamely: $*"; }
+
+CONSOLE_USER="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null)"
+case "$CONSOLE_USER" in
+  ""|root|loginwindow|_mbsetupuser)
+    log "no logged-in user (console user='${CONSOLE_USER:-none}'); skipping per-user setup."
+    log "each user should run once:  blamely install"
+    exit 0
+    ;;
+esac
+if [ ! -x "$BLAMELY" ]; then
+  log "error: $BLAMELY missing; cannot complete setup."
+  exit 0
+fi
+
+UID_NUM="$(/usr/bin/id -u "$CONSOLE_USER" 2>/dev/null)"
+USER_HOME="$(/usr/bin/dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')"
+[ -n "$USER_HOME" ] || USER_HOME="/Users/$CONSOLE_USER"
+REPORT="$USER_HOME/.blamely/last-install.log"
+
+log "configuring Blamely for user: $CONSOLE_USER"
+# Run install as the user. NO_COLOR keeps /var/log/install.log clean; blamely also
+# writes the same report to ~/.blamely/last-install.log.
+/usr/bin/sudo -u "$CONSOLE_USER" -H /usr/bin/env NO_COLOR=1 "$BLAMELY" install
+
+# Show the report in the user's GUI session (best-effort — never blocks/fails).
+if [ -n "$UID_NUM" ] && [ -f "$REPORT" ]; then
+  /bin/launchctl asuser "$UID_NUM" /usr/bin/sudo -u "$CONSOLE_USER" /usr/bin/osascript \
+    -e "set rpt to \"$REPORT\"" \
+    -e 'try' \
+    -e '  set b to button returned of (display dialog "Blamely was installed and configured." & return & return & "Click Show Details to see the detected IDEs, installed plugins, git hooks, and background agent." buttons {"Show Details", "Done"} default button "Done" with title "Blamely" with icon note giving up after 120)' \
+    -e '  if b is "Show Details" then do shell script "open -t " & quoted form of rpt' \
+    -e 'end try' >/dev/null 2>&1 || true
+fi
+
+exit 0

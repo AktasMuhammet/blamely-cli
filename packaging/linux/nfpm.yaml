@@ -1,0 +1,38 @@
+# nfpm config TEMPLATE for the Blamely CLI Linux packages (.deb + .rpm).
+# https://nfpm.goreleaser.com
+#
+# One config builds both formats. build-linux.sh renders the ${...} tokens (with
+# sed, so it doesn't depend on any particular nfpm version's env-var support) into
+# a temp config and runs nfpm against it:
+#   ${BIN}          absolute path to the built blamely binary to package
+#   ${ARCH}         amd64 | arm64  (nfpm maps to deb/rpm arch names automatically)
+#   ${VERSION}      package version, e.g. 1.7.0 (no leading v)
+#   ${SCRIPTS_DIR}  absolute path to this dir's scripts/ (so paths resolve anywhere)
+#
+# The binary installs to /usr/local/bin (on the default PATH). The postinstall
+# scriptlet then runs `blamely install` as the desktop user — Blamely is per-user
+# (daemon + git/AI hooks under ~/.blamely), so a root-run package must target that
+# user, not root. On removal, preremove runs `blamely uninstall` (skipped on upgrade).
+name: blamely
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: devel
+priority: optional
+maintainer: Blamely <hello@blamely.ai>
+description: |
+  Blamely — AI code attribution for git.
+  Tracks which AI tool (Claude, Cursor, Copilot, Codex, Gemini) wrote which lines,
+  via a per-user daemon and git/editor hooks.
+homepage: https://blamely.ai
+license: Proprietary
+
+contents:
+  - src: ${BIN}
+    dst: /usr/local/bin/blamely
+    file_info:
+      mode: 0755
+
+scripts:
+  postinstall: ${SCRIPTS_DIR}/postinstall.sh
+  preremove: ${SCRIPTS_DIR}/preremove.sh

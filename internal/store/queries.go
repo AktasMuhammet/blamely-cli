@@ -345,10 +345,14 @@ func (db *DB) LatestChatGenTypeNear(tool Tool, tsNanos, windowNanos int64) strin
 // insert-time enrichment can't catch it. CONFIRMED inline accepts
 // (confidence=high) are left alone: those genuinely are Tab completions.
 func (db *DB) UpgradeRecentCompletionsToChat(tool Tool, tsNanos, windowNanos int64) error {
+	// Exclude Cursor Tab-log completions: those come from Cursor's own inline
+	// completion log and are authoritative Tab accepts, not chat applies, so a
+	// nearby chat marker must not relabel them (repro: 7e1f1912).
 	_, err := db.Exec(`
 		UPDATE edits SET gen_type='chat'
 		WHERE tool=? AND gen_type='completion' AND confidence != 'high'
-		  AND file_path != '' AND ts >= ? AND ts <= ?`,
+		  AND file_path != '' AND ts >= ? AND ts <= ?
+		  AND COALESCE(raw_meta,'') NOT LIKE '%cursor_tab_log%'`,
 		string(tool), tsNanos-windowNanos, tsNanos+windowNanos)
 	if err != nil {
 		return fmt.Errorf("upgrade completions to chat: %w", err)

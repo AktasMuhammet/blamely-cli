@@ -168,10 +168,11 @@ func (d *doctor) db() {
 // hookCheck describes one AI tool's hook file location and the marker string
 // that proves blamely's command is wired up inside it.
 type hookCheck struct {
-	tool    string         // human label
-	path    func() (string, error)
-	marker  string         // substring proving the hook command is present
-	requires bool          // true if the tool was detected — i.e. we should have installed it
+	tool     string // human label
+	path     func() (string, error)
+	paths    func() []string // union of config locations (default + custom); wins over path when set
+	marker   string          // substring proving the hook command is present
+	requires bool            // true if the tool was detected — i.e. we should have installed it
 }
 
 func (d *doctor) hooks() {
@@ -182,38 +183,60 @@ func (d *doctor) hooks() {
 		// <tool>`, and on Windows <path> ends in `blamely.exe`, so a "blamely
 		// record <tool>" needle would never match. `record <tool>` is the
 		// extension-agnostic tail that's always present.
-		{"Claude (~/.claude/settings.json)", config.ClaudeSettingsPath, "record claude", det.Claude.Present},
-		{"Cursor (~/.cursor/hooks.json)", config.CursorHooksPath, "record cursor", det.Cursor.Present},
-		{"Codex (~/.codex/config.toml)", config.CodexConfigPath, "record codex", det.Codex.Present},
-		{"Copilot (~/.copilot/hooks/blamely.json)", config.CopilotBlamelyHookPath, "record copilot", det.Copilot.Present},
-		{"Gemini (~/.gemini/settings.json)", config.GeminiSettingsPath, "record gemini", det.Gemini.Present},
+		{tool: "Claude (~/.claude/settings.json + custom)", paths: config.ClaudeSettingsPaths, marker: "record claude", requires: det.Claude.Present},
+		{tool: "Cursor (~/.cursor/hooks.json)", path: config.CursorHooksPath, marker: "record cursor", requires: det.Cursor.Present},
+		{tool: "Codex (~/.codex/config.toml + custom)", paths: config.CodexConfigPaths, marker: "record codex", requires: det.Codex.Present},
+		{tool: "Copilot (~/.copilot/hooks/blamely.json)", path: config.CopilotBlamelyHookPath, marker: "record copilot", requires: det.Copilot.Present},
+		{tool: "Gemini (~/.gemini/settings.json)", path: config.GeminiSettingsPath, marker: "record gemini", requires: det.Gemini.Present},
 	}
 	for _, c := range checks {
-		p, err := c.path()
-		if err != nil {
-			d.bad(c.tool, err.Error(), "")
+		// Resolve the location(s) to check. `paths` (union of default + custom) wins
+		// over the single `path` for tools that support a custom home (Claude/Codex).
+		var locs []string
+		if c.paths != nil {
+			locs = c.paths()
+		} else {
+			p, err := c.path()
+			if err != nil {
+				d.bad(c.tool, err.Error(), "")
+				continue
+			}
+			locs = []string{p}
+		}
+
+		// OK if the marker is present in ANY location; report the first match.
+		matched := ""
+		anyFile := false
+		for _, p := range locs {
+			data, err := os.ReadFile(p)
+			if err != nil {
+				continue
+			}
+			anyFile = true
+			if strings.Contains(string(data), c.marker) {
+				matched = p
+				break
+			}
+		}
+		if matched != "" {
+			d.ok(c.tool, matched)
 			continue
 		}
-		data, err := os.ReadFile(p)
-		if err != nil {
+		if !anyFile {
 			if !c.requires {
 				d.ok(c.tool, "not detected, skipped")
 				continue
 			}
-			d.bad(c.tool, fmt.Sprintf("file missing (%s)", p),
+			d.bad(c.tool, fmt.Sprintf("file missing (%s)", strings.Join(locs, ", ")),
 				"run `blamely repair` (will create it)")
 			continue
 		}
-		if !strings.Contains(string(data), c.marker) {
-			if !c.requires {
-				d.ok(c.tool, "no blamely hook (tool not detected)")
-				continue
-			}
-			d.bad(c.tool, "blamely hook NOT present in file",
-				"run `blamely repair` to configure it")
+		if !c.requires {
+			d.ok(c.tool, "no blamely hook (tool not detected)")
 			continue
 		}
-		d.ok(c.tool, p)
+		d.bad(c.tool, "blamely hook NOT present in file",
+			"run `blamely repair` to configure it")
 	}
 }
 

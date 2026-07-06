@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/blamely/blamely/internal/config"
 )
 
 // ClaudeCommitFileOps scans the Claude Code transcripts for repoRoot and returns
@@ -21,24 +23,24 @@ import (
 // clean) — but the transcript still records exactly which files the AI touched.
 // blamely's commit-time attribution uses this to credit those files to the AI.
 func ClaudeCommitFileOps(repoRoot string, sinceNanos, untilNanos int64) (written, deleted []string) {
-	dir := claudeProjectDir(repoRoot)
-	if dir == "" {
-		return nil, nil
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, nil
-	}
 	wset, dset := map[string]bool{}, map[string]bool{}
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+	// Scan the repo's transcript dir under EVERY Claude config location (default +
+	// custom), so a corp CLAUDE_CONFIG_DIR is covered alongside ~/.claude.
+	for _, dir := range claudeProjectDirs(repoRoot) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
 			continue
 		}
-		// A transcript last written before the window opened can't hold ops in it.
-		if info, err := e.Info(); err == nil && info.ModTime().UnixNano() < sinceNanos {
-			continue
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+				continue
+			}
+			// A transcript last written before the window opened can't hold ops in it.
+			if info, err := e.Info(); err == nil && info.ModTime().UnixNano() < sinceNanos {
+				continue
+			}
+			scanTranscriptOps(filepath.Join(dir, e.Name()), sinceNanos, untilNanos, wset, dset)
 		}
-		scanTranscriptOps(filepath.Join(dir, e.Name()), sinceNanos, untilNanos, wset, dset)
 	}
 	return mapKeys(wset), mapKeys(dset)
 }
@@ -63,13 +65,17 @@ func MatchesFileOp(rel string, targets []string) bool {
 	return false
 }
 
-func claudeProjectDir(repoRoot string) string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
+// claudeProjectDirs returns the repo's transcript dir under EVERY Claude config
+// location in the union (~/.claude, $CLAUDE_CONFIG_DIR, and configured extras), so
+// a corp/custom config dir is scanned alongside the default.
+func claudeProjectDirs(repoRoot string) []string {
 	proj := strings.ReplaceAll(filepath.ToSlash(repoRoot), "/", "-")
-	return filepath.Join(home, ".claude", "projects", proj)
+	bases := config.ClaudeProjectsDirs()
+	out := make([]string, 0, len(bases))
+	for _, b := range bases {
+		out = append(out, filepath.Join(b, proj))
+	}
+	return out
 }
 
 type tsOpEntry struct {

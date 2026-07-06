@@ -69,6 +69,15 @@ func Run(installPlugins bool) error {
 		return fmt.Errorf("install binary: %w", err)
 	}
 
+	// Tee the full step-by-step report to ~/.blamely/last-install.log so the
+	// native installers can display exactly what was set up WITHOUT any shell
+	// redirection (`blamely install > log`) — that pattern is what EDR/SmartScreen
+	// flag. The installer just runs the signed blamely.exe directly and reads this
+	// file. Best-effort: if the dir/file can't be created, output is unchanged.
+	if dir, derr := config.EnsureBlamelyDir(); derr == nil {
+		defer uiTeeToFile(filepath.Join(dir, "last-install.log"))()
+	}
+
 	detected, err := Detect()
 	if err != nil {
 		return err
@@ -86,6 +95,15 @@ func Run(installPlugins bool) error {
 	}
 	s.InstalledAt = time.Now()
 	s.BinaryPath = binPath
+
+	// Capture any custom Codex/Claude home from the env NOW, while we run in the
+	// user's shell. The daemon runs under launchd/systemd/schtasks and does NOT
+	// inherit these, so persisting them into config is the only way it learns to
+	// watch a corporate CODEX_HOME / CLAUDE_CONFIG_DIR. Additive — the defaults are
+	// always watched too. Best-effort: a failure here must not abort install.
+	if err := config.CaptureToolDirsFromEnv(); err != nil {
+		info("Tool dirs", "could not persist custom Codex/Claude dirs — "+err.Error())
+	}
 
 	// Hooks: a `blamely record <tool>` hook merged into each detected AI
 	// tool's own settings/config file, plus the global git post-commit hook
@@ -323,7 +341,7 @@ func Run(installPlugins bool) error {
 		return fmt.Errorf("save state: %w", err)
 	}
 
-	fmt.Println()
+	fmt.Fprintln(uiOut)
 	printNextSteps(detected)
 	return nil
 }
@@ -543,9 +561,9 @@ func mergeLabels(existing, fresh []string) []string {
 
 func printDetected(d *Detected) {
 	if uiColor() {
-		fmt.Printf("%sDetected%s\n", uiBold, uiReset)
+		fmt.Fprintf(uiOut, "%sDetected%s\n", uiBold, uiReset)
 	} else {
-		fmt.Println("Detected")
+		fmt.Fprintln(uiOut, "Detected")
 	}
 	for _, row := range []struct {
 		name string
@@ -575,13 +593,13 @@ func printDetected(d *Detected) {
 func printNextSteps(d *Detected) {
 	section("Next steps")
 	if d.Claude.Present {
-		fmt.Println("  · Make an edit with Claude Code, then commit. Run `blamely report HEAD` to see the per-line attribution.")
+		fmt.Fprintln(uiOut, "  · Make an edit with Claude Code, then commit. Run `blamely report HEAD` to see the per-line attribution.")
 	} else {
-		fmt.Println("  · Claude Code wasn't detected. Install it, run `blamely install` again, or add the hook manually.")
+		fmt.Fprintln(uiOut, "  · Claude Code wasn't detected. Install it, run `blamely install` again, or add the hook manually.")
 	}
 	if !d.Cursor.Present || !d.Codex.Present || !d.Copilot.Present || !d.Gemini.Present {
-		fmt.Println("  · Install Cursor/Codex/Copilot/Gemini later? Run `blamely repair` to wire up its hook (`blamely doctor` checks first).")
+		fmt.Fprintln(uiOut, "  · Install Cursor/Codex/Copilot/Gemini later? Run `blamely repair` to wire up its hook (`blamely doctor` checks first).")
 	}
-	fmt.Println("  · `blamely status` shows the daemon health.")
-	fmt.Println("  · `blamely uninstall` reverses every change above.")
+	fmt.Fprintln(uiOut, "  · `blamely status` shows the daemon health.")
+	fmt.Fprintln(uiOut, "  · `blamely uninstall` reverses every change above.")
 }

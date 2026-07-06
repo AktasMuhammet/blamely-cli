@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 const (
@@ -19,6 +20,7 @@ const (
 	excludeFileName     = "exclude"
 	claudeDirName       = ".claude"
 	claudeSettings      = "settings.json"
+	claudeProjects      = "projects"
 	codexDirName        = ".codex"
 	codexSessions       = "sessions"
 	codexConfig         = "config.toml"
@@ -131,6 +133,98 @@ func ExcludeFile() (string, error) {
 	return filepath.Join(d, excludeFileName), nil
 }
 
+// dedupExisting returns the input paths cleaned, de-duplicated (order-preserving),
+// and dropping empties. It does NOT stat — callers that only want existing dirs
+// filter separately; watchers poll for dirs that may appear later.
+func dedupExisting(paths []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		c := filepath.Clean(p)
+		if seen[c] {
+			continue
+		}
+		seen[c] = true
+		out = append(out, c)
+	}
+	return out
+}
+
+// CodexBaseDirs returns the UNION of every Codex home to scan, in order: the home
+// default (~/.codex) ALWAYS first, then $CODEX_HOME, then every extra dir from
+// config (tools.codex_homes). De-duplicated. The default is never dropped — custom
+// dirs are additive, so a machine with both a personal and a corp Codex is covered.
+func CodexBaseDirs() []string {
+	var dirs []string
+	if home, err := Home(); err == nil {
+		dirs = append(dirs, filepath.Join(home, codexDirName))
+	}
+	if env := strings.TrimSpace(os.Getenv("CODEX_HOME")); env != "" {
+		dirs = append(dirs, env)
+	}
+	dirs = append(dirs, LoadConfig().Tools.CodexHomes...)
+	return dedupExisting(dirs)
+}
+
+// ClaudeBaseDirs mirrors CodexBaseDirs for Claude: ~/.claude ALWAYS first, then
+// $CLAUDE_CONFIG_DIR, then tools.claude_config_dirs. De-duplicated, default kept.
+func ClaudeBaseDirs() []string {
+	var dirs []string
+	if home, err := Home(); err == nil {
+		dirs = append(dirs, filepath.Join(home, claudeDirName))
+	}
+	if env := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); env != "" {
+		dirs = append(dirs, env)
+	}
+	dirs = append(dirs, LoadConfig().Tools.ClaudeConfigDirs...)
+	return dedupExisting(dirs)
+}
+
+// CodexSessionsDirs is the per-base sessions/ dir for every Codex home in the union.
+func CodexSessionsDirs() []string {
+	bases := CodexBaseDirs()
+	out := make([]string, 0, len(bases))
+	for _, b := range bases {
+		out = append(out, filepath.Join(b, codexSessions))
+	}
+	return out
+}
+
+// CodexConfigPaths is the per-base config.toml for every Codex home in the union.
+func CodexConfigPaths() []string {
+	bases := CodexBaseDirs()
+	out := make([]string, 0, len(bases))
+	for _, b := range bases {
+		out = append(out, filepath.Join(b, codexConfig))
+	}
+	return out
+}
+
+// ClaudeSettingsPaths is the per-base settings.json for every Claude dir in the union.
+func ClaudeSettingsPaths() []string {
+	bases := ClaudeBaseDirs()
+	out := make([]string, 0, len(bases))
+	for _, b := range bases {
+		out = append(out, filepath.Join(b, claudeSettings))
+	}
+	return out
+}
+
+// ClaudeProjectsDirs is the per-base projects/ dir for every Claude dir in the union.
+func ClaudeProjectsDirs() []string {
+	bases := ClaudeBaseDirs()
+	out := make([]string, 0, len(bases))
+	for _, b := range bases {
+		out = append(out, filepath.Join(b, claudeProjects))
+	}
+	return out
+}
+
+// ClaudeSettingsPath returns the home-default Claude settings.json — the location to
+// create the hook when none exists yet. Use ClaudeSettingsPaths() to scan all.
 func ClaudeSettingsPath() (string, error) {
 	home, err := Home()
 	if err != nil {
@@ -139,6 +233,8 @@ func ClaudeSettingsPath() (string, error) {
 	return filepath.Join(home, claudeDirName, claudeSettings), nil
 }
 
+// CodexSessionsDir returns the home-default Codex sessions dir. Use CodexSessionsDirs()
+// to scan the full union (default + custom).
 func CodexSessionsDir() (string, error) {
 	home, err := Home()
 	if err != nil {
@@ -147,6 +243,8 @@ func CodexSessionsDir() (string, error) {
 	return filepath.Join(home, codexDirName, codexSessions), nil
 }
 
+// CodexConfigPath returns the home-default Codex config.toml — the location to create
+// the hook when none exists yet. Use CodexConfigPaths() to scan all.
 func CodexConfigPath() (string, error) {
 	home, err := Home()
 	if err != nil {

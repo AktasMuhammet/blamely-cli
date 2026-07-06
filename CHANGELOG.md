@@ -4,6 +4,24 @@ Notable changes to the **Blamely CLI** follow [Keep a Changelog](https://keepach
 
 ## [Unreleased]
 
+## [1.6.7] - 2026-07-06
+
+### Added
+
+- **Files deleted by the Cursor agent are now credited to AI.** When you ask Cursor to delete a file, the deletion is attributed to Cursor instead of showing up as a human change.
+- **Better Windows support for AI deletions.** File deletions made through the terminal on Windows are now recognized and attributed correctly.
+- **Support for custom tool locations.** If your team runs Codex or Claude from a non-standard location, you can now point Blamely at it so those edits are still tracked. Set `CODEX_HOME` and/or `CLAUDE_CONFIG_DIR` before running `blamely install` (Blamely picks them up automatically), or add them anytime with `blamely config add tools.codex_home <path>` / `blamely config add tools.claude_config_dir <path>`. These are additive — the standard `~/.codex` and `~/.claude` locations keep working as before.
+- **One-click installers.** Blamely now ships proper installers for Windows, macOS, and Linux, so you no longer need the command line to get set up.
+- **Branded Windows installer.** The Windows installer and the installed app now show the Blamely icon instead of a blank one.
+
+### Fixed
+
+- **More accurate attribution when AI rewrites a whole file.** Both the new and replaced lines are now credited correctly.
+- **Windows path matching.** Deletions on Windows are matched reliably instead of occasionally falling back to a human change.
+- **File deletions from Copilot and Cursor agents** are now recognized and credited to the right tool.
+- **Cleaner install log.** The setup log no longer shows garbled characters.
+- **Reports stay fully private.** HTML reports now open completely offline — they no longer reach out to Google for fonts, so nothing leaves your machine when you open one.
+
 ##DASDA [1.6.0] - 2026-06-15
 
 ### Added

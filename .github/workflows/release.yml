@@ -13,7 +13,9 @@ name: Build & Publish Release
 #                       (default GITHUB_TOKEN can't reach other repos)
 #
 # Optional secrets:
-#   APPLE_CERT_*  / WINDOWS_CERT_*  → code signing if/when you set it up
+#   BLAMELY_SIGN_PFX_BASE64 / BLAMELY_SIGN_PASS  → Authenticode-sign the Windows
+#     blamely.exe AND the setup.exe installer (absent → published unsigned)
+#   GPG_PRIVATE_KEY / GPG_PASSPHRASE             → detach-sign SHA256SUMS
 #
 # Artifacts published per semver tag (e.g. v0.2.0):
 #   blamely_<tag>_darwin_amd64.tar.gz
@@ -48,10 +50,6 @@ permissions:
 
 env:
   GO_VERSION: '1.26.4'
-  # Pinned for reproducible obfuscation. garble is coupled to the Go toolchain
-  # and refuses to run against an unsupported Go release — bump this in lockstep
-  # with GO_VERSION. Releases: https://github.com/burrowers/garble/releases
-  GARBLE_VERSION: 'v0.16.0'
 
 jobs:
   # ── 1. Build per OS/arch in parallel ───────────────────────────────────────
@@ -78,21 +76,6 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Install garble (binary obfuscator)
-        # garble wraps `go build` to:
-        #   - rename packages, functions, types, fields, and locals to short
-        #     non-meaningful names in the compiled binary
-        #   - encrypt string literals (decrypted at runtime)
-        #   - strip extra runtime metadata
-        # Source in this private repo stays unchanged; only the published
-        # binary going to the public release repo is obfuscated.
-        # Pinned via GARBLE_VERSION (see env) for reproducible builds.
-        shell: bash
-        run: |
-          go install mvdan.cc/garble@${GARBLE_VERSION}
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-          "$(go env GOPATH)/bin/garble" version
-
       - name: Resolve tag
         id: tag
         shell: bash
@@ -109,68 +92,36 @@ jobs:
         shell: bash
         run: go test ./...
 
-      - name: Build obfuscated binary
+      - name: Build binary
         shell: bash
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '0'      # static binary; SQLite uses modernc.org/sqlite (pure Go)
-          # GOGARBLE controls which import-path patterns get obfuscated. "*"
-          # garbles everything including third-party deps (cobra, fsnotify,
-          # BurntSushi/toml, modernc.org/sqlite, …). The Go stdlib is never
-          # obfuscated. Drop to e.g. "github.com/blamely/*" if a dep mis-
-          # behaves under obfuscation (rare for these libs).
-          GOGARBLE: '*'
         run: |
           set -e
           out_dir="dist/blamely_${{ steps.tag.outputs.tag }}_${{ matrix.goos }}_${{ matrix.goarch }}"
           bin_name="blamely${{ matrix.ext }}"
           mkdir -p "$out_dir"
-          # garble flags:
-          #   -literals  encrypt string constants in the compiled binary
-          #   -tiny      strip extra runtime metadata (no panic line numbers;
-          #              combines well with -s -w)
-          # Standard build flags still apply via the wrapped `go build`:
+          # Standard release build flags:
           #   -trimpath        remove build paths
-          #   -buildvcs=false  don't stamp git metadata (private repo info)
+          #   -buildvcs=false  don't stamp git metadata
           #   -ldflags -s -w   strip symbols + DWARF
           #   -X main.version  pin the version string to the release tag
-          garble -literals -tiny build \
+          go build \
             -trimpath \
             -buildvcs=false \
             -ldflags="-s -w -X main.version=${{ steps.tag.outputs.tag }}" \
             -o "$out_dir/$bin_name" \
             ./cmd/blamely
 
-      - name: Verify obfuscation (static)
-        # A non-garbled build embeds our import paths in the runtime symbol
-        # tables (gopclntab) even with `-s -w`; garble hashes them away. Grep
-        # the WHOLE module path — covering both internal/ and cmd/, not just
-        # internal/ as before — and fail if any of it survives. On failure we
-        # print the leaking paths to make a regression easy to diagnose.
-        # `grep -a` treats the binary as text; portable across all runners.
-        shell: bash
-        run: |
-          set -e
-          bin="dist/blamely_${{ steps.tag.outputs.tag }}_${{ matrix.goos }}_${{ matrix.goarch }}/blamely${{ matrix.ext }}"
-          if grep -a -q "github.com/blamely/blamely" "$bin"; then
-            echo "ERROR: readable blamely import paths still present in $bin — obfuscation regressed:"
-            grep -a -o "github.com/blamely/blamely[A-Za-z0-9/_.-]*" "$bin" | sort -u | head
-            exit 1
-          fi
-          echo "OK: $bin shows no readable blamely import paths"
-
-      - name: Smoke-test obfuscated binary (native arch only)
-        # The static grep can't catch an obfuscated-but-BROKEN binary. With
-        # GOGARBLE='*', garble rewrites modernc.org/sqlite (heavy unsafe +
-        # //go:linkname) — the most likely thing to break under obfuscation,
-        # and it only fails at RUNTIME when the DB is opened. So actually run
-        # the just-built binary on the matching-arch runner:
+      - name: Smoke-test binary (native arch only)
+        # Run the just-built binary on the matching-arch runner:
         #   - `--version` proves it executes AND the `-X main.version` ldflag
-        #     survived garble's name mangling (else it prints the dev default).
+        #     was applied (else it prints the dev default).
         #   - `history --all` opens, migrates, and queries ~/.blamely/db.sqlite,
-        #     exercising the obfuscated SQLite stack; it needs no git repo /
-        #     daemon / network and exits 0 on an empty DB.
+        #     exercising the SQLite stack; it needs no git repo / daemon /
+        #     network and exits 0 on an empty DB.
         # Cross-arch builds (e.g. linux/arm64 on an amd64 runner) can't run
         # here, so this is gated to the native OS/arch of each runner.
         if: >-
@@ -185,12 +136,12 @@ jobs:
           ver="$("$bin" --version)"
           echo "version output: $ver"
           case "$ver" in
-            *"$tag"*) echo "OK: binary runs and the version ldflag survived obfuscation" ;;
-            *) echo "ERROR: version output '$ver' does not contain tag '$tag' — garble -X mapping broke"; exit 1 ;;
+            *"$tag"*) echo "OK: binary runs and the version ldflag was applied" ;;
+            *) echo "ERROR: version output '$ver' does not contain tag '$tag' — -X mapping broke"; exit 1 ;;
           esac
-          # Open + migrate + query the SQLite store (the obfuscated modernc stack).
+          # Open + migrate + query the SQLite store (the modernc stack).
           "$bin" history --all
-          echo "OK: obfuscated binary runs and SQLite works"
+          echo "OK: binary runs and SQLite works"
 
       - name: Package archive
         id: pkg
@@ -222,12 +173,271 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # ── 2. Aggregate + publish to the public release repo ──────────────────────
-  publish:
-    name: publish to release repo
+  # ── 2. Windows installer (Inno Setup .exe, Authenticode-signed) ────────────
+  # Builds a double-clickable setup.exe from the Windows release archive so users
+  # avoid the irm|iex script (which corporate EDR/SmartScreen flags). Signed with
+  # the code-signing cert in the BLAMELY_SIGN_* secrets; absent secrets → an
+  # UNSIGNED installer + a warning, never a failed release.
+  installers:
+    name: installer windows/${{ matrix.arch }}
+    needs: build
+    runs-on: windows-latest
+    # Signing secret exposed as job env so the step `if:` presence-check can read
+    # it (step-level env is not visible to that step's own `if`). Optional.
+    env:
+      PFX: ${{ secrets.BLAMELY_SIGN_PFX_BASE64 }}
+      PFX_PASS: ${{ secrets.BLAMELY_SIGN_PASS }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   goarch: amd64 }
+          - { arch: arm64, goarch: arm64 }
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then tag="${{ github.event.inputs.tag }}";
+          else tag="${GITHUB_REF#refs/tags/}"; fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "ver=${tag#v}" >> "$GITHUB_OUTPUT"   # version without leading v
+
+      - name: Download Windows archive
+        uses: actions/download-artifact@v4
+        with:
+          pattern: blamely_${{ steps.tag.outputs.tag }}_windows_${{ matrix.goarch }}.*
+          path: incoming
+          merge-multiple: true
+
+      - name: Extract binary
+        id: bin
+        shell: bash
+        run: |
+          set -e
+          dir="blamely_${{ steps.tag.outputs.tag }}_windows_${{ matrix.goarch }}"
+          mkdir -p work
+          7z x -y "incoming/${dir}.zip" -owork >/dev/null || unzip -q -o "incoming/${dir}.zip" -d work
+          bin="work/${dir}/blamely.exe"
+          [ -f "$bin" ] || { echo "binary missing: $bin"; ls -R work; exit 1; }
+          echo "path=$bin" >> "$GITHUB_OUTPUT"
+
+      # Sign the binary BEFORE it's packaged, so the .exe inside the installer is
+      # also signed (Defender scans the extracted exe, not just the installer).
+      - name: Sign blamely.exe (Authenticode)
+        if: env.PFX != ''
+        shell: pwsh
+        run: |
+          $pfx = "$env:RUNNER_TEMP\cert.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX))
+          $pass = if ($env:PFX_PASS) { @('/p', $env:PFX_PASS) } else { @() }
+          & signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 `
+            /f $pfx @pass "${{ steps.bin.outputs.path }}"
+
+      - name: Build Windows installer
+        shell: pwsh
+        env:
+          SQLITE_WIN_URL: 'https://www.sqlite.org/2025/sqlite-tools-win-x64-3500400.zip'
+        run: |
+          choco install innosetup --no-progress -y
+          # sqlite3.exe: the IDE plugins' DB reader, which Windows lacks. Fetch it
+          # so the installer can drop it into ~/.blamely/bin (same source the
+          # publish job uses). Only the x64 build exists upstream; arm64 runs it
+          # under emulation, so bundle the x64 exe for both.
+          Invoke-WebRequest -Uri $env:SQLITE_WIN_URL -OutFile sqlite-tools.zip
+          Expand-Archive -Force sqlite-tools.zip sqlite-tools
+          $sqlite = (Get-ChildItem -Recurse sqlite-tools -Filter sqlite3.exe | Select-Object -First 1).FullName
+          $src = Split-Path "${{ steps.bin.outputs.path }}"
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+            "/DAppVersion=${{ steps.tag.outputs.ver }}" "/DArch=${{ matrix.arch }}" `
+            "/DSourceDir=$src" "/DSqlite=$sqlite" `
+            "/Oout" "/Fblamely_${{ steps.tag.outputs.tag }}_windows_${{ matrix.arch }}_setup" `
+            packaging\windows\blamely.iss
+
+      - name: Sign Windows installer (Authenticode)
+        if: env.PFX != ''
+        shell: pwsh
+        run: |
+          $pfx = "$env:RUNNER_TEMP\cert.pfx"
+          $pass = if ($env:PFX_PASS) { @('/p', $env:PFX_PASS) } else { @() }
+          & signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 `
+            /f $pfx @pass (Get-ChildItem out\*setup*.exe).FullName
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-windows-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── 2b. macOS installer (.pkg wrapped in .dmg) ─────────────────────────────
+  # Builds a native macOS installer from the darwin release archive. The .pkg's
+  # postinstall runs `blamely install` AS THE LOGGED-IN USER (Blamely is per-user).
+  # No Apple Developer ID → binary is only ad-hoc signed and the .pkg/.dmg are
+  # un-notarized (Gatekeeper "right-click → Open"; see packaging/TRUST.md).
+  installers-macos:
+    name: installer macos/${{ matrix.arch }}
+    needs: build
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then tag="${{ github.event.inputs.tag }}";
+          else tag="${GITHUB_REF#refs/tags/}"; fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "ver=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download macOS archive
+        uses: actions/download-artifact@v4
+        with:
+          pattern: blamely_${{ steps.tag.outputs.tag }}_darwin_${{ matrix.arch }}.*
+          path: incoming
+          merge-multiple: true
+
+      - name: Extract binary
+        id: bin
+        shell: bash
+        run: |
+          set -e
+          dir="blamely_${{ steps.tag.outputs.tag }}_darwin_${{ matrix.arch }}"
+          mkdir -p work
+          tar -xzf "incoming/${dir}.tar.gz" -C work
+          bin="work/${dir}/blamely"
+          [ -f "$bin" ] || { echo "binary missing: $bin"; ls -R work; exit 1; }
+          echo "path=$bin" >> "$GITHUB_OUTPUT"
+
+      - name: Build macOS installer (.pkg + .dmg)
+        shell: bash
+        run: |
+          ./packaging/macos/build-macos.sh \
+            --version "${{ steps.tag.outputs.ver }}" \
+            --arch "${{ matrix.arch }}" \
+            --tag "${{ steps.tag.outputs.tag }}" \
+            --binary "${{ steps.bin.outputs.path }}" \
+            --out out
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-macos-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── 2c. Linux installers (.deb + .rpm via nfpm, and .AppImage) ─────────────
+  # Builds native Linux packages from the linux release archive. The .deb/.rpm
+  # postinstall runs `blamely install` AS THE DESKTOP USER; their output streams
+  # to the terminal during `apt`/`dnf install`. The AppImage is a portable runner
+  # (does NOT auto-wire hooks). No OS gatekeeper → trust is via GPG-signed
+  # SHA256SUMS (produced in the publish job).
+  installers-linux:
+    name: installer linux/${{ matrix.arch }}
     needs: build
     runs-on: ubuntu-latest
+    env:
+      # appimagetool is itself an AppImage; runners lack FUSE, so extract-and-run.
+      APPIMAGE_EXTRACT_AND_RUN: '1'
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
     steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then tag="${{ github.event.inputs.tag }}";
+          else tag="${GITHUB_REF#refs/tags/}"; fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "ver=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download Linux archive
+        uses: actions/download-artifact@v4
+        with:
+          pattern: blamely_${{ steps.tag.outputs.tag }}_linux_${{ matrix.arch }}.*
+          path: incoming
+          merge-multiple: true
+
+      - name: Extract binary
+        id: bin
+        shell: bash
+        run: |
+          set -e
+          dir="blamely_${{ steps.tag.outputs.tag }}_linux_${{ matrix.arch }}"
+          mkdir -p work
+          tar -xzf "incoming/${dir}.tar.gz" -C work
+          bin="work/${dir}/blamely"
+          [ -f "$bin" ] || { echo "binary missing: $bin"; ls -R work; exit 1; }
+          echo "path=$bin" >> "$GITHUB_OUTPUT"
+
+      - name: Install packagers (nfpm + appimagetool)
+        shell: bash
+        run: |
+          set -e
+          # nfpm — one config → both .deb and .rpm. Official goreleaser apt repo.
+          echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' \
+            | sudo tee /etc/apt/sources.list.d/goreleaser.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y nfpm
+          # appimagetool (the host runner is x86_64; it fetches the target runtime).
+          curl -fsSL -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          sudo mv appimagetool /usr/local/bin/appimagetool
+
+      - name: Build .deb + .rpm
+        shell: bash
+        run: |
+          ./packaging/linux/build-linux.sh \
+            --version "${{ steps.tag.outputs.ver }}" \
+            --arch "${{ matrix.arch }}" \
+            --tag "${{ steps.tag.outputs.tag }}" \
+            --binary "${{ steps.bin.outputs.path }}" \
+            --out out
+
+      - name: Build .AppImage
+        shell: bash
+        run: |
+          ./packaging/linux/appimage/build-appimage.sh \
+            --arch "${{ matrix.arch }}" \
+            --tag "${{ steps.tag.outputs.tag }}" \
+            --binary "${{ steps.bin.outputs.path }}" \
+            --out out
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-linux-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── 3. Aggregate + publish to the public release repo ──────────────────────
+  publish:
+    name: publish to release repo
+    needs: [build, installers, installers-macos, installers-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        # Repo context for the publish job (workflow scripts / metadata).
+        uses: actions/checkout@v4
+
       - name: Resolve tag
         id: tag
         shell: bash
@@ -265,8 +475,8 @@ jobs:
 
       - name: Sign Windows binaries (Authenticode)
         # Authenticode-sign the Windows blamely.exe so Windows Defender /
-        # SmartScreen trust it — an unsigned, garble-obfuscated binary is what
-        # trips the Trojan:Win32/Gracing (Wacatac/Sabsik) false positives.
+        # SmartScreen trust it — an unsigned binary is what trips the
+        # Trojan:Win32/Gracing (Wacatac/Sabsik) false positives.
         # osslsigncode signs PE files on a Linux host (signtool is Windows-only),
         # so we sign here in the publish job rather than on the build runners.
         #
@@ -336,7 +546,11 @@ jobs:
         run: |
           set -e
           shopt -s nullglob
-          sha256sum *.tar.gz *.zip sqlite3.exe > SHA256SUMS
+          # Covers the archives, the Windows plugin sqlite3.exe, the signed Windows
+          # setup.exe, AND the native macOS/Linux installers (.pkg .dmg .deb .rpm
+          # .AppImage) built by the installer jobs.
+          sha256sum *.tar.gz *.zip *_setup.exe *.pkg *.dmg *.deb *.rpm *.AppImage sqlite3.exe \
+            > SHA256SUMS
           cat SHA256SUMS
 
       - name: GPG-sign checksums
@@ -365,6 +579,43 @@ jobs:
             --detach-sign --armor -o SHA256SUMS.asc SHA256SUMS
           gpg --verify SHA256SUMS.asc SHA256SUMS
 
+      - name: Export public trust assets (cert + GPG pubkey)
+        # With only a self-signed cert (no CA / Azure / Apple ID), trust is a
+        # documented, verifiable process rather than a silent OS prompt. Publish
+        # the PUBLIC verification material so a security team can audit and an
+        # admin can whitelist — never the private .pfx/.key:
+        #   blamely-codesign.crt   public half of the code-signing cert (from the
+        #                          PFX secret; extracted with openssl, no key)
+        #   blamely-gpg-public.asc public GPG key that signs SHA256SUMS.asc
+        env:
+          BLAMELY_SIGN_PFX_BASE64: ${{ secrets.BLAMELY_SIGN_PFX_BASE64 }}
+          BLAMELY_SIGN_PASS: ${{ secrets.BLAMELY_SIGN_PASS }}
+        shell: bash
+        working-directory: dist
+        run: |
+          set -e
+          # Export the public GPG key (private key already imported above).
+          gpg --armor --export > blamely-gpg-public.asc || true
+          [ -s blamely-gpg-public.asc ] || rm -f blamely-gpg-public.asc
+          # Extract the PUBLIC cert from the PFX secret — public half only, no key.
+          if [ -n "${BLAMELY_SIGN_PFX_BASE64:-}" ]; then
+            pfx="$(mktemp)"; trap 'rm -f "$pfx"' EXIT
+            printf '%s' "$BLAMELY_SIGN_PFX_BASE64" | base64 -d > "$pfx"
+            passin=()
+            [ -n "${BLAMELY_SIGN_PASS:-}" ] && passin=(-passin "pass:${BLAMELY_SIGN_PASS}")
+            [ ${#passin[@]} -eq 0 ] && passin=(-passin pass:)
+            # -legacy: OpenSSL 3 needs it for the RC2-encrypted PFXs signtool makes.
+            openssl pkcs12 -in "$pfx" -clcerts -nokeys "${passin[@]}" -legacy \
+              -out blamely-codesign.crt 2>/dev/null \
+              || openssl pkcs12 -in "$pfx" -clcerts -nokeys "${passin[@]}" \
+                   -out blamely-codesign.crt 2>/dev/null \
+              || echo "::warning::could not extract public cert from PFX"
+            [ -s blamely-codesign.crt ] || rm -f blamely-codesign.crt
+          else
+            echo "::warning::No BLAMELY_SIGN_PFX_BASE64 — skipping public cert asset."
+          fi
+          ls -la blamely-gpg-public.asc blamely-codesign.crt 2>/dev/null || true
+
       - name: Publish to public release repo
         # gh CLI is preinstalled on ubuntu-latest. We use the PAT so the
         # release lands in a DIFFERENT repo than the one running this workflow.
@@ -390,25 +641,39 @@ jobs:
               --title "blamely $TAG" \
               --generate-notes \
               --verify-tag=false
-          # Upload (or replace) every versioned archive plus sqlite3.exe (Windows
-          # plugin dependency), SHA256SUMS and its signature.
+          # Upload (or replace) every versioned archive, the signed Windows
+          # setup.exe, the native macOS/Linux installers (.pkg .dmg .deb .rpm
+          # .AppImage), sqlite3.exe (Windows plugin dependency), SHA256SUMS + its
+          # signature, and the public trust assets (cert, GPG pubkey).
+          shopt -s nullglob
           gh release upload "$TAG" --repo "$RELEASE_REPO" --clobber \
-            *.tar.gz *.zip sqlite3.exe SHA256SUMS SHA256SUMS.asc
+            *.tar.gz *.zip *_setup.exe *.pkg *.dmg *.deb *.rpm *.AppImage \
+            sqlite3.exe SHA256SUMS SHA256SUMS.asc \
+            blamely-gpg-public.asc blamely-codesign.crt
 
           # Mark the semver release as GitHub's default "Latest" (UI + /releases/latest).
           gh release edit "$TAG" --repo "$RELEASE_REPO" --latest
 
-          # Rolling `latest` tag release — stable asset names for curl|bash installers.
+          # Rolling `latest` tag release — stable asset names for the installers
+          # and curl|bash scripts (archives + Windows setup.exe get the tag
+          # stripped so download URLs are version-independent).
           mkdir -p latest-assets
           shopt -s nullglob
-          for f in blamely_"${TAG}"_*.tar.gz blamely_"${TAG}"_*.zip; do
+          for f in blamely_"${TAG}"_*.tar.gz blamely_"${TAG}"_*.zip \
+                   blamely_"${TAG}"_*_setup.exe \
+                   blamely_"${TAG}"_*.pkg blamely_"${TAG}"_*.dmg \
+                   blamely_"${TAG}"_*.deb blamely_"${TAG}"_*.rpm \
+                   blamely_"${TAG}"_*.AppImage; do
             [ -f "$f" ] || continue
             stable="blamely_${f#blamely_${TAG}_}"
             cp "$f" "latest-assets/${stable}"
           done
-          # sqlite3.exe already has a stable (version-less) name — ship it as-is.
+          # sqlite3.exe + trust assets already have stable (version-less) names.
           cp sqlite3.exe latest-assets/sqlite3.exe
-          (cd latest-assets && sha256sum *.tar.gz *.zip sqlite3.exe > SHA256SUMS 2>/dev/null || true)
+          for extra in blamely-gpg-public.asc blamely-codesign.crt; do
+            [ -f "$extra" ] && cp "$extra" "latest-assets/$extra"
+          done
+          (cd latest-assets && sha256sum *.tar.gz *.zip *_setup.exe *.pkg *.dmg *.deb *.rpm *.AppImage sqlite3.exe > SHA256SUMS 2>/dev/null || true)
           # Sign the rolling manifest too (GPG key already imported above).
           if [ -f latest-assets/SHA256SUMS ]; then
             gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \

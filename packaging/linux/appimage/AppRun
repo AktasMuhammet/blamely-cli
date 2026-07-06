@@ -1,0 +1,6 @@
+#!/bin/sh
+# AppImage entrypoint: exec the bundled blamely with all passed args.
+# NOTE: an AppImage is a PORTABLE RUNNER, not an installer — it does NOT auto-wire
+# the daemon/hooks. Run `./blamely_*.AppImage install` once to set those up.
+HERE="$(dirname "$(readlink -f "$0")")"
+exec "$HERE/usr/bin/blamely" "$@"

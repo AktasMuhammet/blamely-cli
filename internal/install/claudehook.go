@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/blamely/blamely/internal/config"
 )
@@ -40,18 +41,52 @@ var claudeHookEvents = []string{"PostToolUse"}
 // re-running `blamely install` never stacks duplicates and always pins blamely
 // first. Idempotent — it only writes when the file actually changes. Preserves
 // all unrelated keys (other matchers, user hooks, non-hook settings).
+// It installs into EVERY Claude config location in the union (~/.claude and any
+// custom CLAUDE_CONFIG_DIR / corp dir that exists), so a machine running Claude from
+// a non-default home is wired up too — never just the default. When no location
+// exists yet it creates the hook in the home default. `settingsPath` is a
+// display string of the location(s) written; `added` is true if any changed.
 func InstallClaudeHook(binaryPath string) (added bool, settingsPath string, err error) {
-	settingsPath, err = config.ClaudeSettingsPath()
-	if err != nil {
-		return false, "", err
+	targets := claudeHookTargets()
+	written := make([]string, 0, len(targets))
+	for _, p := range targets {
+		a, werr := installClaudeHookAt(p, binaryPath)
+		if werr != nil {
+			return added, strings.Join(append(written, p), ", "), werr
+		}
+		written = append(written, p)
+		added = added || a
 	}
+	return added, strings.Join(written, ", "), nil
+}
+
+// claudeHookTargets is the set of settings.json paths to install into: every union
+// base whose dir already exists, or the home default if none do yet.
+func claudeHookTargets() []string {
+	var out []string
+	for _, p := range config.ClaudeSettingsPaths() {
+		if dirExists(filepath.Dir(p)) {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		if def, err := config.ClaudeSettingsPath(); err == nil {
+			out = append(out, def)
+		}
+	}
+	return out
+}
+
+// installClaudeHookAt merges the blamely record-hook into one settings.json,
+// prepending it as the FIRST hook of every event we care about. Idempotent.
+func installClaudeHookAt(settingsPath, binaryPath string) (added bool, err error) {
 	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
-		return false, settingsPath, fmt.Errorf("mkdir %s: %w", filepath.Dir(settingsPath), err)
+		return false, fmt.Errorf("mkdir %s: %w", filepath.Dir(settingsPath), err)
 	}
 
 	root, err := readSettings(settingsPath)
 	if err != nil {
-		return false, settingsPath, err
+		return false, err
 	}
 	before := canonJSON(root)
 
@@ -67,16 +102,16 @@ func InstallClaudeHook(binaryPath string) (added bool, settingsPath string, err 
 	root["hooks"] = hooks
 
 	if canonJSON(root) == before {
-		return false, settingsPath, nil
+		return false, nil
 	}
 	data, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
-		return false, settingsPath, fmt.Errorf("marshal settings: %w", err)
+		return false, fmt.Errorf("marshal settings: %w", err)
 	}
 	if err := atomicWrite(settingsPath, data, 0o644); err != nil {
-		return false, settingsPath, err
+		return false, err
 	}
-	return true, settingsPath, nil
+	return true, nil
 }
 
 // prependIntoMatcherGroup adds {type:command, command} as the FIRST hook of the
@@ -115,13 +150,30 @@ func prependIntoMatcherGroup(groups []any, matcher, command string) []any {
 
 // UninstallClaudeHook removes ANY hook entry whose command contains
 // `blamely record claude` from every event group under settings.hooks
-// (PreToolUse, PostToolUse, etc.). User hooks and unrelated keys are
-// preserved. Returns true if something was removed.
+// (PreToolUse, PostToolUse, etc.), across EVERY Claude config location in the
+// union (default + custom). User hooks and unrelated keys are preserved. Returns
+// true if something was removed from any location.
 func UninstallClaudeHook() (removed bool, err error) {
-	settingsPath, err := config.ClaudeSettingsPath()
-	if err != nil {
-		return false, err
+	seen := map[string]bool{}
+	paths := config.ClaudeSettingsPaths()
+	if def, derr := config.ClaudeSettingsPath(); derr == nil {
+		paths = append(paths, def)
 	}
+	for _, p := range paths {
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		r, uerr := uninstallClaudeHookAt(p)
+		if uerr != nil {
+			return removed, uerr
+		}
+		removed = removed || r
+	}
+	return removed, nil
+}
+
+func uninstallClaudeHookAt(settingsPath string) (removed bool, err error) {
 	root, err := readSettings(settingsPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil

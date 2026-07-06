@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 
@@ -36,20 +37,49 @@ const codexBlamelyMarker = "record codex"
 var codexHookEvents = []string{"PostToolUse", "PreToolUse"}
 
 // InstallCodexHook merges blamely's record-hook into every Codex event
-// (PreToolUse + PostToolUse) in ~/.codex/config.toml. Idempotent. Preserves
-// all unrelated keys, including hooks.state.* trust entries Codex manages.
+// (PreToolUse + PostToolUse), across EVERY Codex home in the union (~/.codex and any
+// custom CODEX_HOME / corp dir that exists) — never just the default. When none
+// exist yet it creates the hook in the home default. Idempotent. Preserves all
+// unrelated keys, including hooks.state.* trust entries Codex manages.
 func InstallCodexHook(binaryPath string) (added bool, configPath string, err error) {
-	configPath, err = config.CodexConfigPath()
-	if err != nil {
-		return false, "", err
+	targets := codexHookTargets()
+	written := make([]string, 0, len(targets))
+	for _, p := range targets {
+		a, werr := installCodexHookAt(p, binaryPath)
+		if werr != nil {
+			return added, strings.Join(append(written, p), ", "), werr
+		}
+		written = append(written, p)
+		added = added || a
 	}
+	return added, strings.Join(written, ", "), nil
+}
+
+// codexHookTargets is the set of config.toml paths to install into: every union
+// base whose dir already exists, or the home default if none do yet.
+func codexHookTargets() []string {
+	var out []string
+	for _, p := range config.CodexConfigPaths() {
+		if dirExists(filepath.Dir(p)) {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		if def, err := config.CodexConfigPath(); err == nil {
+			out = append(out, def)
+		}
+	}
+	return out
+}
+
+func installCodexHookAt(configPath, binaryPath string) (added bool, err error) {
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
-		return false, configPath, fmt.Errorf("mkdir %s: %w", filepath.Dir(configPath), err)
+		return false, fmt.Errorf("mkdir %s: %w", filepath.Dir(configPath), err)
 	}
 
 	root, err := readTOML(configPath)
 	if err != nil {
-		return false, configPath, err
+		return false, err
 	}
 	before := canonJSON(root)
 
@@ -78,24 +108,41 @@ func InstallCodexHook(binaryPath string) (added bool, configPath string, err err
 	root["hooks"] = hooks
 
 	if canonJSON(root) == before {
-		return false, configPath, nil
+		return false, nil
 	}
 
 	if err := writeTOML(configPath, root); err != nil {
-		return false, configPath, err
+		return false, err
 	}
-	return true, configPath, nil
+	return true, nil
 }
 
 // UninstallCodexHook removes ANY hook entry whose command contains
 // `blamely record codex` from every event group under hooks (PreToolUse,
-// PostToolUse, …). hooks.state.* trust entries set by Codex are preserved.
-// Returns true if something was removed.
+// PostToolUse, …), across EVERY Codex home in the union (default + custom).
+// hooks.state.* trust entries set by Codex are preserved. Returns true if
+// something was removed from any location.
 func UninstallCodexHook() (removed bool, err error) {
-	configPath, err := config.CodexConfigPath()
-	if err != nil {
-		return false, err
+	seen := map[string]bool{}
+	paths := config.CodexConfigPaths()
+	if def, derr := config.CodexConfigPath(); derr == nil {
+		paths = append(paths, def)
 	}
+	for _, p := range paths {
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		r, uerr := uninstallCodexHookAt(p)
+		if uerr != nil {
+			return removed, uerr
+		}
+		removed = removed || r
+	}
+	return removed, nil
+}
+
+func uninstallCodexHookAt(configPath string) (removed bool, err error) {
 	root, err := readTOML(configPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil

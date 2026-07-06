@@ -46,17 +46,21 @@ type CodexWatcher struct {
 func (c *CodexWatcher) Name() string { return "codex" }
 
 func (c *CodexWatcher) Run(ctx context.Context, sink daemon.Sink) error {
-	dir := c.SessionsDir
-	if dir == "" {
-		var err error
-		dir, err = config.CodexSessionsDir()
-		if err != nil {
-			return err
+	// The set of sessions/ dirs to scan. A single test override wins; otherwise
+	// scan the UNION of ~/.codex/sessions, $CODEX_HOME/sessions, and every extra
+	// dir from config (corp setups) — all are watched at once, none replaces
+	// another. Re-resolved each tick so a dir added to config later is picked up.
+	dirs := func() []string {
+		if c.SessionsDir != "" {
+			return []string{c.SessionsDir}
 		}
+		return config.CodexSessionsDirs()
 	}
-	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
-		// Wait for the directory to appear (Codex may not be installed yet).
-		log.Printf("codex: %s not found, will poll", dir)
+	for _, dir := range dirs() {
+		if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+			// Wait for the directory to appear (Codex may not be installed yet).
+			log.Printf("codex: %s not found, will poll", dir)
+		}
 	}
 
 	tailers := map[string]context.CancelFunc{}
@@ -71,18 +75,20 @@ func (c *CodexWatcher) Run(ctx context.Context, sink daemon.Sink) error {
 
 	for {
 		seen := map[string]bool{}
-		for _, path := range findCodexSessionFiles(dir) {
-			seen[path] = true
-			if _, running := tailers[path]; running {
-				continue
-			}
-			tCtx, cancel := context.WithCancel(ctx)
-			tailers[path] = cancel
-			go func(p string) {
-				if err := tailCodexSession(tCtx, p, sink, c.DB, c.Name()); err != nil && tCtx.Err() == nil {
-					log.Printf("codex tail %s: %v", p, err)
+		for _, dir := range dirs() {
+			for _, path := range findCodexSessionFiles(dir) {
+				seen[path] = true
+				if _, running := tailers[path]; running {
+					continue
 				}
-			}(path)
+				tCtx, cancel := context.WithCancel(ctx)
+				tailers[path] = cancel
+				go func(p string) {
+					if err := tailCodexSession(tCtx, p, sink, c.DB, c.Name()); err != nil && tCtx.Err() == nil {
+						log.Printf("codex tail %s: %v", p, err)
+					}
+				}(path)
+			}
 		}
 		// Stop tailers whose files were rotated/deleted.
 		for path, cancel := range tailers {
@@ -618,6 +624,21 @@ func emitCodexPatchApplyEvents(payload json.RawMessage, when time.Time, st *code
 			}
 			lines = toDaemonLineRanges(full)
 			suggested = int64(len(full))
+			// Codex reports a full-file OVERWRITE as an "add" (it treats writing
+			// the whole file as creating it — e.g. "replace the entire file", which
+			// prints "+N -0" in its own summary), even when the file already exists
+			// at HEAD. The old HEAD lines it overwrote are deletions BY codex;
+			// without fingerprinting them the commit falls those lines back to Human.
+			// A genuinely new file isn't at HEAD, so headFileRemovedHashes returns
+			// nothing — no false deletions. Commit-time matching credits only the
+			// lines actually removed in the diff, so surviving lines aren't touched.
+			root := wt
+			if root == "" {
+				root, _ = gitToplevel(filepath.Dir(abs))
+			}
+			if root != "" {
+				removed = toDaemonRemovedLines(headFileRemovedHashes(root, rel))
+			}
 		case "update":
 			ranges, n := UnifiedDiffAddedRanges(change.UnifiedDiff)
 			removed = toDaemonRemovedLines(UnifiedDiffRemovedLineHashes(change.UnifiedDiff))

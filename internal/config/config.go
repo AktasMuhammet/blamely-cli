@@ -45,9 +45,26 @@ type NoteConfig struct {
 	Tokens bool `json:"tokens"`
 }
 
+// ToolsConfig records EXTRA AI-tool config directories to watch, for setups where
+// Codex/Claude are run with a non-default home (corporate provisioning). These are
+// purely ADDITIVE: the standard ~/.codex and ~/.claude (and the CODEX_HOME /
+// CLAUDE_CONFIG_DIR env dirs) are ALWAYS scanned too — a dir listed here is added to
+// that set, never a replacement. The daemon runs under launchd/systemd/schtasks and
+// does not inherit the user's shell env, so `blamely install` captures the env dirs
+// into here and users/admins can add more with `blamely config add tools.codex_home`.
+type ToolsConfig struct {
+	// CodexHomes are extra Codex home dirs (each contains sessions/ + config.toml),
+	// added to ~/.codex and $CODEX_HOME.
+	CodexHomes []string `json:"codex_homes,omitempty"`
+	// ClaudeConfigDirs are extra Claude config dirs (each contains projects/ +
+	// settings.json), added to ~/.claude and $CLAUDE_CONFIG_DIR.
+	ClaudeConfigDirs []string `json:"claude_config_dirs,omitempty"`
+}
+
 // Config is the user-editable CLI configuration at ~/.blamely/config.json.
 type Config struct {
-	Note NoteConfig `json:"note"`
+	Note  NoteConfig  `json:"note"`
+	Tools ToolsConfig `json:"tools"`
 }
 
 // DefaultConfig returns the default note settings: everything on except
@@ -158,6 +175,135 @@ func (c *Config) SetBool(key string, val bool) (ok bool) {
 		return false
 	}
 	return true
+}
+
+// ListKeys returns the settable list-valued keys (extra tool dirs) in display
+// order. The canonical form is dotted; a bare/singular suffix is also accepted
+// (see normListKey), so `blamely config add tools.codex_home <path>` works.
+func ListKeys() []string {
+	return []string{
+		"tools.codex_homes",
+		"tools.claude_config_dirs",
+	}
+}
+
+// normListKey canonicalises a list key: lowercases, trims, drops an optional
+// "tools." prefix, and folds the singular spelling to the plural field name so
+// both `tools.codex_home` and `tools.codex_homes` resolve to CodexHomes.
+func normListKey(key string) string {
+	k := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(key)), "tools.")
+	switch k {
+	case "codex_home", "codex_homes":
+		return "codex_homes"
+	case "claude_config_dir", "claude_config_dirs":
+		return "claude_config_dirs"
+	}
+	return k
+}
+
+// CanonicalListKey maps a user-supplied list key (bare/singular/dotted, any case)
+// to its canonical dotted form for display. Falls back to the input if unknown.
+func CanonicalListKey(userKey string) string {
+	switch normListKey(userKey) {
+	case "codex_homes":
+		return "tools.codex_homes"
+	case "claude_config_dirs":
+		return "tools.claude_config_dirs"
+	}
+	return userKey
+}
+
+// GetList returns the values of a list key. ok=false for unknown keys.
+func (c Config) GetList(key string) (val []string, ok bool) {
+	switch normListKey(key) {
+	case "codex_homes":
+		return c.Tools.CodexHomes, true
+	case "claude_config_dirs":
+		return c.Tools.ClaudeConfigDirs, true
+	}
+	return nil, false
+}
+
+// AddToList appends a value to a list key if not already present. Returns
+// ok=false for unknown keys, added=false when the value was already there.
+func (c *Config) AddToList(key, value string) (added, ok bool) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return false, true
+	}
+	appendUnique := func(list *[]string) (bool, bool) {
+		for _, e := range *list {
+			if e == v {
+				return false, true
+			}
+		}
+		*list = append(*list, v)
+		return true, true
+	}
+	switch normListKey(key) {
+	case "codex_homes":
+		return appendUnique(&c.Tools.CodexHomes)
+	case "claude_config_dirs":
+		return appendUnique(&c.Tools.ClaudeConfigDirs)
+	}
+	return false, false
+}
+
+// RemoveFromList drops a value from a list key. Returns ok=false for unknown
+// keys, removed=false when the value was not present.
+func (c *Config) RemoveFromList(key, value string) (removed, ok bool) {
+	v := strings.TrimSpace(value)
+	dropVal := func(list *[]string) (bool, bool) {
+		out := (*list)[:0]
+		found := false
+		for _, e := range *list {
+			if e == v {
+				found = true
+				continue
+			}
+			out = append(out, e)
+		}
+		*list = out
+		return found, true
+	}
+	switch normListKey(key) {
+	case "codex_homes":
+		return dropVal(&c.Tools.CodexHomes)
+	case "claude_config_dirs":
+		return dropVal(&c.Tools.ClaudeConfigDirs)
+	}
+	return false, false
+}
+
+// CaptureToolDirsFromEnv persists any custom Codex/Claude home set in the current
+// environment ($CODEX_HOME / $CLAUDE_CONFIG_DIR) into config.Tools, but ONLY when it
+// differs from the home default — the default is always scanned, so recording it
+// would be redundant. This is how the daemon (which does not inherit the installing
+// shell's env) learns to watch a corporate tool dir. Idempotent: AddToList dedupes,
+// and it writes only when something changed.
+func CaptureToolDirsFromEnv() error {
+	home, _ := Home()
+	cfg := LoadConfig()
+	changed := false
+	if v := strings.TrimSpace(os.Getenv("CODEX_HOME")); v != "" {
+		if home == "" || filepath.Clean(v) != filepath.Join(home, ".codex") {
+			if added, _ := cfg.AddToList("codex_homes", v); added {
+				changed = true
+			}
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); v != "" {
+		if home == "" || filepath.Clean(v) != filepath.Join(home, ".claude") {
+			if added, _ := cfg.AddToList("claude_config_dirs", v); added {
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return nil
+	}
+	_, err := SaveConfig(cfg)
+	return err
 }
 
 // ParseBoolValue accepts the usual true/false plus friendly on/off and yes/no

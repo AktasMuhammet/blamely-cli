@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Blamely
+Comment=AI code attribution for git
+Exec=blamely
+Icon=blamely
+Categories=Development;Utility;
+Terminal=true

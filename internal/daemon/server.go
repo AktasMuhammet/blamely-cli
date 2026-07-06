@@ -492,6 +492,14 @@ func validateAndStore(db *store.DB, p EditPayload) error {
 		e.Model.String = p.Model
 	}
 
+	// raw_meta must be set BEFORE enrichChatEdit: the enrich step inspects it to
+	// recognise an authoritative Cursor Tab-log completion (source=cursor_tab_log)
+	// and leave its gen_type alone.
+	if p.RawMeta != "" {
+		e.RawMeta.Valid = true
+		e.RawMeta.String = p.RawMeta
+	}
+
 	enrichChatEdit(db, &e)
 
 	setNullInt(&e.InputTokens, p.InputTokens)
@@ -505,10 +513,6 @@ func validateAndStore(db *store.DB, p EditPayload) error {
 	if p.HashAfter != "" {
 		e.HashAfter.Valid = true
 		e.HashAfter.String = p.HashAfter
-	}
-	if p.RawMeta != "" {
-		e.RawMeta.Valid = true
-		e.RawMeta.String = p.RawMeta
 	}
 	for _, r := range p.Lines {
 		if r.Start <= 0 || r.End < r.Start {
@@ -607,6 +611,24 @@ const chatModelWindowNanos = int64(30 * 60 * 1e9) // 30 minutes — sticky model
 // reflects the chat panel correctly. Runs for both copilot and cursor; a marker
 // only exists when the user actually used that tool's chat panel, so a pure
 // Tab-completion session is left as gen_type=completion.
+// editFromCursorTabLog reports whether an edit was recorded by the Cursor Tab
+// completion-log watcher (raw_meta.source == "cursor_tab_log"). Such an edit is
+// authoritative that its lines were an accepted Cursor Tab (inline) completion,
+// so its gen_type must not be upgraded to chat. Mirrors the gitnotes helper of
+// the same name (kept package-local to avoid a daemon→gitnotes import).
+func editFromCursorTabLog(e *store.Edit) bool {
+	if e == nil || e.Tool != store.ToolCursor || !e.RawMeta.Valid || e.RawMeta.String == "" {
+		return false
+	}
+	var meta struct {
+		Source string `json:"source"`
+	}
+	if json.Unmarshal([]byte(e.RawMeta.String), &meta) != nil {
+		return false
+	}
+	return meta.Source == "cursor_tab_log"
+}
+
 func enrichChatEdit(db *store.DB, e *store.Edit) {
 	switch e.Tool {
 	case store.ToolCopilot, store.ToolCursor:
@@ -617,8 +639,12 @@ func enrichChatEdit(db *store.DB, e *store.Edit) {
 	// Never override a CONFIRMED inline-completion accept. confidence=high on a
 	// completion means the editor plugin saw the inline-suggest commit command
 	// (or IDE accept action) fire — that's a real Tab/inline accept, not a chat
-	// apply, even if the user happened to have a chat panel open nearby.
-	confirmedCompletion := e.Confidence == store.ConfidenceHigh && e.GenType == store.GenTypeCompletion
+	// apply, even if the user happened to have a chat panel open nearby. A Cursor
+	// Tab-log edit is likewise authoritative: it comes from Cursor's own inline
+	// completion log, so it must stay a completion even though it's recorded at
+	// medium confidence (repro: 7e1f1912 — Tab completions relabelled chat).
+	confirmedCompletion := e.GenType == store.GenTypeCompletion &&
+		(e.Confidence == store.ConfidenceHigh || editFromCursorTabLog(e))
 	if e.GenType != store.GenTypeChat && !confirmedCompletion {
 		if recent := db.LatestChatGenTypeNear(e.Tool, now, chatEnrichWindowNanos); recent == string(store.GenTypeChat) {
 			e.GenType = store.GenTypeChat

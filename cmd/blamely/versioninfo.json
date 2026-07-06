@@ -1,0 +1,17 @@
+{
+  "FixedFileInfo": {
+    "FileVersion":    { "Major": 1, "Minor": 6, "Patch": 7, "Build": 0 },
+    "ProductVersion": { "Major": 1, "Minor": 6, "Patch": 7, "Build": 0 },
+    "FileFlagsMask": "3f", "FileFlags": "00", "FileOS": "040004",
+    "FileType": "01", "FileSubType": "00"
+  },
+  "StringFileInfo": {
+    "CompanyName":      "Blamely",
+    "ProductName":      "Blamely",
+    "FileDescription":  "Blamely CLI — per-line AI-vs-human code attribution",
+    "OriginalFilename": "blamely.exe",
+    "InternalName":     "blamely",
+    "LegalCopyright":   "Blamely"
+  },
+  "VarFileInfo": { "Translation": { "LangID": "0409", "CharsetID": "04B0" } }
+}

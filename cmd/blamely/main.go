@@ -39,7 +39,7 @@ func init() {
 // JetBrains plugins. The release workflow can still override it at link time via
 // `-ldflags "-X main.version=<tag>"`; otherwise this hardcoded value is what
 // `blamely --version` reports.
-var version = "1.6.6"
+var version = "1.6.7"
 
 // resolveVersion returns the effective CLI version. Precedence:
 //  1. an explicit -ldflags override (release builds);
@@ -838,19 +838,23 @@ func cmdConfig() *cobra.Command {
 		Short: "View or change what blamely writes into commit notes",
 		Long: "Manage ~/.blamely/config.json. Every toggle defaults to on; turning one\n" +
 			"off keeps it out of future commit notes (existing notes are untouched).\n\n" +
-			"Keys: " + strings.Join(config.NoteKeys(), ", ") + "\n\n" +
+			"Keys: " + strings.Join(config.NoteKeys(), ", ") + "\n" +
+			"List keys (extra AI-tool dirs, additive to the defaults): " +
+			strings.Join(config.ListKeys(), ", ") + "\n\n" +
 			"Examples:\n" +
 			"  blamely config                       # show current settings\n" +
 			"  blamely config get note.conversation\n" +
 			"  blamely config set note.file_lines off\n" +
 			"  blamely config set tokens true       # 'note.' prefix optional\n" +
+			"  blamely config add tools.codex_home /path/to/.codex-corp/codex-config\n" +
+			"  blamely config remove tools.claude_config_dir /path/to/.claude-corp/claude-config\n" +
 			"  blamely config path",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runConfigShow(cmd)
 		},
 	}
-	c.AddCommand(cmdConfigShow(), cmdConfigGet(), cmdConfigSet(), cmdConfigPath())
+	c.AddCommand(cmdConfigShow(), cmdConfigGet(), cmdConfigSet(), cmdConfigAdd(), cmdConfigRemove(), cmdConfigPath())
 	return c
 }
 
@@ -874,6 +878,14 @@ func runConfigShow(cmd *cobra.Command) error {
 	for _, key := range config.NoteKeys() {
 		v, _ := cfg.GetBool(key)
 		fmt.Fprintf(cmd.OutOrStdout(), "  %-30s %v\n", key, v)
+	}
+	for _, key := range config.ListKeys() {
+		v, _ := cfg.GetList(key)
+		if len(v) == 0 {
+			fmt.Fprintf(cmd.OutOrStdout(), "  %-30s (default only)\n", key)
+		} else {
+			fmt.Fprintf(cmd.OutOrStdout(), "  %-30s %s\n", key, strings.Join(v, ", "))
+		}
 	}
 	return nil
 }
@@ -914,6 +926,61 @@ func cmdConfigSet() *cobra.Command {
 				return fmt.Errorf("save config: %w", err)
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "set %s = %v  (%s)\n", canonicalKey(args[0]), val, path)
+			return nil
+		},
+	}
+}
+
+func cmdConfigAdd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "add <key> <path>",
+		Short: "Add an extra AI-tool config dir (additive; defaults are always kept)",
+		Long: "Add an EXTRA Codex/Claude config directory to watch, for setups that run\n" +
+			"those tools from a non-default home (corporate provisioning). This is\n" +
+			"additive — the standard ~/.codex and ~/.claude are ALWAYS watched too.\n\n" +
+			"Keys: " + strings.Join(config.ListKeys(), ", "),
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg := config.LoadConfig()
+			added, ok := cfg.AddToList(args[0], args[1])
+			if !ok {
+				return fmt.Errorf("unknown list key %q (valid: %s)", args[0], strings.Join(config.ListKeys(), ", "))
+			}
+			if !added {
+				fmt.Fprintf(cmd.OutOrStdout(), "%s already present in %s\n", args[1], config.CanonicalListKey(args[0]))
+				return nil
+			}
+			path, err := config.SaveConfig(cfg)
+			if err != nil {
+				return fmt.Errorf("save config: %w", err)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "added %s to %s  (%s)\n", args[1], config.CanonicalListKey(args[0]), path)
+			return nil
+		},
+	}
+}
+
+func cmdConfigRemove() *cobra.Command {
+	return &cobra.Command{
+		Use:     "remove <key> <path>",
+		Aliases: []string{"rm"},
+		Short:   "Remove an extra AI-tool config dir",
+		Args:    cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg := config.LoadConfig()
+			removed, ok := cfg.RemoveFromList(args[0], args[1])
+			if !ok {
+				return fmt.Errorf("unknown list key %q (valid: %s)", args[0], strings.Join(config.ListKeys(), ", "))
+			}
+			if !removed {
+				fmt.Fprintf(cmd.OutOrStdout(), "%s was not in %s\n", args[1], config.CanonicalListKey(args[0]))
+				return nil
+			}
+			path, err := config.SaveConfig(cfg)
+			if err != nil {
+				return fmt.Errorf("save config: %w", err)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "removed %s from %s  (%s)\n", args[1], config.CanonicalListKey(args[0]), path)
 			return nil
 		},
 	}

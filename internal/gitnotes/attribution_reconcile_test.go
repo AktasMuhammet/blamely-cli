@@ -374,6 +374,101 @@ func TestReconcileAddsFromEdits_SkipsWholeFileWrite(t *testing.T) {
 	}
 }
 
+// TestReconcileAddsFromEdits_TrustsCursorWholeFileWrite verifies the Cursor
+// exception: Cursor's agent applies edits via its "Write" tool (recorded as a
+// whole-file write), and its editor plugin mis-records those added lines as Human
+// in the working log. Unlike Claude/Copilot Writes — which stay excluded (see
+// TestReconcileAddsFromEdits_SkipsWholeFileWrite) — a Cursor Write's content_shas
+// ARE trusted here, so the AI-authored lines are reclaimed. Repro of commits
+// a0cefeeb / 0da3364f (24 cursor-added <option> lines shown as Human).
+func TestReconcileAddsFromEdits_TrustsCursorWholeFileWrite(t *testing.T) {
+	db, err := store.OpenAt(filepath.Join(t.TempDir(), "test.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	defer db.Close()
+
+	const repo, file = "/repo", "simple-arcgive-document.html"
+	opt := `        <option value="engineering">Engineering</option>`
+	// A cursor agent apply, recorded via the PostToolUse hook as a whole-file Write.
+	if _, err := db.InsertEdit(store.Edit{
+		TimestampNanos: 1000, RepoPath: repo, FilePath: file,
+		Tool: "cursor", Confidence: "high", GenType: "chat",
+		Model:   sql.NullString{String: "composer-2.5", Valid: true},
+		RawMeta: sql.NullString{String: `{"session_id":"s","tool":"Write","cursor_version":"3.9.16","transcript_path":"t"}`, Valid: true},
+		Lines:   editLines(opt),
+	}); err != nil {
+		t.Fatalf("InsertEdit: %v", err)
+	}
+
+	fe := &FileEntry{Path: file}
+	addRange(fe, 118, 118, "Human", "", "") // working-log fold left it Human
+	note := &Note{Schema: 2, Files: []FileEntry{*fe}}
+	added := []AddedLine{{File: file, LineNum: 118, Content: opt}}
+
+	reconcileAddsFromEdits(db, repo, 2000, note, added)
+
+	r := addRangeAuthor(t, note, file, 118)
+	if r.AuthorType != "AI" || r.Tool != "cursor" || ptrStr(r.GenType) != "chat" {
+		t.Errorf("line 118: want AI/cursor/chat (Cursor Write trusted), got %s/%s/%s",
+			r.AuthorType, r.Tool, ptrStr(r.GenType))
+	}
+	if note.Totals.AILines != 1 || note.Totals.HumanLines != 0 {
+		t.Errorf("split: want AI=1 Human=0, got AI=%d Human=%d", note.Totals.AILines, note.Totals.HumanLines)
+	}
+}
+
+// TestReconcileAddsFromEdits_CursorTabBeatsCopypaste verifies the Cursor Tab
+// precedence: when the SAME line is recorded by both the plugin's heuristic
+// copypaste edit AND Cursor's authoritative Tab-log completion, the Tab-log
+// completion wins (AI/cursor), because Cursor's own log proves it was an accepted
+// inline suggestion, not a clipboard paste. Repro of commit 7e1f1912.
+func TestReconcileAddsFromEdits_CursorTabBeatsCopypaste(t *testing.T) {
+	db, err := store.OpenAt(filepath.Join(t.TempDir(), "test.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	defer db.Close()
+
+	const repo, file = "/repo", "simple-arcgive-document.html"
+	line := `        <option value="security">Security</option>`
+	// The plugin mis-recorded the accepted Tab suggestion as a clipboard paste.
+	if _, err := db.InsertEdit(store.Edit{
+		TimestampNanos: 1000, RepoPath: repo, FilePath: file,
+		Tool: "copypaste", Confidence: "high", GenType: "human",
+		RawMeta: sql.NullString{String: `{"source":"vscode_plugin","host":"Cursor","signal":"clipboard_paste"}`, Valid: true},
+		Lines:   editLines(line),
+	}); err != nil {
+		t.Fatalf("InsertEdit copypaste: %v", err)
+	}
+	// Cursor's Tab log independently recorded the same line as an accepted completion.
+	if _, err := db.InsertEdit(store.Edit{
+		TimestampNanos: 1100, RepoPath: repo, FilePath: file,
+		Tool: "cursor", Confidence: "medium", GenType: "completion",
+		Model:   sql.NullString{String: "composer-2.5", Valid: true},
+		RawMeta: sql.NullString{String: `{"source":"cursor_tab_log"}`, Valid: true},
+		Lines:   editLines(line),
+	}); err != nil {
+		t.Fatalf("InsertEdit cursor-tab: %v", err)
+	}
+
+	fe := &FileEntry{Path: file}
+	addRange(fe, 200, 200, "Human", "", "") // working-log fold left it Human
+	note := &Note{Schema: 2, Files: []FileEntry{*fe}}
+	added := []AddedLine{{File: file, LineNum: 200, Content: line}}
+
+	reconcileAddsFromEdits(db, repo, 2000, note, added)
+
+	r := addRangeAuthor(t, note, file, 200)
+	if r.AuthorType != "AI" || r.Tool != "cursor" || ptrStr(r.GenType) != "completion" {
+		t.Errorf("line 200: want AI/cursor/completion (Tab log beats copypaste), got %s/%s/%s",
+			r.AuthorType, r.Tool, ptrStr(r.GenType))
+	}
+	if note.Totals.AILines != 1 || note.Totals.HumanLines != 0 {
+		t.Errorf("split: want AI=1 Human=0, got AI=%d Human=%d", note.Totals.AILines, note.Totals.HumanLines)
+	}
+}
+
 // TestReconcileAddsFromEdits_NoFalsePositive verifies a human-typed line whose
 // content was never recorded by any AI tool is left Human.
 func TestReconcileAddsFromEdits_NoFalsePositive(t *testing.T) {

@@ -43,7 +43,9 @@ func Detect() (*Detected, error) {
 
 func detectClaude() ToolPresence {
 	var hints []string
-	if settings, err := config.ClaudeSettingsPath(); err == nil {
+	// Check every Claude config location in the union (default + custom), so a
+	// corp CLAUDE_CONFIG_DIR counts as "present" too.
+	for _, settings := range config.ClaudeSettingsPaths() {
 		if fileExists(settings) {
 			hints = append(hints, settings)
 		} else if dirExists(filepath.Dir(settings)) {
@@ -111,12 +113,13 @@ func cursorCandidates(home string) []string {
 
 func detectCodex() ToolPresence {
 	var hints []string
-	if dir, err := config.CodexSessionsDir(); err == nil && pathExists(dir) {
-		hints = append(hints, dir)
-	}
-	if home, err := config.Home(); err == nil {
-		if p := filepath.Join(home, ".codex"); pathExists(p) {
-			hints = append(hints, p)
+	// Every Codex home in the union (default + custom): the sessions/ dir if present,
+	// else the base dir itself.
+	for _, base := range config.CodexBaseDirs() {
+		if s := filepath.Join(base, "sessions"); pathExists(s) {
+			hints = append(hints, s)
+		} else if pathExists(base) {
+			hints = append(hints, base)
 		}
 	}
 	if path, ok := lookPath("codex"); ok {

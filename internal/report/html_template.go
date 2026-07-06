@@ -1,14 +1,27 @@
 package report
 
-import "html/template"
+import (
+	"html/template"
+	"strings"
+)
 
 // htmlTmpl renders htmlVM into a self-contained dark dashboard. No JS and no
-// external scripts; web fonts are progressive enhancement over a system-font
-// fallback, and every icon is an inline SVG, so the file renders fully offline.
-// Per-element colors are applied via CSS custom properties set by a class from a
-// fixed name set (e.g. .t-claude{--tc:…}), never by interpolating a color into a
-// style attribute, so html/template's CSS sanitizer can't blank them out.
-var htmlTmpl = template.Must(template.New("report").Parse(htmlSource))
+// external scripts; the two web fonts are BUNDLED and inlined as base64 @font-face
+// (see fonts.go), so the report renders in IBM Plex Sans / JetBrains Mono with no
+// network call — nothing leaves the machine. Every icon is an inline SVG, so the
+// file is fully offline. Per-element colors are applied via CSS custom properties
+// set by a class from a fixed name set (e.g. .t-claude{--tc:…}), never by
+// interpolating a color into a style attribute, so html/template's CSS sanitizer
+// can't blank them out.
+//
+// The @font-face <style> is spliced in (as static template text, not an action, so
+// html/template never sanitizes the base64) where fontFacePlaceholder sits in the
+// <head>.
+var htmlTmpl = template.Must(template.New("report").Parse(
+	strings.Replace(htmlSource, fontFacePlaceholder, fontFaceStyle(), 1)))
+
+// fontFacePlaceholder marks where the bundled @font-face block is injected.
+const fontFacePlaceholder = "<!--BLAMELY_FONTS-->"
 
 const htmlSource = `<!DOCTYPE html>
 <html lang="en">
@@ -16,8 +29,7 @@ const htmlSource = `<!DOCTYPE html>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>Blamely · {{.ShortHash}}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"/>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
+<!--BLAMELY_FONTS-->
 <style>
 :root{
   --acc:#10b981; --acc2:#34d399; --red:#f0717f; --amber:#e0a33a; --blue:#5aa2f5; --cyan:#56c5d0; --violet:#bd93f5;

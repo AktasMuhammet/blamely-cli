@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/daemon"
 	"github.com/blamely/blamely/internal/gitutil"
 )
@@ -757,21 +758,21 @@ func cursorTranscriptPath(cwd, sessionID string) string {
 // claudeTranscriptPath derives the Claude CLI/Code transcript JSONL path for a
 // given project working directory and session UUID. Claude stores transcripts at:
 //
-//	~/.claude/projects/<cwd-encoded>/<session-id>.jsonl
+//	<claude-config-dir>/projects/<cwd-encoded>/<session-id>.jsonl
 //
-// where <cwd-encoded> replaces ALL slashes (including the leading /) with -.
-// Returns "" if the file doesn't exist.
+// where <cwd-encoded> replaces ALL slashes (including the leading /) with -, and
+// <claude-config-dir> is ~/.claude by default or a custom CLAUDE_CONFIG_DIR/corp
+// dir. Checks EVERY dir in the union and returns the first existing transcript, or
+// "" if none exists.
 func claudeTranscriptPath(cwd, sessionID string) string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
 	proj := strings.ReplaceAll(filepath.ToSlash(cwd), "/", "-")
-	p := filepath.Join(home, ".claude", "projects", proj, sessionID+".jsonl")
-	if _, err := os.Stat(p); err != nil {
-		return ""
+	for _, base := range config.ClaudeProjectsDirs() {
+		p := filepath.Join(base, proj, sessionID+".jsonl")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
 	}
-	return p
+	return ""
 }
 
 // resolveSymlinks returns the canonical path with symlinks resolved.

@@ -30,9 +30,12 @@ import (
 
 // deleteFileDirectiveRe matches the `*** Delete File: <path>` line of an
 // apply_patch tool call as it appears (JSON-escaped) inside a chat-session JSONL.
-// The path runs until the JSON string escape (\) that precedes the patch's
-// newline, a closing quote, or a real newline.
-var deleteFileDirectiveRe = regexp.MustCompile(`\*\*\* Delete File: ([^"\\\n]+)`)
+// The path is a run of either a JSON-escaped backslash (`\\`, a Windows path
+// separator) or any char that is not a quote or a lone backslash — so it stops
+// at the JSON escape that ends the line (`\n`/`\r`/`\"`) but does NOT truncate a
+// Windows path at its first separator. The captured group still carries doubled
+// backslashes; ChatSessionDeletedFiles unescapes them.
+var deleteFileDirectiveRe = regexp.MustCompile(`\*\*\* Delete File: ((?:\\\\|[^"\\\n])+)`)
 
 // ChatSessionDeletedFiles scans a VS Code / Cursor chat-session JSONL for
 // `*** Delete File: <path>` directives — the apply_patch form a Copilot or Cursor
@@ -59,7 +62,9 @@ func ChatSessionDeletedFiles(path string) []string {
 			continue
 		}
 		for _, m := range deleteFileDirectiveRe.FindAllStringSubmatch(sc.Text(), -1) {
-			p := strings.TrimSpace(m[1])
+			// Undo JSON escaping so a Windows path stored as `C:\\proj\\x.html`
+			// becomes the real `C:\proj\x.html` before path matching.
+			p := strings.TrimSpace(strings.ReplaceAll(m[1], `\\`, `\`))
 			if p != "" && !seen[p] {
 				seen[p] = true
 				out = append(out, p)
