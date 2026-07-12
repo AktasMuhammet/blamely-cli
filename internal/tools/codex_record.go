@@ -24,9 +24,9 @@ type codexHookPayload struct {
 
 // RecordCodexFromStdin handles `blamely record codex` (Codex CLI PostToolUse).
 func RecordCodexFromStdin(r io.Reader) error {
-	raw, err := io.ReadAll(io.LimitReader(r, 8<<20))
+	raw, err := readHookPayload(r)
 	if err != nil {
-		return fmt.Errorf("read stdin: %w", err)
+		return err
 	}
 	var p codexHookPayload
 	if err := json.Unmarshal(raw, &p); err != nil {

@@ -202,6 +202,38 @@ func TestExtractClaudeRanges_EditDeletion(t *testing.T) {
 	}
 }
 
+// TestExtractClaudeRanges_StrReplace verifies Cursor's native partial-edit
+// tool is handled with Edit semantics, reading the target from Cursor's
+// `path` field. Regression: StrReplace payloads were silently dropped
+// (unknown tool_name), so every patched — not rewritten — Cursor chat turn
+// fell to Human at commit time.
+func TestExtractClaudeRanges_StrReplace(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "page.html")
+	if err := os.WriteFile(fp, []byte("<a>\n<b>new line</b>\n</a>\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(map[string]any{
+		"path":       fp, // Cursor uses `path`, not `file_path`
+		"old_string": "<a>\n</a>",
+		"new_string": "<a>\n<b>new line</b>\n</a>",
+	})
+	p := claudeHookPayload{ToolName: "StrReplace", ToolInput: raw}
+	file, ranges, suggested, _, _, err := extractClaudeRanges(p)
+	if err != nil {
+		t.Fatalf("extractClaudeRanges: %v", err)
+	}
+	if file != fp {
+		t.Errorf("file: want %q, got %q", fp, file)
+	}
+	if suggested != 1 {
+		t.Errorf("suggested: want 1 new line, got %d", suggested)
+	}
+	if len(ranges) != 1 || ranges[0].Start != 2 || ranges[0].End != 2 {
+		t.Errorf("ranges: want the new line at 2-2, got %+v", ranges)
+	}
+}
+
 // TestExtractClaudeRanges_MultiEditMixedDeletion: one sub-edit adds 2 lines,
 // another deletes 4. Suggested should sum both.
 func TestExtractClaudeRanges_MultiEditMixedDeletion(t *testing.T) {

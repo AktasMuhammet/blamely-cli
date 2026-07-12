@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/daemon"
 	"github.com/blamely/blamely/internal/store"
 )
@@ -311,4 +312,10 @@ func DebugGeminiLogs(ctx context.Context, out io.Writer) error {
 
 	tailToolEdits(ctx, out, store.ToolGemini, "gemini_hook")
 	return nil
+}
+
+// homeDir returns the user's home directory (best-effort).
+func homeDir() string {
+	h, _ := config.Home()
+	return h
 }

@@ -95,7 +95,9 @@ func writePostCommitScript(path, binaryPath string) error {
 BLAMELY=%q
 if [ ! -x "$BLAMELY" ]; then
     # 1. Try the stable install location under ~/.blamely/bin/.
+    #    On Windows (Git bash) the binary is blamely.exe.
     STABLE="$HOME/.blamely/bin/blamely"
+    [ -x "$STABLE" ] || STABLE="$STABLE.exe"
     if [ -x "$STABLE" ]; then
         BLAMELY="$STABLE"
     elif command -v blamely >/dev/null 2>&1; then

@@ -174,7 +174,7 @@ func (db *DB) InsertEdit(e Edit) (int64, error) {
 // EditsForFileSince returns edits touching repo/file with ts >= sinceNanos.
 // Sorted by confidence DESC then ts DESC so that high-confidence records
 // (PostToolUse hooks) are always preferred over medium/low-confidence records
-// (log watchers, VelocityWatcher) for the same line, regardless of which
+// (log watchers) for the same line, regardless of which
 // fired last. Within the same confidence level, newest wins.
 func (db *DB) EditsForFileSince(repo, file string, sinceNanos int64) ([]Edit, error) {
 	return db.editsForFileWhere(
@@ -358,21 +358,6 @@ func (db *DB) UpgradeRecentCompletionsToChat(tool Tool, tsNanos, windowNanos int
 		return fmt.Errorf("upgrade completions to chat: %w", err)
 	}
 	return nil
-}
-
-// HasCopilotSessionNear returns true when at least one copilot session-active
-// marker exists in the DB for repoPath with a timestamp inside [ts-window, ts+window].
-// Used by the attribution step to fold in Copilot attribution for lines that
-// have no other AI edit record.
-// repoPath filters to the same repository so Copilot activity in an unrelated
-// repo open in a different editor window doesn't pollute this commit's attribution.
-func (db *DB) HasCopilotSessionNear(repoPath string, tsNanos, windowNanos int64) bool {
-	row := db.QueryRow(`SELECT COUNT(*) FROM edits
-		WHERE tool='copilot' AND repo_path=? AND ts >= ? AND ts <= ?`,
-		repoPath, tsNanos-windowNanos, tsNanos+windowNanos)
-	var count int
-	_ = row.Scan(&count)
-	return count > 0
 }
 
 // KnownCommits returns all noted commits for the given repos, ordered by ts desc.
@@ -673,7 +658,7 @@ func (db *DB) ChatSessionPathsForPeriod(repoPath string, sinceNanos, untilNanos 
 }
 
 // KnownRepoPaths returns all distinct repo_path values from the edits table.
-// Used by the VelocityWatcher to know which dirs to watch with fsnotify.
+// Used by the history report to know which repos to include by default.
 func (db *DB) KnownRepoPaths() ([]string, error) {
 	rows, err := db.Query(`SELECT DISTINCT repo_path FROM edits WHERE repo_path != ''`)
 	if err != nil {

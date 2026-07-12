@@ -70,6 +70,8 @@ func AttributeWorkingTree(repoPath string) (*Note, error) {
 	// Fold deletions into the generation breakdown so `blamely stats` bars cover all
 	// changed lines, not just additions (mirrors AttributeAndWrite).
 	recomputeByGenType(note)
+	// Per-file AI/Human added+deleted split, from the same settled ranges.
+	recomputeFileLineSplits(note)
 	return note, nil
 }
 

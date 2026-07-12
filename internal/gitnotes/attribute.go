@@ -191,8 +191,20 @@ type FileEntry struct {
 	// names the source pre-commit path.
 	RenamedFrom string `json:"renamed_from,omitempty"`
 	CopiedFrom  string `json:"copied_from,omitempty"`
-	Added       int    `json:"added"`
-	Deleted     int    `json:"deleted"`
+	// Added/Deleted are the file's line-change totals, serialized under the
+	// same key names the Totals block uses (added_lines / deleted_lines; the
+	// pre-1.x keys were the bare added / deleted, still accepted on read).
+	// The four *_lines splits mirror the Totals keys at file scope
+	// (ai_added_lines + human_added_lines == added_lines, likewise for
+	// deletes) and are filled by recomputeFileLineSplits from the settled
+	// ranges after every flip/reconcile pass, so consumers get the split
+	// without re-summing Lines.
+	Added        int `json:"added_lines"`
+	Deleted      int `json:"deleted_lines"`
+	AIAdded      int `json:"ai_added_lines,omitempty"`
+	HumanAdded   int `json:"human_added_lines,omitempty"`
+	AIDeleted    int `json:"ai_deleted_lines,omitempty"`
+	HumanDeleted int `json:"human_deleted_lines,omitempty"`
 	// Lines holds the attribution as collapsed ranges (schema 2): consecutive
 	// lines sharing the same (type, author_type, tool, model, gen_type) are
 	// merged into one RangeEntry. Added/Deleted above stay line-accurate.
@@ -200,6 +212,29 @@ type FileEntry struct {
 	// acc is the per-line accumulation buffer used while building the note; it
 	// is collapsed into Lines at flush time and never serialized.
 	acc []LineEntry
+}
+
+// UnmarshalJSON reads a FileEntry, accepting notes written by older blamely
+// versions that used the bare keys added / deleted (now added_lines /
+// deleted_lines), so `blamely report` on an old commit still shows the right
+// per-file counts.
+func (f *FileEntry) UnmarshalJSON(data []byte) error {
+	type alias FileEntry
+	aux := struct {
+		*alias
+		LegacyAdded   *int `json:"added"`
+		LegacyDeleted *int `json:"deleted"`
+	}{alias: (*alias)(f)}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if f.Added == 0 && aux.LegacyAdded != nil {
+		f.Added = *aux.LegacyAdded
+	}
+	if f.Deleted == 0 && aux.LegacyDeleted != nil {
+		f.Deleted = *aux.LegacyDeleted
+	}
+	return nil
 }
 
 // RangeEntry is a contiguous run of added or deleted lines that share the same
@@ -743,6 +778,8 @@ func attributeAndWriteEx(repoPath, sha string, replayOverride *replayCtx) (*Note
 	// Fold deletions into the generation breakdown (the add-recompute above reset it
 	// to additions only), so the Generation bars cover all changed lines.
 	recomputeByGenType(note)
+	// Per-file AI/Human added+deleted split, from the same settled ranges.
+	recomputeFileLineSplits(note)
 	// Token usage: the Human skeleton attaches no edit per line, so buildNote's
 	// token aggregation never runs for AI tools (leaving tokens nil). Now that the
 	// flip has settled which tools contributed, sum their recorded usage from the

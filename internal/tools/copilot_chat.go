@@ -622,7 +622,9 @@ func (w *chatSessionWatcher) recordTextEditGroup(teg *textEditGroupPart, model, 
 	}
 	abs := teg.URI.FsPath
 	if abs == "" {
-		abs = teg.URI.Path
+		// URI.Path carries a spurious leading slash before a Windows drive
+		// letter ("/c:/Users/..."); fsPath is the OS-native form when present.
+		abs = stripWindowsDriveSlash(teg.URI.Path)
 	}
 	if abs == "" || (teg.URI.Scheme != "" && teg.URI.Scheme != "file") {
 		return

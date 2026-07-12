@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -115,10 +116,36 @@ func TestExtractFilePath_AbsPath(t *testing.T) {
 	}
 }
 
+func TestExtractFilePath_WindowsPaths(t *testing.T) {
+	cases := []struct{ line, want string }{
+		// Any drive letter, either case, either separator.
+		{`writing C:\proj\main.go done`, `C:\proj\main.go`},
+		{`writing e:\work\app\main.go done`, `e:\work\app\main.go`},
+		{`writing c:/Users/alice/repo/main.go done`, `c:/Users/alice/repo/main.go`},
+		// Percent-encoded drive colon inside a file URI (VS Code/Cursor form).
+		{`apply uri=file:///c%3A/Users/alice/repo/main.go rest`, `c:/Users/alice/repo/main.go`},
+		{`path="C:\proj\x.go" other=stuff`, `C:\proj\x.go`},
+	}
+	for _, c := range cases {
+		got, ok := extractFilePath(c.line)
+		if !ok {
+			t.Errorf("extractFilePath(%q): expected ok=true", c.line)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("extractFilePath(%q): want %q, got %q", c.line, c.want, got)
+		}
+	}
+}
+
 func TestExtractFilePath_NoPath(t *testing.T) {
-	_, ok := extractFilePath("no file path here")
-	if ok {
-		t.Error("expected ok=false when no path present")
+	for _, line := range []string{
+		"no file path here",
+		"fetching https://example.com/foo/bar", // URL scheme must not match as a drive path
+	} {
+		if _, ok := extractFilePath(line); ok {
+			t.Errorf("extractFilePath(%q): expected ok=false", line)
+		}
 	}
 }
 
@@ -414,5 +441,45 @@ func TestCursorWindowWorkspaceRoots(t *testing.T) {
 	// no exthost.log → empty, no panic
 	if r := cursorWindowWorkspaceRoots(filepath.Join(t.TempDir(), "x", "y", "Cursor Tab.log")); len(r) != 0 {
 		t.Errorf("missing exthost.log should yield no roots, got %v", r)
+	}
+}
+
+// TestCursorWindowWorkspaceRoots_EscapedCwd verifies that a JSON-escaped cwd
+// (Windows exthost.log holds "cwd":"c:\\Users\\...") is unescaped before the
+// directory stat. We JSON-encode a real temp dir so the log bytes carry the
+// escaped form regardless of platform.
+func TestCursorWindowWorkspaceRoots_EscapedCwd(t *testing.T) {
+	win := t.TempDir()
+	exthost := filepath.Join(win, "exthost")
+	tabDir := filepath.Join(exthost, "anysphere.cursor-always-local")
+	if err := os.MkdirAll(tabDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ws := t.TempDir()
+	enc, err := json.Marshal(ws) // `"...escaped..."` with quotes
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(exthost, "exthost.log"),
+		[]byte(`ExtHostSearch folderQueries=[{"cwd":`+string(enc)+`,"x":1}]`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	roots := cursorWindowWorkspaceRoots(filepath.Join(tabDir, "Cursor Tab.log"))
+	if len(roots) != 1 || roots[0] != ws {
+		t.Fatalf("cursorWindowWorkspaceRoots = %v, want [%s]", roots, ws)
+	}
+}
+
+func TestUnescapeJSONString(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{`c:\\Users\\alice\\repo`, `c:\Users\alice\repo`}, // Windows-escaped cwd
+		{`/Users/alice/repo`, `/Users/alice/repo`},         // fast path, no escapes
+		{`c:\Users\broken`, `c:\Users\broken`},             // invalid JSON escape → raw fallback
+		{`line\nbreak`, "line\nbreak"},
+	}
+	for _, c := range cases {
+		if got := unescapeJSONString(c.in); got != c.want {
+			t.Errorf("unescapeJSONString(%q): want %q, got %q", c.in, c.want, got)
+		}
 	}
 }

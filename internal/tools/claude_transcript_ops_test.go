@@ -27,6 +27,14 @@ func TestBashRedirectAndRmTargets(t *testing.T) {
 	if got := bashRedirectTargets("ls 2>/dev/null > out.txt"); !eq(got, []string{"out.txt"}) {
 		t.Errorf("redirect (dev filtered) = %v", got)
 	}
+	// Absolute targets are skipped — the result set is repo-relative. The
+	// Windows drive form must be skipped like the Unix form.
+	if got := bashRedirectTargets(`echo hi > C:\proj\out.txt`); got != nil {
+		t.Errorf("windows absolute redirect should be skipped, got %v", got)
+	}
+	if got := bashRedirectTargets(`echo hi > c:/proj/out.txt`); got != nil {
+		t.Errorf("windows absolute redirect (fwd slash) should be skipped, got %v", got)
+	}
 	d := bashRmTargets("rm muhamemt.html && git add -A && git commit -m \"Remove\"")
 	if !eq(d, []string{"muhamemt.html"}) {
 		t.Errorf("rm targets = %v", d)

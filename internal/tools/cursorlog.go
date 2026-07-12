@@ -20,6 +20,7 @@ package tools
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -504,7 +505,7 @@ func cursorWindowWorkspaceRoots(tabLogPath string) []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, m := range cursorCwdRe.FindAllSubmatch(data, -1) {
-		p := string(m[1])
+		p := unescapeJSONString(string(m[1]))
 		if p == "" || seen[p] {
 			continue
 		}
@@ -512,6 +513,22 @@ func cursorWindowWorkspaceRoots(tabLogPath string) []string {
 			seen[p] = true
 			out = append(out, p)
 		}
+	}
+	return out
+}
+
+// unescapeJSONString decodes a raw JSON string value captured by regex (no
+// surrounding quotes). On Windows the exthost.log cwd is JSON-escaped
+// ("c:\\Users\\name\\repo"); the doubled backslashes must be unescaped before
+// os.Stat. The regex capture can't contain a `"`, so re-wrapping is safe.
+// Falls back to the raw input if it isn't valid JSON.
+func unescapeJSONString(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s // fast path: nothing escaped (all Unix paths)
+	}
+	var out string
+	if err := json.Unmarshal([]byte(`"`+s+`"`), &out); err != nil {
+		return s
 	}
 	return out
 }
@@ -588,22 +605,42 @@ func extractFilePath(line string) (string, bool) {
 			return p, true
 		}
 	}
-	// Bare absolute path (Unix: starts with /, Windows: C:\ etc.).
-	for _, pfx := range []string{"/Users/", "/home/", "/var/", "/tmp/", "C:\\", "D:\\"} {
-		if i := strings.Index(line, pfx); i >= 0 {
-			rest := line[i:]
-			end := strings.IndexAny(rest, " \t\n\r\"'`}),")
-			if end < 0 {
-				end = len(rest)
-			}
-			p := strings.TrimSpace(rest[:end])
-			if len(p) > len(pfx) {
-				return p, true
-			}
+	// Bare absolute path (Unix: starts with /, Windows: any drive letter,
+	// either separator — VS Code/Cursor emit lowercase drives and both
+	// "c:\..." and "c:/..." forms). The EARLIEST match wins: "c:/Users/x"
+	// contains "/Users/" two bytes in, and only earliest-wins keeps the
+	// drive prefix instead of truncating to the embedded Unix form.
+	start, minLen := -1, 0
+	for _, pfx := range []string{"/Users/", "/home/", "/var/", "/tmp/"} {
+		if i := strings.Index(line, pfx); i >= 0 && (start < 0 || i < start) {
+			start, minLen = i, len(pfx)
+		}
+	}
+	if m := windowsDrivePathRe.FindStringSubmatchIndex(line); m != nil {
+		// m[2]: start of group 1 — the path itself, minus any preceding char.
+		if start < 0 || m[2] < start {
+			start, minLen = m[2], 3 // more than just "C:\"
+		}
+	}
+	if start >= 0 {
+		rest := line[start:]
+		end := strings.IndexAny(rest, " \t\n\r\"'`}),")
+		if end < 0 {
+			end = len(rest)
+		}
+		p := strings.TrimSpace(rest[:end])
+		if len(p) > minLen {
+			return p, true
 		}
 	}
 	return "", false
 }
+
+// windowsDrivePathRe matches the start of a bare Windows absolute path: any
+// drive letter (either case), either separator. The negative char classes
+// keep it from firing inside URLs ("https://...") — a URL's scheme letter is
+// preceded by more letters and followed by a double slash.
+var windowsDrivePathRe = regexp.MustCompile(`(?:^|[^A-Za-z0-9])([A-Za-z]:[\\/][^\\/])`)
 
 func emitCursorLogEvent(abs string, sink daemon.Sink) {
 	if _, err := os.Stat(abs); err != nil {

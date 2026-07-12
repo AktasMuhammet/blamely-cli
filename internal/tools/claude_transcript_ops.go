@@ -181,12 +181,25 @@ func bashRedirectTargets(cmd string) []string {
 	var out []string
 	for _, m := range redirectRe.FindAllStringSubmatch(cmd, -1) {
 		t := cleanTarget(m[1])
-		if t == "" || strings.HasPrefix(t, "/") {
+		if t == "" || isShellAbsPath(t) {
 			continue
 		}
 		out = append(out, t)
 	}
 	return out
+}
+
+// isShellAbsPath reports whether a shell token is an absolute path — Unix
+// ("/...", which also covers /dev/null-style stream targets) or Windows
+// drive-letter ("C:\..." / "c:/..."). Deliberately not filepath.IsAbs:
+// transcripts may be parsed on a different OS than they were written on, and
+// the check must behave the same everywhere.
+func isShellAbsPath(t string) bool {
+	if strings.HasPrefix(t, "/") {
+		return true
+	}
+	return len(t) > 2 && t[1] == ':' && (t[2] == '\\' || t[2] == '/') &&
+		('a' <= t[0] && t[0] <= 'z' || 'A' <= t[0] && t[0] <= 'Z')
 }
 
 // winDeleteRe matches Windows file-deletion verbs — cmd `del`/`erase` and
@@ -204,6 +217,9 @@ func shellDeleteTargets(cmd string) []string {
 		// Windows: backslash is a PATH SEPARATOR, not an escape (`C:\proj\x.html`).
 		for _, tok := range splitShellFields(m[1], false) {
 			tok = cleanTarget(tok)
+			// The "/" prefix filters cmd-style switches (`del /f /q x.html`),
+			// NOT absolute paths — Windows absolute targets are kept on
+			// purpose (see TestShellDeleteTargets).
 			if tok == "" || strings.HasPrefix(tok, "-") || strings.HasPrefix(tok, "/") {
 				continue
 			}

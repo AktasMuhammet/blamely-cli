@@ -19,7 +19,7 @@ func CaptureBaselineFromStdin(r io.Reader) error {
 	if !authorship.Enabled() {
 		return nil
 	}
-	raw, err := io.ReadAll(io.LimitReader(r, 8<<20))
+	raw, err := readHookPayload(r)
 	if err != nil {
 		return nil // best-effort: a pre-hook must never block the tool
 	}

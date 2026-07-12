@@ -46,24 +46,36 @@ type claudeHookPayload struct {
 	GenType string `json:"gen_type"`
 }
 
+// The input structs accept both `file_path` (Claude's field) and `path`
+// (Cursor's native field, e.g. StrReplace/Write in agent transcripts and some
+// hook versions) — see target().
 type editInput struct {
 	FilePath  string `json:"file_path"`
+	Path      string `json:"path"`
 	OldString string `json:"old_string"`
 	NewString string `json:"new_string"`
 }
 
+func (in editInput) target() string { return firstNonEmpty(in.FilePath, in.Path) }
+
 type writeInput struct {
 	FilePath string `json:"file_path"`
+	Path     string `json:"path"`
 	Content  string `json:"content"`
 }
 
+func (in writeInput) target() string { return firstNonEmpty(in.FilePath, in.Path) }
+
 type multiEditInput struct {
 	FilePath string `json:"file_path"`
+	Path     string `json:"path"`
 	Edits    []struct {
 		OldString string `json:"old_string"`
 		NewString string `json:"new_string"`
 	} `json:"edits"`
 }
+
+func (in multiEditInput) target() string { return firstNonEmpty(in.FilePath, in.Path) }
 
 // deletePathFromInput pulls the target path out of a Cursor `Delete` tool's
 // input, accepting either `path` (Cursor's field) or `file_path` (the
@@ -100,9 +112,9 @@ func cursorGenType(p claudeHookPayload) string {
 // is distinguished by the presence of `cursor_version`: Cursor payloads
 // include it, Claude Code payloads do not.
 func RecordClaudeFromStdin(r io.Reader) error {
-	raw, err := io.ReadAll(io.LimitReader(r, 8<<20))
+	raw, err := readHookPayload(r)
 	if err != nil {
-		return fmt.Errorf("read stdin: %w", err)
+		return err
 	}
 	var p claudeHookPayload
 	if err := json.Unmarshal(raw, &p); err != nil {
@@ -595,12 +607,18 @@ func recentlyChangedFiles(root string, window time.Duration) []string {
 // some of the AI-produced lines.
 func extractClaudeRanges(p claudeHookPayload) (string, []LineRange, int64, []DeletedLineHash, *string, error) {
 	switch p.ToolName {
-	case "Edit":
+	case "Edit", "StrReplace":
+		// StrReplace is Cursor's native partial-edit tool — same
+		// old_string/new_string semantics as Claude's Edit, with the target
+		// under `path` instead of `file_path`. Without this case every
+		// Cursor chat turn that patches (rather than rewrites) a file was
+		// silently dropped and its lines fell to Human at commit time.
 		var in editInput
 		if err := json.Unmarshal(p.ToolInput, &in); err != nil {
-			return "", nil, 0, nil, nil, fmt.Errorf("parse Edit input: %w", err)
+			return "", nil, 0, nil, nil, fmt.Errorf("parse %s input: %w", p.ToolName, err)
 		}
-		if in.FilePath == "" {
+		file := in.target()
+		if file == "" {
 			return "", nil, 0, nil, nil, nil
 		}
 		removed := RemovedLineHashes(in.OldString, in.NewString)
@@ -613,28 +631,29 @@ func extractClaudeRanges(p claudeHookPayload) (string, []LineRange, int64, []Del
 		// human-edit watcher's `recent AI activity` lookup suppresses any
 		// competing human-edit row for the same file.
 		if strings.TrimSpace(in.NewString) == "" && in.OldString != "" {
-			return in.FilePath, nil, int64(countLines(in.OldString)), removed, nil, nil
+			return file, nil, int64(countLines(in.OldString)), removed, nil, nil
 		}
 		// Credit the AI only for the lines that are genuinely new — not for
 		// context lines that happen to be inside new_string for the match to
 		// be precise. We always compute the line-count diff so suggested
 		// stays accurate even when we can't locate the text in the file.
-		fullRange, err := LocateNewString(in.FilePath, in.NewString)
+		fullRange, err := LocateNewString(file, in.NewString)
 		if err != nil {
-			return in.FilePath, nil, CountAddedLines(in.OldString, in.NewString), removed, nil, err
+			return file, nil, CountAddedLines(in.OldString, in.NewString), removed, nil, err
 		}
 		if fullRange == nil {
-			return in.FilePath, nil, CountAddedLines(in.OldString, in.NewString), removed, nil, nil
+			return file, nil, CountAddedLines(in.OldString, in.NewString), removed, nil, nil
 		}
 		ranges, suggested := narrowToChangedLines(in.OldString, in.NewString, *fullRange)
-		return in.FilePath, ranges, suggested, removed, nil, nil
+		return file, ranges, suggested, removed, nil, nil
 
 	case "Write":
 		var in writeInput
 		if err := json.Unmarshal(p.ToolInput, &in); err != nil {
 			return "", nil, 0, nil, nil, fmt.Errorf("parse Write input: %w", err)
 		}
-		if in.FilePath == "" {
+		file := in.target()
+		if file == "" {
 			return "", nil, 0, nil, nil, nil
 		}
 		suggested := int64(countLines(in.Content))
@@ -651,16 +670,17 @@ func extractClaudeRanges(p claudeHookPayload) (string, []LineRange, int64, []Del
 		// falls outside and is mislabelled human. Per-line shas fix both.
 		ranges := perLineShaRangesFromContent(in.Content)
 		if len(ranges) == 0 {
-			return in.FilePath, nil, suggested, nil, &in.Content, nil
+			return file, nil, suggested, nil, &in.Content, nil
 		}
-		return in.FilePath, ranges, suggested, nil, &in.Content, nil
+		return file, ranges, suggested, nil, &in.Content, nil
 
 	case "MultiEdit":
 		var in multiEditInput
 		if err := json.Unmarshal(p.ToolInput, &in); err != nil {
 			return "", nil, 0, nil, nil, fmt.Errorf("parse MultiEdit input: %w", err)
 		}
-		if in.FilePath == "" {
+		file := in.target()
+		if file == "" {
 			return "", nil, 0, nil, nil, nil
 		}
 		var suggested int64
@@ -675,7 +695,7 @@ func extractClaudeRanges(p claudeHookPayload) (string, []LineRange, int64, []Del
 				suggested += int64(countLines(ed.OldString))
 				continue
 			}
-			lr, err := LocateNewString(in.FilePath, ed.NewString)
+			lr, err := LocateNewString(file, ed.NewString)
 			if err != nil || lr == nil {
 				// Can't locate, but still credit the AI's net-new line count.
 				suggested += CountAddedLines(ed.OldString, ed.NewString)
@@ -685,7 +705,7 @@ func extractClaudeRanges(p claudeHookPayload) (string, []LineRange, int64, []Del
 			out = append(out, narrowed...)
 			suggested += narrowSuggest
 		}
-		return in.FilePath, out, suggested, removed, nil, nil
+		return file, out, suggested, removed, nil, nil
 
 	case "NotebookEdit":
 		var in struct {
@@ -838,4 +858,20 @@ func postToDaemon(payload daemon.EditPayload) error {
 		return fmt.Errorf("daemon rejected: %s: %s", resp.Status, string(msg))
 	}
 	return nil
+}
+
+func looksLikeSourceFile(p string) bool {
+	// Skip hidden files, binaries, and common non-code extensions.
+	base := filepath.Base(p)
+	if strings.HasPrefix(base, ".") {
+		return false
+	}
+	ext := strings.ToLower(filepath.Ext(p))
+	skip := map[string]bool{
+		".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".svg": true,
+		".pdf": true, ".zip": true, ".tar": true, ".gz": true, ".exe": true,
+		".bin": true, ".dll": true, ".so": true, ".dylib": true, ".db": true,
+		".sqlite": true, ".sqlite3": true,
+	}
+	return !skip[ext]
 }

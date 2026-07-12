@@ -13,6 +13,24 @@ import (
 	"github.com/blamely/blamely/internal/store"
 )
 
+func TestFileURIToPath(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"file:///Users/alice/repo/main.go", "/Users/alice/repo/main.go"},
+		{"file:///Users/alice/my%20repo/main.go", "/Users/alice/my repo/main.go"},
+		// Windows drive URIs: the leading slash must be stripped, including
+		// when the drive colon is percent-encoded (VS Code-family form).
+		{"file:///C:/Users/alice/repo/main.go", "C:/Users/alice/repo/main.go"},
+		{"file:///c%3A/Users/alice/repo/main.go", "c:/Users/alice/repo/main.go"},
+		// Non-URI input passes through untouched.
+		{"/already/a/path.go", "/already/a/path.go"},
+	}
+	for _, c := range cases {
+		if got := fileURIToPath(c.in); got != c.want {
+			t.Errorf("fileURIToPath(%q): want %q, got %q", c.in, c.want, got)
+		}
+	}
+}
+
 func TestParseCodeActionEdit(t *testing.T) {
 	content := "Created At: 2026-06-07T21:00:59Z\nCompleted At: 2026-06-07T21:01:01Z\nThe following changes were made by the replace_file_content tool to: /Users/abdulkerimatik/development/training/gemini-test/index.html. If relevant, proactively run terminal commands to execute this code for the USER. Don't ask for permission.\n[diff_block_start]\n@@ -135,6 +135,16 @@\n           </svg>\n           GitHub\n         </button>\n+        <button type=\"button\" class=\"social-btn\" id=\"ldap-login-btn\">\n+          <svg></svg>\n+          LDAP\n+        </button>\n       </div>\n \n       <!-- Sign Up Prompt -->\n[diff_block_end]\n\nPlease note..."
 

@@ -67,6 +67,13 @@ WantedBy=default.target
 	return unitPath, nil
 }
 
+// EnsureDaemonAgent is the daemon's startup self-heal. On Linux systemd's
+// Restart=always already revives a crashed daemon and the user unit survives
+// reboots, so there is nothing to re-assert — restarting the unit from inside
+// the daemon would kill the caller. No-op by design; the Windows
+// implementation (Scheduled Tasks have no KeepAlive) does the real work.
+func EnsureDaemonAgent(string) error { return nil }
+
 func UninstallDaemonAgent() error {
 	home, err := config.Home()
 	if err != nil {

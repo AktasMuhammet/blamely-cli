@@ -309,6 +309,45 @@ func recomputeByGenType(note *Note) {
 	note.ByGenType = gt
 }
 
+// recomputeFileLineSplits fills each file's AI/Human added+deleted split from
+// its settled per-line ranges, mirroring the Totals JSON keys at file scope.
+// The AI share is summed from the ranges; the Human share is derived as the
+// file's total minus the AI share (never negative), so a note whose file_lines
+// were stripped by config still reports ai=0 / human=total instead of losing
+// lines. MUST run after the final pass that mutates range attribution
+// (flips, reconciles, transcript backfills) and before the note is persisted.
+func recomputeFileLineSplits(note *Note) {
+	if note == nil {
+		return
+	}
+	for i := range note.Files {
+		fe := &note.Files[i]
+		aiAdd, aiDel := 0, 0
+		for _, r := range fe.Lines {
+			if r.AuthorType != "AI" {
+				continue
+			}
+			n := r.NumLines()
+			switch r.Type {
+			case "add":
+				aiAdd += n
+			case "delete":
+				aiDel += n
+			}
+		}
+		if aiAdd > fe.Added {
+			aiAdd = fe.Added
+		}
+		if aiDel > fe.Deleted {
+			aiDel = fe.Deleted
+		}
+		fe.AIAdded = aiAdd
+		fe.HumanAdded = fe.Added - aiAdd
+		fe.AIDeleted = aiDel
+		fe.HumanDeleted = fe.Deleted - aiDel
+	}
+}
+
 // recomputeDeletedAggregates rebuilds the deleted-line totals + per-tool deleted
 // counts from the (now working-log-sourced) delete ranges.
 func recomputeDeletedAggregates(note *Note) {

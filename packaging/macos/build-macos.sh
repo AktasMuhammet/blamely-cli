@@ -87,9 +87,19 @@ pkgbuild \
   --install-location / \
   "$COMPONENT"
 
-# 3. Product (distribution) pkg — the double-clickable installer.
+# 3. Product (distribution) pkg — the double-clickable installer. Synthesize the
+#    distribution XML, then add a title and a conclusion pane so Installer.app
+#    shows the setup summary on its own final page (no extra dialogs; the
+#    postinstall stays silent in the GUI).
 #    (Add `productsign --sign "Developer ID Installer: …"` here once a cert exists.)
-productbuild --package "$COMPONENT" "$OUT/$PKG_NAME"
+DIST="$WORK/distribution.xml"
+productbuild --synthesize --package "$COMPONENT" "$DIST"
+sed -i '' 's|<installer-gui-script minSpecVersion="[0-9]*">|&\
+    <title>Blamely CLI</title>\
+    <conclusion file="conclusion.html"/>|' "$DIST"
+grep -q '<conclusion' "$DIST" || { echo "error: failed to inject conclusion pane into distribution.xml" >&2; exit 1; }
+productbuild --distribution "$DIST" --package-path "$WORK" \
+  --resources "$HERE/resources" "$OUT/$PKG_NAME"
 
 # 4. Wrap the pkg in a compressed .dmg so it's a single downloadable disk image.
 DMGROOT="$WORK/dmg"

@@ -374,62 +374,6 @@ func TestSessionDurationNanos_OnlyCountsOwnRepo(t *testing.T) {
 	}
 }
 
-func TestHasCopilotSessionNear_Present(t *testing.T) {
-	db := openTestDB(t)
-	now := int64(1_000_000_000_000)
-	_, _ = db.InsertEdit(Edit{
-		TimestampNanos: now,
-		RepoPath:       "/repo/a",
-		Tool:           ToolCopilot,
-		Confidence:     ConfidenceLow,
-	})
-	if !db.HasCopilotSessionNear("/repo/a", now, int64(60*1e9)) {
-		t.Error("expected HasCopilotSessionNear=true when marker is present in window")
-	}
-}
-
-func TestHasCopilotSessionNear_OutsideWindow(t *testing.T) {
-	db := openTestDB(t)
-	now := int64(1_000_000_000_000)
-	_, _ = db.InsertEdit(Edit{
-		TimestampNanos: now - int64(120*1e9), // 2 minutes before — outside 60s window
-		RepoPath:       "/repo/a",
-		Tool:           ToolCopilot,
-		Confidence:     ConfidenceLow,
-	})
-	if db.HasCopilotSessionNear("/repo/a", now, int64(60*1e9)) {
-		t.Error("expected HasCopilotSessionNear=false when marker is outside window")
-	}
-}
-
-func TestHasCopilotSessionNear_WrongTool(t *testing.T) {
-	db := openTestDB(t)
-	now := int64(1_000_000_000_000)
-	_, _ = db.InsertEdit(Edit{
-		TimestampNanos: now,
-		RepoPath:       "/repo/a",
-		Tool:           ToolHuman, // not copilot
-		Confidence:     ConfidenceHigh,
-	})
-	if db.HasCopilotSessionNear("/repo/a", now, int64(60*1e9)) {
-		t.Error("expected HasCopilotSessionNear=false for non-copilot tool")
-	}
-}
-
-func TestHasCopilotSessionNear_WrongRepo(t *testing.T) {
-	db := openTestDB(t)
-	now := int64(1_000_000_000_000)
-	_, _ = db.InsertEdit(Edit{
-		TimestampNanos: now,
-		RepoPath:       "/repo/other", // Copilot active in a DIFFERENT repo
-		Tool:           ToolCopilot,
-		Confidence:     ConfidenceLow,
-	})
-	if db.HasCopilotSessionNear("/repo/a", now, int64(60*1e9)) {
-		t.Error("expected HasCopilotSessionNear=false when Copilot session is in a different repo")
-	}
-}
-
 func TestPreviousCommitTimestampNanos_NoPrior(t *testing.T) {
 	db := openTestDB(t)
 	// No commits in the DB → should return 0 (include all AI records).

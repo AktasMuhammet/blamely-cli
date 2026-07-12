@@ -44,14 +44,34 @@ func TestUriToPath_NonFileScheme(t *testing.T) {
 }
 
 func TestUriToPath_WindowsPath(t *testing.T) {
-	// On Windows Cursor emits file:///C:/Users/... URIs.
-	// The function should strip the leading slash to get C:/Users/...
-	// We can test the string transformation on any OS.
-	got := uriToPath("file:///C:/Users/alice/repo/main.go")
-	// On non-Windows the function leaves the leading slash; on Windows it strips it.
-	// The important thing is: no empty result.
-	if got == "" {
-		t.Errorf("uriToPath for Windows-style URI should not be empty")
+	// On Windows Cursor emits file:///C:/Users/... URIs — often with a
+	// lowercase drive letter and a percent-encoded colon (c%3A). The drive
+	// strip is unconditional (a Unix path never starts with "/<letter>:/"),
+	// so the transformation is testable on any OS.
+	cases := []struct{ uri, want string }{
+		{"file:///C:/Users/alice/repo/main.go", "C:/Users/alice/repo/main.go"},
+		{"file:///c%3A/Users/alice/repo/main.go", "c:/Users/alice/repo/main.go"},
+		{"file:///c:/Users/alice/my%20repo/main.go", "c:/Users/alice/my repo/main.go"},
+	}
+	for _, c := range cases {
+		if got := uriToPath(c.uri); got != c.want {
+			t.Errorf("uriToPath(%q): want %q, got %q", c.uri, c.want, got)
+		}
+	}
+}
+
+func TestStripWindowsDriveSlash(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"/c:/Users/x/f.go", "c:/Users/x/f.go"},
+		{"/C:\\Users\\x\\f.go", "C:\\Users\\x\\f.go"},
+		{"/Users/alice/repo/main.go", "/Users/alice/repo/main.go"}, // Unix untouched
+		{"/1:/oddity", "/1:/oddity"},                               // not a drive letter
+		{"c:/already/stripped", "c:/already/stripped"},
+	}
+	for _, c := range cases {
+		if got := stripWindowsDriveSlash(c.in); got != c.want {
+			t.Errorf("stripWindowsDriveSlash(%q): want %q, got %q", c.in, c.want, got)
+		}
 	}
 }
 

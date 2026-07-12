@@ -26,9 +26,9 @@ type geminiHookPayload struct {
 
 // RecordGeminiFromStdin handles `blamely record gemini` (Gemini CLI AfterTool).
 func RecordGeminiFromStdin(r io.Reader) error {
-	raw, err := io.ReadAll(io.LimitReader(r, 8<<20))
+	raw, err := readHookPayload(r)
 	if err != nil {
-		return fmt.Errorf("read stdin: %w", err)
+		return err
 	}
 	var p geminiHookPayload
 	if err := json.Unmarshal(raw, &p); err != nil {

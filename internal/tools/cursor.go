@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -234,21 +235,34 @@ func (c *CursorWatcher) emit(manifest *cursorEntries, snapshot string, when time
 }
 
 // uriToPath decodes a "file:///" URI into a local path. Returns "" if the
-// resource isn't a local file. Handles macOS/Linux & basic Windows forms.
+// resource isn't a local file. Handles macOS/Linux & Windows forms, including
+// the percent-encoded drive colon VS Code/Cursor emit ("file:///c%3A/...").
 func uriToPath(uri string) string {
 	const prefix = "file://"
 	if !strings.HasPrefix(uri, prefix) {
 		return ""
 	}
 	p := uri[len(prefix):]
-	// "file:///Users/..." → "/Users/..."
-	// "file://C:/..."     → "C:/..."  (Windows form)
-	if strings.HasPrefix(p, "/") && runtime.GOOS == "windows" && len(p) > 3 && p[2] == ':' {
-		p = p[1:]
+	// Decode BEFORE the drive check: the drive colon is often encoded (%3A),
+	// and paths can carry %20 spaces and other escapes.
+	if u, err := url.PathUnescape(p); err == nil {
+		p = u
 	}
-	// Percent-decode the simplest cases. We deliberately don't pull net/url to
-	// avoid hauling that in for one helper; spaces and `%20` are the common ones.
-	p = strings.ReplaceAll(p, "%20", " ")
+	// "file:///Users/..." → "/Users/..."
+	// "file:///C:/..."    → "C:/..."   (Windows form, drive may be lowercase)
+	return stripWindowsDriveSlash(p)
+}
+
+// stripWindowsDriveSlash removes the spurious leading slash a file:// URI
+// leaves in front of a Windows drive letter ("/c:/Users/..." → "c:/Users/...").
+// Unconditional on purpose: a legitimate Unix path never starts with
+// "/<letter>:/", and skipping the runtime.GOOS check keeps the logic
+// unit-testable on every platform.
+func stripWindowsDriveSlash(p string) string {
+	if len(p) > 3 && p[0] == '/' && p[2] == ':' && (p[3] == '/' || p[3] == '\\') &&
+		('a' <= p[1] && p[1] <= 'z' || 'A' <= p[1] && p[1] <= 'Z') {
+		return p[1:]
+	}
 	return p
 }
 

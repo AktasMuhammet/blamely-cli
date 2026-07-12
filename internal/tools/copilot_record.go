@@ -40,9 +40,9 @@ type copilotHookPayload struct {
 //   - falls back to a session-active marker (no file/lines) for payload shapes
 //     we don't recognise, so the attribute fold-in can still credit Copilot
 func RecordCopilotFromStdin(r io.Reader) error {
-	raw, err := io.ReadAll(io.LimitReader(r, 8<<20))
+	raw, err := readHookPayload(r)
 	if err != nil {
-		return fmt.Errorf("read stdin: %w", err)
+		return err
 	}
 	var p copilotHookPayload
 	if err := json.Unmarshal(raw, &p); err != nil {

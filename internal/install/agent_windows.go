@@ -79,15 +79,9 @@ func launcherVBSPath() (string, error) {
 	return filepath.Join(dir, "bin", startupVBSName), nil
 }
 
-func installScheduledTask(binaryPath string) (string, error) {
-	// A stale task from a prior install under a different security context
-	// (e.g. an elevated session) can make /Create /F fail with "Access is
-	// denied" because the current user doesn't own it. Clear it first —
-	// best-effort, since a missing task also errors.
-	_ = exec.Command("schtasks", "/Delete", "/F", "/TN", scheduledTaskName).Run()
-
-	// Launch via a hidden VBScript so the ONLOGON trigger doesn't pop a console
-	// window every login. wscript runs the .vbs, which starts the daemon hidden.
+// writeLauncherVBS (re)writes the stable hidden launcher next to the binary
+// and returns its path.
+func writeLauncherVBS(binaryPath string) (string, error) {
 	vbs, err := launcherVBSPath()
 	if err != nil {
 		return "", err
@@ -98,7 +92,13 @@ func installScheduledTask(binaryPath string) (string, error) {
 	if err := atomicWrite(vbs, []byte(daemonLauncherVBSContent(binaryPath)), 0o644); err != nil {
 		return "", err
 	}
+	return vbs, nil
+}
 
+// createOnLogonTask registers (or force-overwrites) the ONLOGON task that
+// launches the daemon hidden at every user logon. Shared by the installer and
+// the daemon's startup self-heal (EnsureDaemonAgent).
+func createOnLogonTask(vbs string) error {
 	// /F = force overwrite; /SC ONLOGON = run at every user logon; /RL LIMITED = user privileges.
 	args := []string{
 		"/Create", "/F",
@@ -108,7 +108,27 @@ func installScheduledTask(binaryPath string) (string, error) {
 		"/RL", "LIMITED",
 	}
 	if out, err := exec.Command("schtasks", args...).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("schtasks /Create: %w: %s", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("schtasks /Create: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	allowBatteryStart(scheduledTaskName)
+	return nil
+}
+
+func installScheduledTask(binaryPath string) (string, error) {
+	// A stale task from a prior install under a different security context
+	// (e.g. an elevated session) can make /Create /F fail with "Access is
+	// denied" because the current user doesn't own it. Clear it first —
+	// best-effort, since a missing task also errors.
+	_ = exec.Command("schtasks", "/Delete", "/F", "/TN", scheduledTaskName).Run()
+
+	// Launch via a hidden VBScript so the ONLOGON trigger doesn't pop a console
+	// window every login. wscript runs the .vbs, which starts the daemon hidden.
+	vbs, err := writeLauncherVBS(binaryPath)
+	if err != nil {
+		return "", err
+	}
+	if err := createOnLogonTask(vbs); err != nil {
+		return "", err
 	}
 	// Register the periodic keepalive watchdog so a mid-session crash is revived
 	// without waiting for the next logon. Best-effort: the ONLOGON task already
@@ -146,19 +166,31 @@ func installWatchdogTask(vbs string) error {
 	if out, err := exec.Command("schtasks", args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("schtasks /Create watchdog: %w: %s", err, strings.TrimSpace(string(out)))
 	}
+	allowBatteryStart(watchdogTaskName)
 	return nil
 }
 
+// allowBatteryStart patches a just-created Scheduled Task so it also fires on
+// battery power. schtasks /Create has no switch for these settings, and its
+// defaults (DisallowStartIfOnBatteries + StopIfGoingOnBatteries) silently keep
+// the daemon dead on a laptop that boots unplugged: neither the ONLOGON revive
+// nor the 2-minute watchdog ever fires, so after a shutdown → power-on cycle
+// the daemon stays down until the editor plugin's /health respawn kicks in.
+// -StartWhenAvailable additionally lets the watchdog fire promptly after boot
+// instead of waiting for the next interval boundary. Best-effort: an old
+// PowerShell or a policy-restricted box keeps the schtasks defaults, which is
+// exactly the pre-patch behavior.
+func allowBatteryStart(taskName string) {
+	_ = exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command",
+		fmt.Sprintf(
+			"Set-ScheduledTask -TaskName '%s' -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable)",
+			taskName,
+		)).Run()
+}
+
 func installStartupAgent(binaryPath string) (string, error) {
-	startupDir, err := windowsStartupDir()
+	vbsPath, err := installStartupAgentEntry(binaryPath)
 	if err != nil {
-		return "", err
-	}
-	if err := os.MkdirAll(startupDir, 0o755); err != nil {
-		return "", fmt.Errorf("mkdir startup: %w", err)
-	}
-	vbsPath := filepath.Join(startupDir, startupVBSName)
-	if err := atomicWrite(vbsPath, []byte(daemonLauncherVBSContent(binaryPath)), 0o644); err != nil {
 		return "", err
 	}
 	// Crash recovery between logons: a per-user time-triggered task needs no
@@ -202,6 +234,66 @@ func isSchtasksAccessDenied(err error) bool {
 	return strings.Contains(msg, "access is denied") ||
 		strings.Contains(msg, "erişim engellendi") ||
 		strings.Contains(msg, "access denied")
+}
+
+// taskExists reports whether a Scheduled Task with the given name is registered.
+func taskExists(taskName string) bool {
+	return exec.Command("schtasks", "/Query", "/TN", taskName).Run() == nil
+}
+
+// EnsureDaemonAgent is the daemon's startup self-heal: it re-asserts the
+// autostart registration WITHOUT touching the already-running daemon (no
+// /End, no immediate relaunch — installScheduledTask does those and would
+// kill the caller). Called best-effort every time the daemon starts, however
+// it was started (logon task, watchdog, editor-plugin respawn, or by hand) —
+// so a machine whose tasks were never created, were removed, or predate the
+// battery-settings fix converges to a working autostart the first time any
+// daemon comes up.
+func EnsureDaemonAgent(binaryPath string) error {
+	vbs, err := writeLauncherVBS(binaryPath)
+	if err != nil {
+		return err
+	}
+	if taskExists(scheduledTaskName) {
+		// Re-apply the battery settings: tasks created before allowBatteryStart
+		// existed never fire on a laptop booting unplugged.
+		allowBatteryStart(scheduledTaskName)
+	} else if isWindowsAdmin() {
+		if err := createOnLogonTask(vbs); err != nil {
+			// Fall back like InstallDaemonAgent does: a Startup-folder entry
+			// needs no elevation and still covers the next logon.
+			if _, serr := installStartupAgentEntry(binaryPath); serr != nil {
+				return serr
+			}
+		}
+	} else {
+		if _, err := installStartupAgentEntry(binaryPath); err != nil {
+			return err
+		}
+	}
+	// The watchdog is a per-user time trigger — no elevation needed, so ensure
+	// it on every path. installWatchdogTask is idempotent (/Delete + /Create /F)
+	// and re-applies the battery settings itself.
+	return installWatchdogTask(vbs)
+}
+
+// installStartupAgentEntry writes only the Startup-folder VBS (the non-admin
+// logon revive), without launching the daemon — shared by installStartupAgent
+// (which also starts the daemon now) and EnsureDaemonAgent (where the daemon
+// is already running).
+func installStartupAgentEntry(binaryPath string) (string, error) {
+	startupDir, err := windowsStartupDir()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(startupDir, 0o755); err != nil {
+		return "", fmt.Errorf("mkdir startup: %w", err)
+	}
+	vbsPath := filepath.Join(startupDir, startupVBSName)
+	if err := atomicWrite(vbsPath, []byte(daemonLauncherVBSContent(binaryPath)), 0o644); err != nil {
+		return "", err
+	}
+	return vbsPath, nil
 }
 
 func UninstallDaemonAgent() error {

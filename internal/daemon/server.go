@@ -87,7 +87,7 @@ type Range struct {
 var Watchers []Watcher
 
 // DBWatcherFactory, if set, is called at daemon startup to create a Watcher
-// that needs DB access (e.g. VelocityWatcher). Assigned by cmd/blamely.
+// that needs DB access. Assigned by cmd/blamely.
 //
 // Use DBWatcherFactories for additional DB-backed watchers; both are appended
 // to the runtime watcher list. DBWatcherFactory is retained for backward

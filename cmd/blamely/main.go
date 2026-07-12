@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -39,7 +40,7 @@ func init() {
 // JetBrains plugins. The release workflow can still override it at link time via
 // `-ldflags "-X main.version=<tag>"`; otherwise this hardcoded value is what
 // `blamely --version` reports.
-var version = "1.6.7"
+var version = "1.6.8"
 
 // resolveVersion returns the effective CLI version. Precedence:
 //  1. an explicit -ldflags override (release builds);
@@ -173,6 +174,20 @@ func cmdDaemon() *cobra.Command {
 				// per-model token totals from each session's terminal shutdown event.
 				func(db *store.DB) daemon.Watcher { return &tools.CopilotCliUsageWatcher{DB: db} },
 			}
+			// Self-heal the autostart registration every time the daemon comes up,
+			// however it was started (logon task, watchdog, editor-plugin respawn,
+			// or by hand). Windows Scheduled Tasks have no launchd/systemd-style
+			// KeepAlive and older installs miss the on-battery settings, so a
+			// broken machine converges to a working autostart on first daemon
+			// start. No-op on macOS/Linux. Async + best-effort: schtasks/
+			// powershell must never delay or fail daemon startup.
+			go func() {
+				if exe, err := os.Executable(); err == nil {
+					if err := install.EnsureDaemonAgent(exe); err != nil {
+						log.Printf("daemon agent self-heal: %v", err)
+					}
+				}
+			}()
 			return daemon.Run(cmd.Context())
 		},
 	}

@@ -45,6 +45,7 @@ var jetbrainsIDELabels = map[string]bool{
 	"CLion":                   true,
 	"RubyMine":                true,
 	"Rider":                   true,
+	"RustRover":               true,
 	"DataSpell":               true,
 }
 

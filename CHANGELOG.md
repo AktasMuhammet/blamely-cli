@@ -4,6 +4,19 @@ Notable changes to the **Blamely CLI** follow [Keep a Changelog](https://keepach
 
 ## [Unreleased]
 
+## [1.6.8] - 2026-07-13
+
+### Added
+
+- **Attribution now survives cherry-pick, squash, and stash.** When you cherry-pick a commit, squash commits together, or stash and re-apply your work, Blamely keeps the AI-vs-human credit on each line instead of losing it. This joins the existing support for rebase and amend, so reorganizing your history no longer wipes out who wrote what.
+
+### Fixed
+
+- **Blamely keeps running on a laptop that's on battery (Windows).** Previously, if you started your laptop while unplugged, Windows quietly refused to launch Blamely's background service until you plugged in — so nothing was tracked in the meantime. It now starts and stays running whether or not you're on battery.
+- **RustRover now gets the Blamely plugin.** If you use RustRover, the installer was skipping it and leaving it without the plugin. It's now detected like every other JetBrains IDE, so the plugin installs automatically.
+- **More reliable attribution on Windows across editors.** Fixed cases where Windows file paths (with drive letters like `C:\`) weren't matched correctly in Cursor, Antigravity, and Claude, which could leave AI edits credited to the wrong person.
+- **More accurate per-file AI vs. human line counts.** The breakdown of how many lines were written by AI versus a human on each file is now calculated more reliably, so totals no longer drop lines in edge cases.
+
 ## [1.6.7] - 2026-07-06
 
 ### Added

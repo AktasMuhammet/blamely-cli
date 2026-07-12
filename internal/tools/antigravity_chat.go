@@ -680,7 +680,8 @@ func parseCodeAction(content string) (path string, ranges []daemon.LineRange, su
 }
 
 // fileURIToPath converts a "file:///abs/path" URI from the transcript's
-// narrative into a filesystem path, decoding any percent-escapes.
+// narrative into a filesystem path, decoding any percent-escapes and
+// stripping the leading slash a Windows drive URI carries ("/C:/..." → "C:/...").
 func fileURIToPath(uri string) string {
 	const prefix = "file://"
 	if !strings.HasPrefix(uri, prefix) {
@@ -690,7 +691,7 @@ func fileURIToPath(uri string) string {
 	if u, err := url.PathUnescape(p); err == nil {
 		p = u
 	}
-	return p
+	return stripWindowsDriveSlash(p)
 }
 
 // ── model resolution ──────────────────────────────────────────────────────────
