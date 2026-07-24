@@ -4,6 +4,12 @@ Notable changes to the **Blamely CLI** follow [Keep a Changelog](https://keepach
 
 ## [Unreleased]
 
+### Fixed
+
+- **The background daemon now starts reliably on macOS.** Install moved off the legacy `launchctl load` (which reports success even when it starts nothing) onto the modern `bootout` → `enable` → `bootstrap` flow. This re-enables an agent left disabled by an earlier uninstall or by policy, targets the user's GUI session explicitly, and lands in the right user's session even when install runs under `sudo`.
+- **Company-wide (MDM/Jamf) installs no longer end with a dead daemon and a scary health-check warning.** When install is pushed remotely while the user isn't logged into a GUI session, Blamely now says so — `Daemon: no GUI login session right now — starts automatically at next login` — instead of timing out and printing misleading recovery steps. The one-line macOS installer also attaches itself to the user's session (`launchctl asuser`) when run as root, and accepts `BLAMELY_TARGET_USER=<name>` for MDM wrappers. See `docs/macos-bulk-deployment.md` for the recommended Jamf/Kandji/Intune policy script.
+- **Clearer diagnostics when the macOS daemon doesn't come up.** The install failure output now includes launchd's live view of the agent — whether it's disabled (with the exact `launchctl enable` command to fix it) and its state / last exit code — instead of only generic guesses.
+
 ## [1.6.8] - 2026-07-13
 
 ### Added

@@ -1,6 +1,7 @@
 package install
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -280,18 +281,29 @@ func Run(installPlugins bool) error {
 		_ = os.Remove(portPath)
 	}
 	agentRef, err := InstallDaemonAgent(binPath)
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrNoGUISession):
+		// MDM/SSH bulk install (e.g. a Jamf policy): the agent is registered
+		// but the user has no Aqua session to start it in right now. launchd
+		// bootstraps ~/Library/LaunchAgents at the next GUI login, so this is
+		// a deferred start, not a failure — and waiting on /health below would
+		// only burn 8s and print misleading "daemon didn't start" diagnostics.
+		s.LaunchAgentInstalled = true
+		ok("Daemon agent", agentRef)
+		info("Daemon", "no GUI login session right now — starts automatically at next login")
+	case err != nil:
 		return fmt.Errorf("daemon agent: %w", err)
-	}
-	s.LaunchAgentInstalled = true
-	ok("Daemon agent", agentRef)
+	default:
+		s.LaunchAgentInstalled = true
+		ok("Daemon agent", agentRef)
 
-	// Block until the daemon actually answers /health, so the user knows
-	// hooks are being listened to before this command exits.
-	if sock, derr := daemon.WaitForReady(8 * time.Second); derr != nil {
-		diagnoseDaemon(derr, agentRef)
-	} else {
-		ok("Daemon", fmt.Sprintf("listening on %s · ready to receive hooks", sock))
+		// Block until the daemon actually answers /health, so the user knows
+		// hooks are being listened to before this command exits.
+		if sock, derr := daemon.WaitForReady(8 * time.Second); derr != nil {
+			diagnoseDaemon(derr, agentRef)
+		} else {
+			ok("Daemon", fmt.Sprintf("listening on %s · ready to receive hooks", sock))
+		}
 	}
 
 	// Best-effort — if shell detection fails or the rc isn't writable, we

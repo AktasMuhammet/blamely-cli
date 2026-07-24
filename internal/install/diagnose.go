@@ -37,7 +37,15 @@ func diagnoseDaemon(rootErr error, agentRef string) {
 		}
 	}
 
-	// 2. Recovery commands, tailored per OS.
+	// 2. Live service-manager state (currently darwin-only): is the launchd
+	// label disabled, and what does launchd report as its last exit? This turns
+	// "the daemon didn't come up" into a specific, actionable cause.
+	if state := daemonManagerState(); state != "" {
+		fmt.Print(state)
+		fmt.Println()
+	}
+
+	// 3. Recovery commands, tailored per OS.
 	fmt.Println("  Try one of these:")
 	fmt.Println("    • blamely status                — confirm whether the daemon is up")
 	fmt.Println("    • blamely install               — re-run install (this regenerates the agent)")

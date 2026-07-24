@@ -1,10 +1,13 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
+	"runtime"
 	"time"
 
+	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/store"
 )
 
@@ -13,17 +16,43 @@ import (
 // falls back to the TCP port (daemon.port). The second return value is the
 // human-readable address for status messages.
 func healthClient() (*http.Client, string, string, error) {
-	if sock, err := ReadSocket(); err == nil {
+	sock, sockErr := ReadSocket()
+	if sockErr == nil {
 		c := UnixHTTPClient(sock)
 		return c, "http://unix/health", sock, nil
 	}
-	port, err := ReadPort()
-	if err != nil {
-		return nil, "", "", err
+	port, portErr := ReadPort()
+	if portErr != nil {
+		// Neither discovery file exists → the daemon isn't running. Report BOTH
+		// mechanisms rather than just the port error: on macOS/Linux the daemon
+		// binds a socket and never writes a port file, so a bare "read port file
+		// …daemon.port: no such file" reason is actively misleading (it names a
+		// file that platform never uses). Naming the socket path too tells the
+		// operator what actually should have appeared.
+		return nil, "", "", noDaemonError(sockErr, portErr)
 	}
 	url := fmt.Sprintf("http://127.0.0.1:%d/health", port)
 	c := &http.Client{Timeout: 2 * time.Second}
 	return c, url, fmt.Sprintf("127.0.0.1:%d", port), nil
+}
+
+// noDaemonError builds the "daemon not running" error shown when neither the
+// socket nor the port file exists. It names the paths the daemon would have
+// created so the reason is truthful on every platform (socket-based on
+// macOS/Linux, port-based on Windows). Falls back to the underlying errors if a
+// path can't be resolved.
+func noDaemonError(sockErr, portErr error) error {
+	sockPath, sperr := config.SocketFile()
+	portPath, pperr := config.PortFile()
+	if sperr != nil || pperr != nil {
+		return fmt.Errorf("daemon not running: %w", errors.Join(sockErr, portErr))
+	}
+	if runtime.GOOS == "windows" {
+		// Windows is forced onto TCP (see server.go), so the port file is the
+		// real indicator there; mention the socket second.
+		return fmt.Errorf("daemon not running: no port file at %s (and no socket at %s)", portPath, sockPath)
+	}
+	return fmt.Errorf("daemon not running: no socket at %s (and no port file at %s)", sockPath, portPath)
 }
 
 // AnotherDaemonHealthy does ONE quick /health probe of an already-running daemon.
@@ -84,7 +113,7 @@ func PrintStatus() error {
 	client, url, addr, err := healthClient()
 	if err != nil {
 		fmt.Println("daemon: NOT RUNNING")
-		fmt.Printf("  (could not read socket or port file: %v)\n", err)
+		fmt.Printf("  (%v)\n", err)
 		return nil
 	}
 	resp, err := client.Get(url)

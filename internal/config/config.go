@@ -57,7 +57,7 @@ type ToolsConfig struct {
 	// added to ~/.codex and $CODEX_HOME.
 	CodexHomes []string `json:"codex_homes,omitempty"`
 	// ClaudeConfigDirs are extra Claude config dirs (each contains projects/ +
-	// settings.json), added to ~/.claude and $CLAUDE_CONFIG_DIR.
+	// settings.json), added to ~/. and $CLAUDE_CONFIG_DIR.
 	ClaudeConfigDirs []string `json:"claude_config_dirs,omitempty"`
 }
 
