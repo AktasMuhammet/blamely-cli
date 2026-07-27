@@ -219,6 +219,14 @@ func installExtensionWithRetry(cliPath, source string) ([]byte, error) {
 		time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
 		out, err = run()
 	}
+	// Crash AFTER success: some editor CLIs (seen with Antigravity on Windows —
+	// a v8 FATAL ERROR during its own post-install teardown) exit non-zero even
+	// though their output already reported the extension installed. The install
+	// DID land, so trust the CLI's own success line over its exit code;
+	// reporting ✗ here made whole fleets look broken over a cosmetic crash.
+	if err != nil && strings.Contains(string(out), "successfully installed") {
+		return out, nil
+	}
 	return out, err
 }
 

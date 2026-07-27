@@ -274,6 +274,21 @@ func Run(installPlugins bool) error {
 	// looks like. The plumbing that makes the above two groups actually work.
 	section("System")
 
+	// Windows: kill any running daemon SYNCHRONOUSLY before touching its
+	// discovery file. macOS/Linux restart the daemon through the service
+	// manager (kickstart -k / systemctl restart), but the Windows agent paths
+	// have no restart primitive — the Startup-folder install never kills the
+	// old daemon at all. Without this, a reinstall over a live daemon plays out
+	// as: port file deleted below → new spawn exits on the old daemon's
+	// instance lock → old daemon only notices its port file is gone on a 30s
+	// poll → revival waits for the 2-minute watchdog. The health check below
+	// can't survive that, and worse, the OLD binary keeps running until
+	// logoff. Killing first releases the lock so the fresh spawn (new binary)
+	// takes over within seconds.
+	if runtime.GOOS == "windows" {
+		killRunningDaemon()
+	}
+
 	// We invalidate any stale port file BEFORE registering the agent so the
 	// post-install health check can't false-positive on the previous daemon's
 	// port. Then we register/restart and wait for the new daemon to come up.
@@ -298,8 +313,14 @@ func Run(installPlugins bool) error {
 		ok("Daemon agent", agentRef)
 
 		// Block until the daemon actually answers /health, so the user knows
-		// hooks are being listened to before this command exits.
-		if sock, derr := daemon.WaitForReady(8 * time.Second); derr != nil {
+		// hooks are being listened to before this command exits. 25s, not a
+		// few: on corporate Windows the first exec of a freshly downloaded
+		// binary gets a full antivirus scan (fleets often set
+		// BLAMELY_SKIP_DEFENDER_EXCLUSION), which alone can eat 10s+ before
+		// blamelyd's first instruction runs. A healthy daemon answers in ~1s
+		// and returns immediately — the long ceiling only costs time on the
+		// genuinely-broken path.
+		if sock, derr := daemon.WaitForReady(25 * time.Second); derr != nil {
 			diagnoseDaemon(derr, agentRef)
 		} else {
 			ok("Daemon", fmt.Sprintf("listening on %s · ready to receive hooks", sock))
