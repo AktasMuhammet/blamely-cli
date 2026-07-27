@@ -4,15 +4,16 @@ Notable changes to the **Blamely CLI** follow [Keep a Changelog](https://keepach
 
 ## [Unreleased]
 
+## [1.6.9] - 2026-07-27
+
 ### Fixed
 
-- **Reinstalling on Windows now hands the daemon over immediately.** Install kills the previous daemon synchronously before starting the new one. Previously a reinstall over a running daemon could leave the old version running (with its discovery file deleted, so hooks couldn't reach it) until the next logoff or watchdog cycle — and always failed the post-install health check.
-- **No more false "daemon health check failed" on slow corporate machines.** The post-install health wait is now 25s instead of 8s: on managed Windows fleets the first launch of a freshly downloaded binary gets a full antivirus scan, which alone could outlast the old window while the daemon started perfectly fine seconds later. A fast daemon still completes the check in ~1s.
-- **A crashing editor CLI no longer marks a successful extension install as failed.** Some editors (seen with Antigravity on Windows) install the Blamely extension, report success, then crash during their own shutdown. Install now trusts the CLI's success output over its exit code.
-
-- **The background daemon now starts reliably on macOS.** Install moved off the legacy `launchctl load` (which reports success even when it starts nothing) onto the modern `bootout` → `enable` → `bootstrap` flow. This re-enables an agent left disabled by an earlier uninstall or by policy, targets the user's GUI session explicitly, and lands in the right user's session even when install runs under `sudo`.
-- **Company-wide (MDM/Jamf) installs no longer end with a dead daemon and a scary health-check warning.** When install is pushed remotely while the user isn't logged into a GUI session, Blamely now says so — `Daemon: no GUI login session right now — starts automatically at next login` — instead of timing out and printing misleading recovery steps. The one-line macOS installer also attaches itself to the user's session (`launchctl asuser`) when run as root, and accepts `BLAMELY_TARGET_USER=<name>` for MDM wrappers. See `docs/macos-bulk-deployment.md` for the recommended Jamf/Kandji/Intune policy script.
-- **Clearer diagnostics when the macOS daemon doesn't come up.** The install failure output now includes launchd's live view of the agent — whether it's disabled (with the exact `launchctl enable` command to fix it) and its state / last exit code — instead of only generic guesses.
+- **Blamely's background service now starts reliably on macOS.** Some users — especially on company-managed Macs or after a reinstall — ended up with everything installed but the service never running, so nothing was tracked. Install now starts the service in a way macOS respects in all of these cases, including when it had been switched off by an earlier uninstall.
+- **Company-wide installs no longer look broken.** When IT pushes Blamely to a Mac while the user isn't logged in, install used to end with a scary "daemon health check failed" warning even though nothing was wrong. It now simply says the service will start automatically at the user's next login. A step-by-step guide for IT teams deploying via Jamf/Kandji/Intune is included (`docs/macos-bulk-deployment.md`).
+- **Updating Blamely on Windows now switches to the new version immediately.** Previously the old version could quietly keep running after an update — and stop receiving edits from your AI tools — until you signed out or restarted.
+- **Fewer false alarms on slower machines.** On corporate Windows machines where antivirus scans new programs, the service can take a little longer to start the first time. Install now waits long enough for that instead of reporting a failure while the service was actually coming up fine.
+- **Editor extension installs are reported correctly.** In some editors (seen with Antigravity on Windows), the Blamely extension installed successfully but was reported as failed. Install now reports what actually happened.
+- **Better guidance when something really is wrong.** If the service genuinely fails to start on macOS, install now tells you the specific cause and the exact command to fix it, instead of a generic list of things to try.
 
 ## [1.6.8] - 2026-07-13
 
