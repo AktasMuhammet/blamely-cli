@@ -3,3 +3,5 @@
 /.idea/
 .DS_Store
 /dist/
+# Filled-in release/signing env (real credentials) — only the .example ships.
+/release.env

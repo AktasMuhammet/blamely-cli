@@ -12,9 +12,18 @@ name: Build & Publish Release
 #   RELEASE_REPO_TOKEN  a fine-grained PAT with `contents: write` on RELEASE_REPO
 #                       (default GITHUB_TOKEN can't reach other repos)
 #
-# Optional secrets:
-#   BLAMELY_SIGN_PFX_BASE64 / BLAMELY_SIGN_PASS  → Authenticode-sign the Windows
-#     blamely.exe AND the setup.exe installer (absent → published unsigned)
+# Optional secrets — Windows Authenticode via Azure Trusted Signing (absent →
+# published unsigned; AZURE_TS_ACCOUNT is the on/off switch):
+#   AZURE_TENANT_ID      Entra tenant id
+#   AZURE_CLIENT_ID      app registration (service principal) with the
+#                        "Trusted Signing Certificate Profile Signer" role on
+#                        the Trusted Signing account
+#   AZURE_CLIENT_SECRET  that app registration's client secret
+#   AZURE_TS_ENDPOINT    regional endpoint, e.g. https://weu.codesigning.azure.net
+#   AZURE_TS_ACCOUNT     Trusted Signing account name
+#   AZURE_TS_PROFILE     certificate profile name (Public Trust)
+#
+# Optional secrets (other):
 #   GPG_PRIVATE_KEY / GPG_PASSPHRASE             → detach-sign SHA256SUMS
 #
 # Artifacts published per semver tag (e.g. v0.2.0):
@@ -175,18 +184,17 @@ jobs:
 
   # ── 2. Windows installer (Inno Setup .exe, Authenticode-signed) ────────────
   # Builds a double-clickable setup.exe from the Windows release archive so users
-  # avoid the irm|iex script (which corporate EDR/SmartScreen flags). Signed with
-  # the code-signing cert in the BLAMELY_SIGN_* secrets; absent secrets → an
-  # UNSIGNED installer + a warning, never a failed release.
+  # avoid the irm|iex script (which corporate EDR/SmartScreen flags). Signed via
+  # Azure Trusted Signing (the AZURE_* secrets — see the header); absent secrets
+  # → an UNSIGNED installer + a warning, never a failed release.
   installers:
     name: installer windows/${{ matrix.arch }}
     needs: build
     runs-on: windows-latest
-    # Signing secret exposed as job env so the step `if:` presence-check can read
+    # Signing gate exposed as job env so the step `if:` presence-check can read
     # it (step-level env is not visible to that step's own `if`). Optional.
     env:
-      PFX: ${{ secrets.BLAMELY_SIGN_PFX_BASE64 }}
-      PFX_PASS: ${{ secrets.BLAMELY_SIGN_PASS }}
+      AZURE_TS_ACCOUNT: ${{ secrets.AZURE_TS_ACCOUNT }}
     strategy:
       fail-fast: false
       matrix:
@@ -224,29 +232,52 @@ jobs:
           bin="work/${dir}/blamely.exe"
           [ -f "$bin" ] || { echo "binary missing: $bin"; ls -R work; exit 1; }
           echo "path=$bin" >> "$GITHUB_OUTPUT"
-
-      # signtool.exe ships with the Windows SDK but is not on the runner's PATH —
-      # locate the newest SDK's x64 copy and expose its directory to later steps.
-      - name: Add signtool to PATH
-        if: env.PFX != ''
-        shell: pwsh
-        run: |
-          $st = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.*\x64\signtool.exe" |
-            Sort-Object { [version]$_.Directory.Parent.Name } | Select-Object -Last 1
-          if (-not $st) { throw 'signtool.exe not found in any Windows SDK under Windows Kits\10' }
-          Add-Content $env:GITHUB_PATH $st.DirectoryName
+          echo "dir=$(dirname "$bin")" >> "$GITHUB_OUTPUT"
 
       # Sign the binary BEFORE it's packaged, so the .exe inside the installer is
       # also signed (Defender scans the extracted exe, not just the installer).
-      - name: Sign blamely.exe (Authenticode)
-        if: env.PFX != ''
-        shell: pwsh
+      - name: Sign blamely.exe (Azure Trusted Signing)
+        if: env.AZURE_TS_ACCOUNT != ''
+        # NOTE: this action is the former azure/trusted-signing-action — Microsoft
+        # rebranded it to "Artifact Signing" at v1.0.0 GA (old name/tags are gone;
+        # trusted-signing-action@v5 never existed).
+        uses: azure/artifact-signing-action@v2
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_TS_PROFILE }}
+          files-folder: ${{ steps.bin.outputs.dir }}
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # Re-pack the release .zip around the now-signed exe and OVERWRITE the
+      # build job's artifact, so the published archive (what the install
+      # scripts download) carries the signed binary. This replaces the old
+      # osslsigncode pass in the publish job — Azure Trusted Signing has no
+      # Linux client, so zip signing had to move here (the Windows runner).
+      - name: Repack signed exe into release zip
+        if: env.AZURE_TS_ACCOUNT != ''
+        shell: bash
         run: |
-          $pfx = "$env:RUNNER_TEMP\cert.pfx"
-          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX))
-          $pass = if ($env:PFX_PASS) { @('/p', $env:PFX_PASS) } else { @() }
-          & signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 `
-            /f $pfx @pass "${{ steps.bin.outputs.path }}"
+          set -e
+          dir="blamely_${{ steps.tag.outputs.tag }}_windows_${{ matrix.goarch }}"
+          rm -f "incoming/${dir}.zip"
+          (cd work && 7z a -tzip -mx=9 -bd "../incoming/${dir}.zip" "$dir" >/dev/null)
+
+      - name: Upload signed release zip (replaces unsigned artifact)
+        if: env.AZURE_TS_ACCOUNT != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: blamely_${{ steps.tag.outputs.tag }}_windows_${{ matrix.goarch }}.zip
+          path: incoming/blamely_${{ steps.tag.outputs.tag }}_windows_${{ matrix.goarch }}.zip
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Build Windows installer
         shell: pwsh
@@ -270,14 +301,24 @@ jobs:
             "/Oout" "/Fblamely_${{ steps.tag.outputs.tag }}_windows_${{ matrix.arch }}_setup" `
             packaging\windows\blamely.iss
 
-      - name: Sign Windows installer (Authenticode)
-        if: env.PFX != ''
-        shell: pwsh
-        run: |
-          $pfx = "$env:RUNNER_TEMP\cert.pfx"
-          $pass = if ($env:PFX_PASS) { @('/p', $env:PFX_PASS) } else { @() }
-          & signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 `
-            /f $pfx @pass (Get-ChildItem out\*setup*.exe).FullName
+      - name: Sign Windows installer (Azure Trusted Signing)
+        if: env.AZURE_TS_ACCOUNT != ''
+        # NOTE: this action is the former azure/trusted-signing-action — Microsoft
+        # rebranded it to "Artifact Signing" at v1.0.0 GA (old name/tags are gone;
+        # trusted-signing-action@v5 never existed).
+        uses: azure/artifact-signing-action@v2
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_TS_PROFILE }}
+          files-folder: out
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
 
       - name: Upload installer
         uses: actions/upload-artifact@v4
@@ -486,72 +527,11 @@ jobs:
           rm -rf sqlite-tools sqlite-tools.zip
           ls -la sqlite3.exe
 
-      - name: Sign Windows binaries (Authenticode)
-        # Authenticode-sign the Windows blamely.exe so Windows Defender /
-        # SmartScreen trust it — an unsigned binary is what trips the
-        # Trojan:Win32/Gracing (Wacatac/Sabsik) false positives.
-        # osslsigncode signs PE files on a Linux host (signtool is Windows-only),
-        # so we sign here in the publish job rather than on the build runners.
-        #
-        # Signs the .exe INSIDE each Windows .zip and re-packs it, and runs BEFORE
-        # the SHA256SUMS step below so the published checksums cover the SIGNED
-        # artifact. No-ops with a loud warning when no signing cert is configured,
-        # so a release without the secret still publishes (just unsigned) — mirrors
-        # the repo's sign-windows.sh behavior.
-        #
-        # Secrets (in this private source repo):
-        #   BLAMELY_SIGN_PFX_BASE64  base64 of a .pfx/.p12 code-signing cert
-        #   BLAMELY_SIGN_PASS        the .pfx password (empty for a passwordless cert)
-        env:
-          BLAMELY_SIGN_PFX_BASE64: ${{ secrets.BLAMELY_SIGN_PFX_BASE64 }}
-          BLAMELY_SIGN_PASS: ${{ secrets.BLAMELY_SIGN_PASS }}
-          BLAMELY_SIGN_TIMESTAMP_URL: 'http://timestamp.digicert.com'
-        shell: bash
-        working-directory: dist
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          zips=( *_windows_*.zip )
-          if [ -z "${BLAMELY_SIGN_PFX_BASE64:-}" ]; then
-            echo "::warning::No BLAMELY_SIGN_PFX_BASE64 secret — shipping Windows binaries UNSIGNED (Defender may flag them)."
-            exit 0
-          fi
-          if [ ${#zips[@]} -eq 0 ]; then
-            echo "No Windows archives found — nothing to sign."
-            exit 0
-          fi
-          sudo apt-get update
-          sudo apt-get install -y osslsigncode
-
-          # Materialize the .pfx from the base64 secret into a temp file.
-          pfx="$(mktemp)"
-          trap 'rm -f "$pfx"' EXIT
-          printf '%s' "$BLAMELY_SIGN_PFX_BASE64" | base64 -d > "$pfx" \
-            || { echo "::error::BLAMELY_SIGN_PFX_BASE64 is not valid base64"; exit 1; }
-          # Omit -pass entirely for a passwordless cert (osslsigncode dislikes -pass "").
-          passargs=()
-          [ -n "${BLAMELY_SIGN_PASS:-}" ] && passargs=(-pass "$BLAMELY_SIGN_PASS")
-
-          for zip in "${zips[@]}"; do
-            dir="${zip%.zip}"                       # e.g. blamely_v1.7.0_windows_amd64
-            rm -rf _sign && mkdir _sign
-            unzip -q -o "$zip" -d _sign
-            exe="_sign/$dir/blamely.exe"
-            [ -f "$exe" ] || { echo "::error::$exe not found inside $zip"; exit 1; }
-            # -h sha256 + -ts (RFC3161) is the modern Authenticode profile; the
-            # timestamp keeps the signature valid after the cert expires.
-            osslsigncode sign \
-              -pkcs12 "$pfx" "${passargs[@]}" \
-              -n "Blamely" -i "https://blamely.ai" \
-              -h sha256 -ts "$BLAMELY_SIGN_TIMESTAMP_URL" \
-              -in "$exe" -out "$exe.signed"
-            mv -f "$exe.signed" "$exe"
-            # Re-pack with the same top-level layout the build job produced.
-            rm -f "$zip"
-            ( cd _sign && zip -q -r -X "../$zip" "$dir" )
-            rm -rf _sign
-            echo "✓ signed and repacked $zip"
-          done
+      # NOTE: no signing step here. The Windows blamely.exe (inside the release
+      # .zip) and the setup.exe installer are both signed via Azure Trusted
+      # Signing in the `installers` job — that job re-packs and OVERWRITES the
+      # Windows zip artifacts, so what this publish job downloads is already
+      # signed. SHA256SUMS below therefore covers the signed artifacts.
 
       - name: Generate SHA256SUMS
         shell: bash
@@ -592,17 +572,13 @@ jobs:
             --detach-sign --armor -o SHA256SUMS.asc SHA256SUMS
           gpg --verify SHA256SUMS.asc SHA256SUMS
 
-      - name: Export public trust assets (cert + GPG pubkey)
-        # With only a self-signed cert (no CA / Azure / Apple ID), trust is a
-        # documented, verifiable process rather than a silent OS prompt. Publish
-        # the PUBLIC verification material so a security team can audit and an
-        # admin can whitelist — never the private .pfx/.key:
-        #   blamely-codesign.crt   public half of the code-signing cert (from the
-        #                          PFX secret; extracted with openssl, no key)
+      - name: Export public trust assets (GPG pubkey)
+        # Windows binaries are signed via Azure Trusted Signing, whose certs
+        # chain to a Microsoft PUBLICLY TRUSTED root and rotate every few days —
+        # so there is no long-lived .crt to publish or whitelist (admins pin the
+        # publisher subject name instead; see packaging/TRUST.md). The only
+        # trust asset we still publish is the GPG key that signs SHA256SUMS:
         #   blamely-gpg-public.asc public GPG key that signs SHA256SUMS.asc
-        env:
-          BLAMELY_SIGN_PFX_BASE64: ${{ secrets.BLAMELY_SIGN_PFX_BASE64 }}
-          BLAMELY_SIGN_PASS: ${{ secrets.BLAMELY_SIGN_PASS }}
         shell: bash
         working-directory: dist
         run: |
@@ -610,24 +586,7 @@ jobs:
           # Export the public GPG key (private key already imported above).
           gpg --armor --export > blamely-gpg-public.asc || true
           [ -s blamely-gpg-public.asc ] || rm -f blamely-gpg-public.asc
-          # Extract the PUBLIC cert from the PFX secret — public half only, no key.
-          if [ -n "${BLAMELY_SIGN_PFX_BASE64:-}" ]; then
-            pfx="$(mktemp)"; trap 'rm -f "$pfx"' EXIT
-            printf '%s' "$BLAMELY_SIGN_PFX_BASE64" | base64 -d > "$pfx"
-            passin=()
-            [ -n "${BLAMELY_SIGN_PASS:-}" ] && passin=(-passin "pass:${BLAMELY_SIGN_PASS}")
-            [ ${#passin[@]} -eq 0 ] && passin=(-passin pass:)
-            # -legacy: OpenSSL 3 needs it for the RC2-encrypted PFXs signtool makes.
-            openssl pkcs12 -in "$pfx" -clcerts -nokeys "${passin[@]}" -legacy \
-              -out blamely-codesign.crt 2>/dev/null \
-              || openssl pkcs12 -in "$pfx" -clcerts -nokeys "${passin[@]}" \
-                   -out blamely-codesign.crt 2>/dev/null \
-              || echo "::warning::could not extract public cert from PFX"
-            [ -s blamely-codesign.crt ] || rm -f blamely-codesign.crt
-          else
-            echo "::warning::No BLAMELY_SIGN_PFX_BASE64 — skipping public cert asset."
-          fi
-          ls -la blamely-gpg-public.asc blamely-codesign.crt 2>/dev/null || true
+          ls -la blamely-gpg-public.asc 2>/dev/null || true
 
       - name: Publish to public release repo
         # gh CLI is preinstalled on ubuntu-latest. We use the PAT so the
@@ -657,12 +616,13 @@ jobs:
           # Upload (or replace) every versioned archive, the signed Windows
           # setup.exe, the native macOS/Linux installers (.pkg .dmg .deb .rpm
           # .AppImage), sqlite3.exe (Windows plugin dependency), SHA256SUMS + its
-          # signature, and the public trust assets (cert, GPG pubkey).
+          # signature, and the GPG public key (Windows signing is Azure Trusted
+          # Signing — publicly trusted chain, no cert asset to publish).
           shopt -s nullglob
           gh release upload "$TAG" --repo "$RELEASE_REPO" --clobber \
             *.tar.gz *.zip *_setup.exe *.pkg *.dmg *.deb *.rpm *.AppImage \
             sqlite3.exe SHA256SUMS SHA256SUMS.asc \
-            blamely-gpg-public.asc blamely-codesign.crt
+            blamely-gpg-public.asc
 
           # Mark the semver release as GitHub's default "Latest" (UI + /releases/latest).
           gh release edit "$TAG" --repo "$RELEASE_REPO" --latest
@@ -683,7 +643,7 @@ jobs:
           done
           # sqlite3.exe + trust assets already have stable (version-less) names.
           cp sqlite3.exe latest-assets/sqlite3.exe
-          for extra in blamely-gpg-public.asc blamely-codesign.crt; do
+          for extra in blamely-gpg-public.asc; do
             [ -f "$extra" ] && cp "$extra" "latest-assets/$extra"
           done
           (cd latest-assets && sha256sum *.tar.gz *.zip *_setup.exe *.pkg *.dmg *.deb *.rpm *.AppImage sqlite3.exe > SHA256SUMS 2>/dev/null || true)
