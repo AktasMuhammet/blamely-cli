@@ -281,7 +281,7 @@ func Run(installPlugins bool) error {
 	// old daemon at all. Without this, a reinstall over a live daemon plays out
 	// as: port file deleted below → new spawn exits on the old daemon's
 	// instance lock → old daemon only notices its port file is gone on a 30s
-	// poll → revival waits for the 2-minute watchdog. The health check below
+	// poll → revival waits for the periodic keepalive. The health check below
 	// can't survive that, and worse, the OLD binary keeps running until
 	// logoff. Killing first releases the lock so the fresh spawn (new binary)
 	// takes over within seconds.

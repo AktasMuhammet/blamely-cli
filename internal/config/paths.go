@@ -81,7 +81,7 @@ func PidFile() (string, error) {
 // lifetime, enforcing a single running instance. Unlike the /health probe (a
 // best-effort check that races when launchers start concurrently), an exclusive
 // file lock can be held by only one process at a time, so a second daemon — from
-// the logon task, an editor plugin spawn, the keepalive watchdog, or install —
+// the logon task, an editor plugin spawn, the keepalive task, or install —
 // fails to acquire it and exits instead of binding a second ephemeral port.
 func LockFile() (string, error) {
 	d, err := BlamelyDir()

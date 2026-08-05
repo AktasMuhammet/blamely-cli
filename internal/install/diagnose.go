@@ -61,7 +61,7 @@ func diagnoseDaemon(rootErr error, agentRef string) {
 	case "windows":
 		fmt.Println("    • schtasks /Query /TN \"Blamely Daemon\" /V")
 		fmt.Println("    • schtasks /Run   /TN \"Blamely Daemon\"")
-		fmt.Println("    • schtasks /Query /TN \"Blamely Daemon Watchdog\" /V — periodic keepalive that revives a crashed daemon")
+		fmt.Println("    • schtasks /Query /TN \"Blamely Daemon Keepalive\" /V — periodic keepalive that revives a crashed daemon")
 	}
 	fmt.Println("    • Common causes:")
 	fmt.Println("        - another blamely (or a stale daemon) is holding the port file")

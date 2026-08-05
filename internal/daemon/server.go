@@ -108,7 +108,8 @@ func Run(ctx context.Context) error {
 
 	// Route logging to ~/.blamely/daemon.log (with 24h retention) before anything
 	// else, so startup, hook traffic, and connection errors are all captured —
-	// including on Windows, where the hidden-VBScript launcher discards stderr.
+	// including on Windows, where `daemon --background` frees its console and so
+	// has nowhere to write stderr.
 	closeLog := setupLogging(ctx)
 	defer closeLog()
 
@@ -123,7 +124,7 @@ func Run(ctx context.Context) error {
 	}
 	// Authoritative single-instance guard: an exclusive OS lock held for our whole
 	// lifetime. The /health probe above is only a fast pre-check — it races when
-	// launchers (logon/launchd, editor-plugin spawns, the keepalive watchdog,
+	// launchers (logon/launchd, editor-plugin spawns, the keepalive task,
 	// install) start daemons concurrently and all see "no healthy daemon" before
 	// any binds, then each binds its own ephemeral port / re-creates the unix
 	// socket and they ALL keep running. The lock can be held by exactly one

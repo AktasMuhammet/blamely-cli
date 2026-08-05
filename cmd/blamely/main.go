@@ -138,10 +138,18 @@ func main() {
 }
 
 func cmdDaemon() *cobra.Command {
-	return &cobra.Command{
+	var background bool
+	c := &cobra.Command{
 		Use:   "daemon",
 		Short: "Run the long-lived attribution daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Autostart entry point (Windows Scheduled Task / Startup shortcut):
+			// drop the console window the launcher gave us. Only ever set by the
+			// autostart registration, so running `blamely daemon` by hand keeps
+			// its terminal. No-op off Windows.
+			if background {
+				hideConsole()
+			}
 			// Watchers use direct, observable signals (hooks, log parsers,
 			// editor plugin events). The velocity/heuristic watcher has been
 			// removed: inline completions are now attributed at high confidence
@@ -181,7 +189,7 @@ func cmdDaemon() *cobra.Command {
 				func(db *store.DB) daemon.Watcher { return &tools.CopilotCliUsageWatcher{DB: db} },
 			}
 			// Self-heal the autostart registration every time the daemon comes up,
-			// however it was started (logon task, watchdog, editor-plugin respawn,
+			// however it was started (logon task, keepalive, editor-plugin respawn,
 			// or by hand). Windows Scheduled Tasks have no launchd/systemd-style
 			// KeepAlive and older installs miss the on-battery settings, so a
 			// broken machine converges to a working autostart on first daemon
@@ -212,6 +220,10 @@ func cmdDaemon() *cobra.Command {
 			return daemon.Run(cmd.Context())
 		},
 	}
+	c.Flags().BoolVar(&background, "background", false,
+		"started by the autostart registration: detach from the launcher's console (Windows; no-op elsewhere)")
+	_ = c.Flags().MarkHidden("background")
+	return c
 }
 
 func cmdRepair() *cobra.Command {

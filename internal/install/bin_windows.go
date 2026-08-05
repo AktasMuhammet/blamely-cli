@@ -84,9 +84,10 @@ func removeInstalledBinary(p string, extraFiles []string, purgeRoot string) erro
 	// wipe the bin directory.
 	//
 	// rmdir /s /q removes the WHOLE bin folder, not just blamely.exe. The
-	// installer also drops sqlite3.exe (bundled for the IDE plugins), the daemon
-	// launcher (blamely-daemon.vbs), staging subdirs (.install-*), and rotated
-	// backups (blamely.exe.old-*) into this same folder — a plain del of the exe
+	// installer also drops sqlite3.exe (bundled for the IDE plugins), staging
+	// subdirs (.install-*, .update-*), a legacy blamely-daemon.vbs on machines
+	// upgraded from before 1.8.0, and rotated backups (blamely.exe.old-*) into
+	// this same folder — a plain del of the exe
 	// followed by a non-recursive rmdir left every one of those (and the folder)
 	// behind. The bin dir is exclusively Blamely's, so recursive removal is safe;
 	// ~/.blamely itself (config.json, exclude, a kept db) is the parent and is
@@ -112,13 +113,17 @@ func removeInstalledBinary(p string, extraFiles []string, purgeRoot string) erro
 	// renamed/dev one this /im can't match. Safe here: it runs only after the ping
 	// wait, once this uninstaller process has exited.
 	// Delete the respawn tasks IN the cleanup script too, not just via
-	// UninstallDaemonAgent before this. The keepalive watchdog fires every 2
-	// minutes; if its schtasks deletion didn't take (or raced), it would spawn a
-	// fresh daemon mid-cleanup that re-locks blamely.exe / db.sqlite and defeats
-	// the rmdir. Re-deleting both tasks at the top of each pass guarantees no
-	// resurrection between the taskkill and the rmdir.
-	taskDel := fmt.Sprintf(`schtasks /delete /f /tn "%s" >nul 2>&1 & schtasks /delete /f /tn "%s" >nul 2>&1 & `,
-		scheduledTaskName, watchdogTaskName)
+	// UninstallDaemonAgent before this. The keepalive fires on a timer; if its
+	// schtasks deletion didn't take (or raced), it would spawn a fresh daemon
+	// mid-cleanup that re-locks blamely.exe / db.sqlite and defeats the rmdir.
+	// Re-deleting the tasks at the top of each pass guarantees no resurrection
+	// between the taskkill and the rmdir. The legacy watchdog name is included so
+	// uninstalling a machine that upgraded from the pre-1.8.0 VBScript layout
+	// can't be resurrected by a task this build never creates.
+	var taskDel string
+	for _, tn := range []string{scheduledTaskName, keepaliveTaskName, legacyWatchdogTaskName} {
+		taskDel += fmt.Sprintf(`schtasks /delete /f /tn "%s" >nul 2>&1 & `, tn)
+	}
 	killClean := fmt.Sprintf(`%staskkill /f /t /im "%s" >nul 2>&1 & %srmdir /s /q "%s" >nul 2>&1`, taskDel, exeName, dels, wipeDir)
 	// First wait is short (~1s): the daemon is already dead (killed synchronously
 	// in killRunningDaemon), so the ONLY lock left on the bin is this uninstaller's

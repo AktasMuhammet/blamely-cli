@@ -16,16 +16,57 @@ import (
 
 const scheduledTaskName = "Blamely Daemon"
 
-// watchdogTaskName is a periodic Scheduled Task that re-launches the hidden
-// daemon every couple of minutes. Windows has no launchd KeepAlive / systemd
-// Restart=always equivalent, so the ONLOGON task (or Startup-folder entry)
-// only revives the daemon at logon — a single mid-session crash would leave it
-// dead until the next login. The daemon's single-instance guard
-// (AnotherDaemonHealthy) makes a redundant launch a fast no-op, so firing this
-// on a fixed interval simply resurrects the daemon whenever it isn't running.
-const watchdogTaskName = "Blamely Daemon Watchdog"
+// keepaliveTaskName is a periodic Scheduled Task that re-launches the daemon if
+// it has died. Windows has no launchd KeepAlive / systemd Restart=always
+// equivalent, so the ONLOGON task only revives the daemon at logon — a
+// mid-session crash would otherwise leave it dead until the next login. The
+// daemon's single-instance guard (AnotherDaemonHealthy) makes a redundant
+// launch a fast no-op, so firing this on a timer simply resurrects the daemon
+// whenever it isn't running.
+const keepaliveTaskName = "Blamely Daemon Keepalive"
 
-const startupVBSName = "blamely-daemon.vbs"
+// keepaliveMinutes is how often the keepalive task fires.
+//
+// This was 2 minutes. A signed binary relaunched every 2 minutes from a
+// Scheduled Task is, behaviourally, indistinguishable from malware refusing to
+// stay killed — it was part of what tripped Defender (see the file comment on
+// startupShortcutName). 15 minutes still recovers a crashed daemon without a
+// human noticing, and it is not the only recovery path: the editor plugins
+// respawn the daemon when their /health probe fails, and EnsureDaemonAgent
+// self-heals on every daemon start.
+const keepaliveMinutes = 15
+
+// startupShortcutName is the non-admin autostart fallback: a plain .lnk pointing
+// at the signed blamely.exe.
+//
+// It replaces blamely-daemon.vbs. That VBScript, launched via
+// `wscript.exe //B //Nologo` from both the Startup folder and a 2-minute
+// Scheduled Task, was reported by Windows Defender as
+// Trojan:Win32/Commando.A!ml — a machine-learning verdict on the SHAPE of the
+// install, not on any specific code:
+//
+//	unsigned script + LOLBin script host + Startup-folder persistence +
+//	a second scheduled-task persistence + a 2-minute relaunch loop + hidden window
+//
+// Each is ordinary alone; together they are a textbook persistence template.
+// Worse, routing through wscript threw away the very thing that should make
+// blamely trustworthy on Windows: the binary is Authenticode-signed by a
+// verified publisher, but Defender never saw that signature on the thing that
+// actually started at boot, because the thing that started was an unsigned .vbs.
+//
+// Everything here now launches the signed blamely.exe directly. The console
+// window that used to justify the VBScript is handled inside the binary
+// (`daemon --background`, see cmd/blamely/console_windows.go).
+const startupShortcutName = "Blamely.lnk"
+
+// Legacy artifact names, removed on install/ensure/uninstall so machines that
+// already have the flagged VBScript layout converge to the clean one. Without
+// this, an upgrade would leave the .vbs on disk and the old task registered —
+// still detected, and now orphaned.
+const (
+	legacyStartupVBSName   = "blamely-daemon.vbs"
+	legacyWatchdogTaskName = "Blamely Daemon Watchdog"
+)
 
 // createNoWindow (CREATE_NO_WINDOW) launches a console process with no console
 // window at all — the reliable way to start the console-subsystem blamely.exe
@@ -39,18 +80,19 @@ var (
 )
 
 func InstallDaemonAgent(binaryPath string) (string, error) {
+	removeLegacyAgentArtifacts()
+
 	// ONLOGON scheduled tasks require elevation on most Windows builds, even for
-	// the current user. Non-admin installs go straight to the Startup folder.
-	if !isWindowsAdmin() {
-		return installStartupAgent(binaryPath)
+	// the current user. Non-admin installs fall back to the keepalive task (a
+	// per-user time trigger needs no elevation) and then to a Startup shortcut.
+	if isWindowsAdmin() {
+		if ref, err := installScheduledTask(binaryPath); err == nil {
+			return ref, nil
+		} else if !isSchtasksAccessDenied(err) {
+			return "", err
+		}
 	}
-	if ref, err := installScheduledTask(binaryPath); err == nil {
-		return ref, nil
-	} else if isSchtasksAccessDenied(err) {
-		return installStartupAgent(binaryPath)
-	} else {
-		return "", err
-	}
+	return installUnprivilegedAgent(binaryPath)
 }
 
 func isWindowsAdmin() bool {
@@ -58,52 +100,21 @@ func isWindowsAdmin() bool {
 	return r != 0
 }
 
-// daemonLauncherVBSContent returns a VBScript that starts `blamely daemon` with
-// a hidden window (WScript.Shell.Run intWindowStyle=0). Routing the launch
-// through this keeps the console-subsystem daemon from flashing a cmd window at
-// logon or when the Scheduled Task fires.
-func daemonLauncherVBSContent(binaryPath string) string {
-	return fmt.Sprintf(
-		"Set WshShell = CreateObject(\"WScript.Shell\")\r\nWshShell.Run \"\"\"%s\"\" daemon\", 0, False\r\n",
-		binaryPath,
-	)
-}
-
-// launcherVBSPath is the stable launcher used by the Scheduled Task (kept in
-// ~/.blamely/bin so it lives next to the binary, not in the Startup folder).
-func launcherVBSPath() (string, error) {
-	dir, err := config.BlamelyDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "bin", startupVBSName), nil
-}
-
-// writeLauncherVBS (re)writes the stable hidden launcher next to the binary
-// and returns its path.
-func writeLauncherVBS(binaryPath string) (string, error) {
-	vbs, err := launcherVBSPath()
-	if err != nil {
-		return "", err
-	}
-	if err := os.MkdirAll(filepath.Dir(vbs), 0o755); err != nil {
-		return "", fmt.Errorf("mkdir %s: %w", filepath.Dir(vbs), err)
-	}
-	if err := atomicWrite(vbs, []byte(daemonLauncherVBSContent(binaryPath)), 0o644); err != nil {
-		return "", err
-	}
-	return vbs, nil
+// daemonCommand is the command line every autostart entry runs: the signed
+// binary, with the flag that makes it drop the launcher's console window.
+func daemonCommand(binaryPath string) string {
+	return fmt.Sprintf("\"%s\" daemon --background", binaryPath)
 }
 
 // createOnLogonTask registers (or force-overwrites) the ONLOGON task that
-// launches the daemon hidden at every user logon. Shared by the installer and
-// the daemon's startup self-heal (EnsureDaemonAgent).
-func createOnLogonTask(vbs string) error {
+// launches the daemon at every user logon. Shared by the installer and the
+// daemon's startup self-heal (EnsureDaemonAgent).
+func createOnLogonTask(binaryPath string) error {
 	// /F = force overwrite; /SC ONLOGON = run at every user logon; /RL LIMITED = user privileges.
 	args := []string{
 		"/Create", "/F",
 		"/TN", scheduledTaskName,
-		"/TR", fmt.Sprintf("wscript.exe //B //Nologo \"%s\"", vbs),
+		"/TR", daemonCommand(binaryPath),
 		"/SC", "ONLOGON",
 		"/RL", "LIMITED",
 	}
@@ -121,19 +132,13 @@ func installScheduledTask(binaryPath string) (string, error) {
 	// best-effort, since a missing task also errors.
 	_ = exec.Command("schtasks", "/Delete", "/F", "/TN", scheduledTaskName).Run()
 
-	// Launch via a hidden VBScript so the ONLOGON trigger doesn't pop a console
-	// window every login. wscript runs the .vbs, which starts the daemon hidden.
-	vbs, err := writeLauncherVBS(binaryPath)
-	if err != nil {
+	if err := createOnLogonTask(binaryPath); err != nil {
 		return "", err
 	}
-	if err := createOnLogonTask(vbs); err != nil {
-		return "", err
-	}
-	// Register the periodic keepalive watchdog so a mid-session crash is revived
-	// without waiting for the next logon. Best-effort: the ONLOGON task already
-	// covers login, so a watchdog failure must not fail the whole install.
-	_ = installWatchdogTask(vbs)
+	// Register the periodic keepalive so a mid-session crash is revived without
+	// waiting for the next logon. Best-effort: the ONLOGON task already covers
+	// login, so a keepalive failure must not fail the whole install.
+	_ = installKeepaliveTask(binaryPath)
 
 	// Kill any prior running instance so a reinstall picks up the new binary,
 	// then start the daemon now (hidden, via CREATE_NO_WINDOW). Both best-effort.
@@ -142,31 +147,47 @@ func installScheduledTask(binaryPath string) (string, error) {
 	return scheduledTaskName, nil
 }
 
-// installWatchdogTask registers (idempotently) the periodic keepalive task that
-// relaunches the daemon via the hidden VBS launcher every 2 minutes. A per-user
-// time-triggered task does not require elevation (unlike ONLOGON), so this also
-// gives the non-admin Startup-folder install crash recovery, not just logon
-// recovery. Best-effort by contract: callers ignore the error.
-func installWatchdogTask(vbs string) error {
+// installUnprivilegedAgent is the no-elevation path. A per-user time-triggered
+// task needs no admin rights and fires after logon too (StartWhenAvailable), so
+// it is tried FIRST and is normally the only autostart artifact this path
+// creates — one mechanism, not two. The Startup shortcut is a fallback for
+// machines where policy blocks task creation entirely.
+func installUnprivilegedAgent(binaryPath string) (string, error) {
+	if err := installKeepaliveTask(binaryPath); err == nil {
+		_ = startDaemonNow(binaryPath)
+		return keepaliveTaskName, nil
+	}
+	lnk, err := installStartupAgentEntry(binaryPath)
+	if err != nil {
+		return "", err
+	}
+	if err := startDaemonNow(binaryPath); err != nil {
+		return lnk, fmt.Errorf("startup entry written but daemon failed to start: %w", err)
+	}
+	return lnk, nil
+}
+
+// installKeepaliveTask registers (idempotently) the periodic task that
+// relaunches the daemon if it has died. A per-user time-triggered task does not
+// require elevation (unlike ONLOGON), so this also gives the non-admin install
+// crash recovery, not just logon recovery.
+func installKeepaliveTask(binaryPath string) error {
 	// Clear any stale task from a prior install under a different security
 	// context; a missing task also errors, so this is best-effort.
-	_ = exec.Command("schtasks", "/Delete", "/F", "/TN", watchdogTaskName).Run()
+	_ = exec.Command("schtasks", "/Delete", "/F", "/TN", keepaliveTaskName).Run()
 
-	// /SC MINUTE /MO 2 = fire every 2 minutes, indefinitely. The launched daemon
-	// self-exits when another instance is already healthy, so this is a no-op
-	// while the daemon is up and a resurrection once it has died.
 	args := []string{
 		"/Create", "/F",
-		"/TN", watchdogTaskName,
-		"/TR", fmt.Sprintf("wscript.exe //B //Nologo \"%s\"", vbs),
+		"/TN", keepaliveTaskName,
+		"/TR", daemonCommand(binaryPath),
 		"/SC", "MINUTE",
-		"/MO", "2",
+		"/MO", fmt.Sprint(keepaliveMinutes),
 		"/RL", "LIMITED",
 	}
 	if out, err := exec.Command("schtasks", args...).CombinedOutput(); err != nil {
-		return fmt.Errorf("schtasks /Create watchdog: %w: %s", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("schtasks /Create keepalive: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	allowBatteryStart(watchdogTaskName)
+	allowBatteryStart(keepaliveTaskName)
 	return nil
 }
 
@@ -174,9 +195,9 @@ func installWatchdogTask(vbs string) error {
 // battery power. schtasks /Create has no switch for these settings, and its
 // defaults (DisallowStartIfOnBatteries + StopIfGoingOnBatteries) silently keep
 // the daemon dead on a laptop that boots unplugged: neither the ONLOGON revive
-// nor the 2-minute watchdog ever fires, so after a shutdown → power-on cycle
-// the daemon stays down until the editor plugin's /health respawn kicks in.
-// -StartWhenAvailable additionally lets the watchdog fire promptly after boot
+// nor the keepalive ever fires, so after a shutdown → power-on cycle the daemon
+// stays down until the editor plugin's /health respawn kicks in.
+// -StartWhenAvailable additionally lets the keepalive fire promptly after boot
 // instead of waiting for the next interval boundary. Best-effort: an old
 // PowerShell or a policy-restricted box keeps the schtasks defaults, which is
 // exactly the pre-patch behavior.
@@ -186,21 +207,6 @@ func allowBatteryStart(taskName string) {
 			"Set-ScheduledTask -TaskName '%s' -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable)",
 			taskName,
 		)).Run()
-}
-
-func installStartupAgent(binaryPath string) (string, error) {
-	vbsPath, err := installStartupAgentEntry(binaryPath)
-	if err != nil {
-		return "", err
-	}
-	// Crash recovery between logons: a per-user time-triggered task needs no
-	// elevation, so even this non-admin path gets keepalive. Best-effort — the
-	// Startup entry still covers the next logon if the watchdog can't register.
-	_ = installWatchdogTask(vbsPath)
-	if err := startDaemonNow(binaryPath); err != nil {
-		return vbsPath, fmt.Errorf("startup entry written but daemon failed to start: %w", err)
-	}
-	return vbsPath, nil
 }
 
 func windowsStartupDir() (string, error) {
@@ -245,42 +251,52 @@ func taskExists(taskName string) bool {
 // autostart registration WITHOUT touching the already-running daemon (no
 // /End, no immediate relaunch — installScheduledTask does those and would
 // kill the caller). Called best-effort every time the daemon starts, however
-// it was started (logon task, watchdog, editor-plugin respawn, or by hand) —
+// it was started (logon task, keepalive, editor-plugin respawn, or by hand) —
 // so a machine whose tasks were never created, were removed, or predate the
 // battery-settings fix converges to a working autostart the first time any
 // daemon comes up.
+//
+// This is also what migrates an existing install off the Defender-flagged
+// VBScript layout: the legacy artifacts are removed and the tasks re-created to
+// run the signed binary directly, without waiting for the user to reinstall.
 func EnsureDaemonAgent(binaryPath string) error {
-	vbs, err := writeLauncherVBS(binaryPath)
-	if err != nil {
-		return err
-	}
+	removeLegacyAgentArtifacts()
+
 	if taskExists(scheduledTaskName) {
-		// Re-apply the battery settings: tasks created before allowBatteryStart
-		// existed never fire on a laptop booting unplugged.
-		allowBatteryStart(scheduledTaskName)
+		// Re-assert the command line (an install predating this change still
+		// points at wscript + the .vbs we just deleted) and the battery
+		// settings (tasks created before allowBatteryStart existed never fire
+		// on a laptop booting unplugged).
+		if isWindowsAdmin() {
+			_ = createOnLogonTask(binaryPath)
+		} else {
+			allowBatteryStart(scheduledTaskName)
+		}
 	} else if isWindowsAdmin() {
-		if err := createOnLogonTask(vbs); err != nil {
-			// Fall back like InstallDaemonAgent does: a Startup-folder entry
-			// needs no elevation and still covers the next logon.
+		if err := createOnLogonTask(binaryPath); err != nil {
+			// Fall back like InstallDaemonAgent does: the keepalive task (below)
+			// needs no elevation, and a Startup shortcut covers the next logon.
 			if _, serr := installStartupAgentEntry(binaryPath); serr != nil {
 				return serr
 			}
 		}
-	} else {
-		if _, err := installStartupAgentEntry(binaryPath); err != nil {
-			return err
+	}
+	// The keepalive is a per-user time trigger — no elevation needed, so ensure
+	// it on every path. installKeepaliveTask is idempotent (/Delete + /Create /F)
+	// and re-applies the battery settings itself.
+	if err := installKeepaliveTask(binaryPath); err != nil {
+		if taskExists(scheduledTaskName) {
+			return nil // logon coverage is registered; keepalive is a bonus
+		}
+		if _, serr := installStartupAgentEntry(binaryPath); serr != nil {
+			return serr
 		}
 	}
-	// The watchdog is a per-user time trigger — no elevation needed, so ensure
-	// it on every path. installWatchdogTask is idempotent (/Delete + /Create /F)
-	// and re-applies the battery settings itself.
-	return installWatchdogTask(vbs)
+	return nil
 }
 
-// installStartupAgentEntry writes only the Startup-folder VBS (the non-admin
-// logon revive), without launching the daemon — shared by installStartupAgent
-// (which also starts the daemon now) and EnsureDaemonAgent (where the daemon
-// is already running).
+// installStartupAgentEntry writes only the Startup-folder shortcut (the
+// last-resort logon revive), without launching the daemon.
 func installStartupAgentEntry(binaryPath string) (string, error) {
 	startupDir, err := windowsStartupDir()
 	if err != nil {
@@ -289,23 +305,58 @@ func installStartupAgentEntry(binaryPath string) (string, error) {
 	if err := os.MkdirAll(startupDir, 0o755); err != nil {
 		return "", fmt.Errorf("mkdir startup: %w", err)
 	}
-	vbsPath := filepath.Join(startupDir, startupVBSName)
-	if err := atomicWrite(vbsPath, []byte(daemonLauncherVBSContent(binaryPath)), 0o644); err != nil {
+	lnk := filepath.Join(startupDir, startupShortcutName)
+	if err := writeShortcut(lnk, binaryPath, "daemon --background"); err != nil {
 		return "", err
 	}
-	return vbsPath, nil
+	return lnk, nil
+}
+
+// writeShortcut creates a .lnk pointing at target. A shortcut is what an
+// ordinary application puts in the Startup folder, and it carries no code of its
+// own — unlike the .vbs it replaces, what autostarts is the signed binary
+// itself.
+//
+// COM (IShellLink) is driven through a one-shot PowerShell call rather than
+// linking an OLE binding into the CLI: nothing is left on disk but the .lnk.
+func writeShortcut(lnkPath, target, args string) error {
+	script := fmt.Sprintf(
+		"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%s');"+
+			"$s.TargetPath='%s';$s.Arguments='%s';$s.WorkingDirectory='%s';"+
+			"$s.WindowStyle=7;$s.Description='Blamely background service';$s.Save()",
+		lnkPath, target, args, filepath.Dir(target),
+	)
+	out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("create startup shortcut: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	if _, statErr := os.Stat(lnkPath); statErr != nil {
+		return fmt.Errorf("create startup shortcut: %s was not written", lnkPath)
+	}
+	return nil
+}
+
+// removeLegacyAgentArtifacts deletes the pre-1.8.0 VBScript launchers and the
+// task that ran them. Best-effort and idempotent: a clean machine has none of
+// these, and a missing file/task is not an error worth surfacing.
+func removeLegacyAgentArtifacts() {
+	if startupDir, err := windowsStartupDir(); err == nil {
+		_ = os.Remove(filepath.Join(startupDir, legacyStartupVBSName))
+	}
+	if dir, err := config.BlamelyDir(); err == nil {
+		_ = os.Remove(filepath.Join(dir, "bin", legacyStartupVBSName))
+	}
+	_ = exec.Command("schtasks", "/Delete", "/F", "/TN", legacyWatchdogTaskName).Run()
 }
 
 func UninstallDaemonAgent() error {
+	removeLegacyAgentArtifacts()
 	if startupDir, err := windowsStartupDir(); err == nil {
-		_ = os.Remove(filepath.Join(startupDir, startupVBSName))
+		_ = os.Remove(filepath.Join(startupDir, startupShortcutName))
 	}
-	if vbs, err := launcherVBSPath(); err == nil {
-		_ = os.Remove(vbs)
-	}
-	// Remove the periodic keepalive watchdog. Best-effort: it won't exist on
-	// installs that predate it, and a missing task makes /Delete error.
-	_ = exec.Command("schtasks", "/Delete", "/F", "/TN", watchdogTaskName).Run()
+	// Remove the periodic keepalive. Best-effort: it won't exist on installs
+	// that predate it, and a missing task makes /Delete error.
+	_ = exec.Command("schtasks", "/Delete", "/F", "/TN", keepaliveTaskName).Run()
 	err := exec.Command("schtasks", "/Delete", "/F", "/TN", scheduledTaskName).Run()
 	if err != nil {
 		var ee *exec.ExitError
