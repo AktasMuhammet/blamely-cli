@@ -175,8 +175,14 @@ func fakeBinary(version string) string {
 	return "#!/bin/sh\necho \"blamely version " + version + "\"\n"
 }
 
-// pinInstalledSelf makes os.Executable() look like the installed copy so the
-// step-1 guard passes, and returns ~/.blamely/bin.
+// pinInstalledSelf makes the step-1 guard ("am I the installed copy?") pass, and
+// returns ~/.blamely/bin.
+//
+// The guard compares executablePath() with InstalledBinaryPath() by file
+// identity, so the test puts a placeholder at the installed path and points the
+// seam at it. Deliberately NOT a hardlink of the running test binary: on Windows
+// that leaves a locked image in the temp dir and t.TempDir() cleanup then fails
+// with "Access is denied".
 func pinInstalledSelf(t *testing.T) string {
 	t.Helper()
 	fakeHomeDir(t)
@@ -187,16 +193,12 @@ func pinInstalledSelf(t *testing.T) string {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// The step-1 guard compares os.Executable() with InstalledBinaryPath() by
-	// file IDENTITY (sameFile), and os.Executable() keeps reporting the test
-	// binary — so hardlink it into place to make the two the same inode.
-	self, err := os.Executable()
-	if err != nil {
+	if err := os.WriteFile(dst, []byte("placeholder installed binary"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Link(self, dst); err != nil {
-		t.Skipf("cannot hardlink the test binary into the fake home: %v", err)
-	}
+	prev := executablePath
+	executablePath = func() (string, error) { return dst, nil }
+	t.Cleanup(func() { executablePath = prev })
 	return filepath.Dir(dst)
 }
 

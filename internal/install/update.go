@@ -94,6 +94,13 @@ var runInstaller = func(bin string, args ...string) error {
 	return cmd.Run()
 }
 
+// executablePath resolves this process's own binary for the "am I the installed
+// copy?" guard. A package var so a test can point it at an ordinary file:
+// hardlinking the running test binary into a temp dir would work on Unix but
+// leaves a LOCKED image on Windows, which then fails t.TempDir() cleanup with
+// "Access is denied".
+var executablePath = os.Executable
+
 // UpdateChannel resolves which release channel to update from: $BLAMELY_CHANNEL
 // (one-off override, mirrors the installer), then update.channel in config (how
 // a fleet pins itself), then "latest".
@@ -265,7 +272,7 @@ func Update(ctx context.Context, opts UpdateOptions) (UpdateResult, error) {
 	// cannot detect a dev build — `version` is a hardcoded string that a local
 	// `go build` inherits — but path identity can.
 	if !opts.Force {
-		self, err := os.Executable()
+		self, err := executablePath()
 		if err != nil {
 			return res, fmt.Errorf("locate blamely binary: %w", err)
 		}
