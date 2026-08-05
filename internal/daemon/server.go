@@ -245,6 +245,10 @@ func Run(ctx context.Context) error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	// Ask periodically whether a newer blamely exists. Purely advisory unless
+	// update.auto is on, and silent on every failure — see watchForUpdates.
+	go watchForUpdates(ctx)
+
 	errCh := make(chan error, 1)
 	go func() {
 		if err := s.http.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {

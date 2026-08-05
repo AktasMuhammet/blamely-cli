@@ -61,25 +61,74 @@ type ToolsConfig struct {
 	ClaudeConfigDirs []string `json:"claude_config_dirs,omitempty"`
 }
 
+// UpdateConfig controls whether blamely keeps ITSELF up to date.
+//
+// Both checking AND applying are on by default: a machine running a stale build
+// mis-attributes silently — nothing looks broken, the numbers are just wrong —
+// so the cost of staying behind is higher than the cost of moving forward. An
+// update is only ever applied after it has been checksum-verified and the new
+// binary has been run once successfully, and a failure leaves the working
+// version untouched (see install.Update).
+//
+// Sites that need to pin a version — change-controlled fleets, anyone who
+// validates releases before rollout — opt OUT with
+// `blamely config set update.auto off`, or stop the check entirely with
+// `blamely config set update.check off` / BLAMELY_NO_UPDATE_CHECK=1. Auto
+// implies Check: with checking off, nothing is applied either.
+//
+// Channel/APIBase/IntervalHours are file-only settings (no `config set` verb):
+// Channel and APIBase already have env overrides (BLAMELY_CHANNEL,
+// BLAMELY_UPDATE_API) for one-off use, and a fleet sets them by deploying a
+// config.json.
+type UpdateConfig struct {
+	// Check lets the daemon ask whether a newer release exists and record the
+	// answer as a hint for `blamely status`/`doctor`. Never downloads anything.
+	Check bool `json:"check"`
+	// Auto lets the daemon APPLY an available update on its own. On by default;
+	// turning it off keeps the notice without the install.
+	Auto bool `json:"auto"`
+	// Channel overrides the release channel ("latest" or "beta"). Empty falls
+	// back to $BLAMELY_CHANNEL, then "latest".
+	Channel string `json:"channel,omitempty"`
+	// IntervalHours is how often the daemon checks. 0 means the 24h default.
+	IntervalHours int `json:"interval_hours,omitempty"`
+	// APIBase points the updater at an internal mirror of the releases API, for
+	// corp networks that block api.github.com. Empty means the public repo.
+	APIBase string `json:"api_base,omitempty"`
+}
+
 // Config is the user-editable CLI configuration at ~/.blamely/config.json.
 type Config struct {
-	Note  NoteConfig  `json:"note"`
-	Tools ToolsConfig `json:"tools"`
+	Note   NoteConfig   `json:"note"`
+	Tools  ToolsConfig  `json:"tools"`
+	Update UpdateConfig `json:"update"`
 }
 
 // DefaultConfig returns the default note settings: everything on except
-// Conversation and ConversationAssistant, which are opt-in.
+// Conversation and ConversationAssistant, which are opt-in. Self-update both
+// checks and applies by default (see UpdateConfig).
 func DefaultConfig() Config {
-	return Config{Note: NoteConfig{
-		FileLines:             true,
-		Conversation:          false,
-		ConversationUser:      true,
-		ConversationAssistant: false,
-		Message:               true,
-		CodingTime:            true,
-		Tokens:                true,
-	}}
+	return Config{
+		Note: NoteConfig{
+			FileLines:             true,
+			Conversation:          false,
+			ConversationUser:      true,
+			ConversationAssistant: false,
+			Message:               true,
+			CodingTime:            true,
+			Tokens:                true,
+		},
+		Update: UpdateConfig{
+			Check:         true,
+			Auto:          true,
+			IntervalHours: DefaultUpdateIntervalHours,
+		},
+	}
 }
+
+// DefaultUpdateIntervalHours is how often the daemon checks for a new release
+// when UpdateConfig.IntervalHours is unset.
+const DefaultUpdateIntervalHours = 24
 
 // ConfigFile returns the path to ~/.blamely/config.json.
 func ConfigFile() (string, error) {
@@ -127,14 +176,54 @@ func NoteKeys() []string {
 	}
 }
 
+// UpdateKeys returns the settable self-update toggles in display order. Unlike
+// the note keys, the "update." prefix is REQUIRED — a bare "check" or "auto"
+// would read as a note toggle.
+func UpdateKeys() []string {
+	return []string{
+		"update.check",
+		"update.auto",
+	}
+}
+
+// UpdateIntervalHours returns the configured check cadence, falling back to the
+// default so a missing or nonsensical value can't turn the daemon's periodic
+// check into a hot loop.
+func (c Config) UpdateIntervalHours() int {
+	if c.Update.IntervalHours <= 0 {
+		return DefaultUpdateIntervalHours
+	}
+	return c.Update.IntervalHours
+}
+
 // normKey lowercases, trims, and drops an optional "note." prefix so callers
 // may pass either "note.file_lines" or "file_lines".
 func normKey(key string) string {
 	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(key)), "note.")
 }
 
-// GetBool returns the value of a note toggle by key. ok=false for unknown keys.
+// updateKey splits a dotted update key ("update.auto" → "auto"). ok=false for
+// anything not update-scoped, so the note switch below sees only note keys.
+func updateKey(key string) (suffix string, ok bool) {
+	k := strings.ToLower(strings.TrimSpace(key))
+	if !strings.HasPrefix(k, "update.") {
+		return "", false
+	}
+	return strings.TrimPrefix(k, "update."), true
+}
+
+// GetBool returns the value of a note or update toggle by key. ok=false for
+// unknown keys.
 func (c Config) GetBool(key string) (val bool, ok bool) {
+	if k, isUpdate := updateKey(key); isUpdate {
+		switch k {
+		case "check":
+			return c.Update.Check, true
+		case "auto":
+			return c.Update.Auto, true
+		}
+		return false, false
+	}
 	switch normKey(key) {
 	case "file_lines":
 		return c.Note.FileLines, true
@@ -154,8 +243,19 @@ func (c Config) GetBool(key string) (val bool, ok bool) {
 	return false, false
 }
 
-// SetBool sets a note toggle by key. ok=false for unknown keys.
+// SetBool sets a note or update toggle by key. ok=false for unknown keys.
 func (c *Config) SetBool(key string, val bool) (ok bool) {
+	if k, isUpdate := updateKey(key); isUpdate {
+		switch k {
+		case "check":
+			c.Update.Check = val
+		case "auto":
+			c.Update.Auto = val
+		default:
+			return false
+		}
+		return true
+	}
 	switch normKey(key) {
 	case "file_lines":
 		c.Note.FileLines = val

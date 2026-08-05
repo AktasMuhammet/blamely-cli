@@ -21,6 +21,10 @@ type releaseInfo struct {
 	Name    string `json:"name"`
 	TagName string `json:"tag_name"`
 	Body    string `json:"body"`
+	// Assets are the downloadable files attached to the release. Unused by the
+	// notes path, populated for the updater (see update.go) — one type for both
+	// so the two can't drift apart on what a release looks like.
+	Assets []releaseAsset `json:"assets"`
 }
 
 // ReleaseChannel returns which release the notes should come from, mirroring the

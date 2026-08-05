@@ -10,6 +10,7 @@ import (
 
 	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/daemon"
+	"github.com/blamely/blamely/internal/updatehint"
 )
 
 // Doctor runs a full self-check of the blamely installation: daemon health,
@@ -27,6 +28,9 @@ func Doctor(w io.Writer) error {
 	d := &doctor{w: w}
 	d.daemon()
 	d.binary()
+	// Called from here, not inside binary(), so an available update is still
+	// reported when the binary check itself bails out early.
+	d.updateHint()
 	d.gitHook()
 	d.path()
 	d.db()
@@ -99,6 +103,18 @@ func (d *doctor) binary() {
 		return
 	}
 	d.ok("stable binary path", p)
+}
+
+// updateHint surfaces what the daemon's periodic check last found. It reads the
+// recorded hint only — doctor never makes a network call of its own, so it stays
+// instant and works offline.
+func (d *doctor) updateHint() {
+	h, ok := updatehint.Read()
+	if !ok {
+		return
+	}
+	d.warn("version", fmt.Sprintf("%s installed, %s available", Version, h.Version),
+		"run `blamely update`")
 }
 
 func (d *doctor) gitHook() {

@@ -9,6 +9,7 @@ import (
 
 	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/store"
+	"github.com/blamely/blamely/internal/updatehint"
 )
 
 // healthClient returns an HTTP client and target URL for the daemon's /health
@@ -110,6 +111,10 @@ func WaitForReady(timeout time.Duration) (string, error) {
 }
 
 func PrintStatus() error {
+	// Printed first, and independently of daemon health: whether a newer blamely
+	// exists has nothing to do with whether the daemon is up, and the paths
+	// below return early.
+	printUpdateHint()
 	client, url, addr, err := healthClient()
 	if err != nil {
 		fmt.Println("daemon: NOT RUNNING")
@@ -129,6 +134,17 @@ func PrintStatus() error {
 	fmt.Printf("daemon: HEALTHY on %s\n", addr)
 	printSessionUsage()
 	return nil
+}
+
+// printUpdateHint shows what the daemon's periodic check last found. It reads
+// the recorded hint only — status never makes a network call, so it stays
+// instant and silent offline.
+func printUpdateHint() {
+	h, ok := updatehint.Read()
+	if !ok {
+		return
+	}
+	fmt.Printf("update:  %s available (run `blamely update`)\n", h.Version)
 }
 
 // printSessionUsage shows recent per-session, per-model CUMULATIVE token totals

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,6 +24,7 @@ import (
 	"github.com/blamely/blamely/internal/report"
 	"github.com/blamely/blamely/internal/store"
 	"github.com/blamely/blamely/internal/tools"
+	"github.com/blamely/blamely/internal/updatehint"
 )
 
 // Wire Attribution note-seeding into the engine here, at the top level: main can
@@ -40,7 +42,7 @@ func init() {
 // JetBrains plugins. The release workflow can still override it at link time via
 // `-ldflags "-X main.version=<tag>"`; otherwise this hardcoded value is what
 // `blamely --version` reports.
-var version = "1.7.0"
+var version = "1.8.0"
 
 // resolveVersion returns the effective CLI version. Precedence:
 //  1. an explicit -ldflags override (release builds);
@@ -93,6 +95,9 @@ func main() {
 	ver := resolveVersion()
 	gitnotes.Version = ver
 	report.Version = ver
+	// The updater compares against this, and the daemon-side check needs it too
+	// (resolveVersion lives here, out of reach of internal/daemon).
+	install.Version = ver
 
 	root := &cobra.Command{
 		Use:   "blamely",
@@ -107,6 +112,7 @@ func main() {
 
 	root.AddCommand(cmdDaemon())
 	root.AddCommand(cmdInstall())
+	root.AddCommand(cmdUpdate())
 	root.AddCommand(cmdInstallJetbrainsZip())
 	root.AddCommand(cmdUninstall())
 	root.AddCommand(cmdRepair())
@@ -188,6 +194,21 @@ func cmdDaemon() *cobra.Command {
 					}
 				}
 			}()
+			// Hand the daemon its update check/apply as closures: internal/daemon
+			// cannot import internal/install (install imports daemon), so this is
+			// the same indirection the watcher lists above use.
+			daemon.CheckUpdate = func(ctx context.Context) (updatehint.Hint, bool, error) {
+				rel, newer, err := install.CheckForUpdate(ctx, install.Version)
+				if err != nil {
+					return updatehint.Hint{}, false, err
+				}
+				_, url, _ := rel.ArchiveURL()
+				return updatehint.Hint{Version: rel.Version, Tag: rel.Tag, URL: url}, newer, nil
+			}
+			daemon.ApplyUpdate = func(ctx context.Context) error {
+				_, err := install.Update(ctx, install.UpdateOptions{Current: install.Version, Out: io.Discard})
+				return err
+			}
 			return daemon.Run(cmd.Context())
 		},
 	}
@@ -303,6 +324,87 @@ func cmdInstall() *cobra.Command {
 	}
 	c.Flags().BoolVar(&skipPlugins, "skip-plugins", false,
 		"skip installing the VS Code-family/JetBrains IDE plugins (CLI + hooks only — handy for local dev builds)")
+	return c
+}
+
+func cmdUpdate() *cobra.Command {
+	var (
+		check       bool
+		force       bool
+		dryRun      bool
+		withPlugins bool
+		channel     string
+		from        string
+		sha256Sum   string
+	)
+	c := &cobra.Command{
+		Use:   "update",
+		Short: "Update blamely to the latest release",
+		Long: "Download and install the newest blamely, then re-register the tool hooks\n" +
+			"and restart the daemon.\n\n" +
+			"The download is checked against the release's SHA256SUMS and the new binary\n" +
+			"is run once before anything is replaced, so a bad download can never leave\n" +
+			"you without a working install.\n\n" +
+			"Air-gapped or behind a proxy that blocks api.github.com:\n" +
+			"  blamely update --from ./blamely_v1.8.0_linux_amd64.tar.gz --sha256 <sum>\n" +
+			"  BLAMELY_UPDATE_API=https://mirror.corp/repos/x/y blamely update\n\n" +
+			"The daemon already does this for you once a day. To be notified without\n" +
+			"installing: blamely config set update.auto off — or stop checking entirely\n" +
+			"with blamely config set update.check off.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			out := cmd.OutOrStdout()
+			if check {
+				// Report only — never downloads, never touches the installed copy.
+				ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Second)
+				defer cancel()
+				rel, newer, err := install.CheckForUpdate(ctx, install.Version)
+				if err != nil {
+					return err
+				}
+				if !newer {
+					fmt.Fprintf(out, "blamely %s is up to date\n", install.Version)
+					return nil
+				}
+				fmt.Fprintf(out, "update available: %s -> %s  (run `blamely update`)\n", install.Version, rel.Version)
+				return nil
+			}
+			// `sudo blamely update` would reinstall the per-user daemon under
+			// root; drop back to the invoking user, exactly like install does.
+			if err := install.DropToInvokingUserIfRoot(); err != nil {
+				return err
+			}
+			res, err := install.Update(cmd.Context(), install.UpdateOptions{
+				Current:     install.Version,
+				Channel:     channel,
+				Force:       force,
+				DryRun:      dryRun,
+				WithPlugins: withPlugins,
+				FromArchive: from,
+				ExpectSHA:   sha256Sum,
+				Out:         out,
+			})
+			if err != nil {
+				return err
+			}
+			if !res.Updated {
+				return nil
+			}
+			fmt.Fprintf(out, "updated %s -> %s\n", res.From, res.To)
+			// The hint (if any) described the version we just installed.
+			_ = updatehint.Clear()
+			install.PrintWhatsNew()
+			return nil
+		},
+	}
+	c.Flags().BoolVar(&check, "check", false, "only report whether a newer version exists")
+	c.Flags().BoolVar(&force, "force", false, "install even at the same version, and from a non-installed copy")
+	c.Flags().BoolVar(&dryRun, "dry-run", false, "resolve and compare versions, then stop before downloading")
+	c.Flags().BoolVar(&withPlugins, "with-plugins", false,
+		"also reinstall the IDE plugins (off by default so an update never clobbers a sideloaded dev build)")
+	c.Flags().StringVar(&channel, "channel", "", "release channel to update from (default: latest)")
+	c.Flags().StringVar(&from, "from", "", "install this local release archive instead of downloading (air-gapped)")
+	c.Flags().StringVar(&sha256Sum, "sha256", "", "expected sha256 of --from's archive (required with --from)")
 	return c
 }
 
@@ -872,7 +974,7 @@ func cmdConfig() *cobra.Command {
 		Short: "View or change what blamely writes into commit notes",
 		Long: "Manage ~/.blamely/config.json. Every toggle defaults to on; turning one\n" +
 			"off keeps it out of future commit notes (existing notes are untouched).\n\n" +
-			"Keys: " + strings.Join(config.NoteKeys(), ", ") + "\n" +
+			"Keys: " + strings.Join(settableKeys(), ", ") + "\n" +
 			"List keys (extra AI-tool dirs, additive to the defaults): " +
 			strings.Join(config.ListKeys(), ", ") + "\n\n" +
 			"Examples:\n" +
@@ -880,6 +982,7 @@ func cmdConfig() *cobra.Command {
 			"  blamely config get note.conversation\n" +
 			"  blamely config set note.file_lines off\n" +
 			"  blamely config set tokens true       # 'note.' prefix optional\n" +
+			"  blamely config set update.auto off   # notify about updates, don't install\n" +
 			"  blamely config add tools.codex_home /path/to/.codex-corp/codex-config\n" +
 			"  blamely config remove tools.claude_config_dir /path/to/.claude-corp/claude-config\n" +
 			"  blamely config path",
@@ -909,7 +1012,7 @@ func runConfigShow(cmd *cobra.Command) error {
 	if path, err := config.ConfigFile(); err == nil {
 		fmt.Fprintf(cmd.OutOrStdout(), "%s\n\n", path)
 	}
-	for _, key := range config.NoteKeys() {
+	for _, key := range append(config.NoteKeys(), config.UpdateKeys()...) {
 		v, _ := cfg.GetBool(key)
 		fmt.Fprintf(cmd.OutOrStdout(), "  %-30s %v\n", key, v)
 	}
@@ -933,7 +1036,7 @@ func cmdConfigGet() *cobra.Command {
 			cfg := config.LoadConfig()
 			v, ok := cfg.GetBool(args[0])
 			if !ok {
-				return fmt.Errorf("unknown key %q (valid: %s)", args[0], strings.Join(config.NoteKeys(), ", "))
+				return fmt.Errorf("unknown key %q (valid: %s)", args[0], strings.Join(settableKeys(), ", "))
 			}
 			fmt.Fprintln(cmd.OutOrStdout(), v)
 			return nil
@@ -953,7 +1056,7 @@ func cmdConfigSet() *cobra.Command {
 			}
 			cfg := config.LoadConfig()
 			if !cfg.SetBool(args[0], val) {
-				return fmt.Errorf("unknown key %q (valid: %s)", args[0], strings.Join(config.NoteKeys(), ", "))
+				return fmt.Errorf("unknown key %q (valid: %s)", args[0], strings.Join(settableKeys(), ", "))
 			}
 			path, err := config.SaveConfig(cfg)
 			if err != nil {
@@ -1023,6 +1126,12 @@ func cmdConfigRemove() *cobra.Command {
 // canonicalKey maps a user-supplied key (bare or dotted, any case) to its
 // canonical dotted form so `set` echoes a consistent name. Falls back to the
 // input if it's not a known key (Set already rejected it by then).
+// settableKeys is every boolean key `config get`/`config set` accepts: the note
+// toggles plus the self-update ones.
+func settableKeys() []string {
+	return append(config.NoteKeys(), config.UpdateKeys()...)
+}
+
 func canonicalKey(userKey string) string {
 	norm := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(userKey)), "note.")
 	for _, k := range config.NoteKeys() {

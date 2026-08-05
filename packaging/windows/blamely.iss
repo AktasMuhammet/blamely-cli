@@ -8,10 +8,10 @@
 ;     per-user daemon, set git core.hooksPath, and wire each detected AI tool hook
 ;   - runs `blamely uninstall` on removal
 ;
-; A SIGNED installer is what clears SmartScreen / Defender — an unsigned,
-; garble-obfuscated .exe is what trips the Trojan:Win32 false positives and what
-; makes the `irm | iex` script get blocked by corporate security. Sign at compile
-; time with the SignTool directive (configured by the caller, see build note).
+; A SIGNED installer is what clears SmartScreen / Defender — historically the
+; unsigned .exe tripped Trojan:Win32 false positives and made the `irm | iex`
+; script get blocked by corporate security. Release builds are now signed via
+; Azure Trusted Signing in CI (publisher "Oobeya Inc", Microsoft public chain).
 ;
 ; Build (on Windows, with Inno Setup 6):
 ;   iscc /DAppVersion=1.7.0 /DArch=x64 ^
