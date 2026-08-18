@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -159,9 +158,7 @@ func RecordClaudeFromStdin(r io.Reader) error {
 					return recordToolDeletionPath(path, p.Cwd, "cursor", cursorGenType(p), p.Model, p.SessionID, p.TranscriptPath, "cursor_delete")
 				}
 			case "Shell":
-				if root := findRepoRoot(p.Cwd, p.Cwd); root != "" {
-					return recordShellDeletions(root, shellCommandFromInput(p.ToolInput), "cursor", cursorGenType(p), p.Model, p.SessionID, p.TranscriptPath, "cursor_shell_delete")
-				}
+				return recordShellDeletionsFrom(p.Cwd, shellCommandFromInput(p.ToolInput), "cursor", cursorGenType(p), p.Model, p.SessionID, p.TranscriptPath, "cursor_shell_delete")
 			}
 			return nil
 		}
@@ -279,15 +276,20 @@ const (
 // never appear. Each changed source file is recorded as a medium-confidence
 // claude edit covering the whole file, matching how a Write is stored, so the
 // existing commit-time attribution credits it without any further changes.
+// A cwd ABOVE the repos (a workspace dir holding separate `backend/` and
+// `frontend/` clones) resolves to every repo nested beneath it, so an agent
+// started there still gets its shell writes attributed — see DiscoverRepos.
 func recordClaudeBashWrites(cwd, sessionID, transcriptPath, genType, command string) error {
-	if cwd == "" {
-		return nil
+	for _, root := range gitutil.DiscoverRepos(cwd) {
+		if err := recordClaudeBashWritesIn(root, sessionID, transcriptPath, genType, command); err != nil {
+			return err
+		}
 	}
-	root, ok := gitToplevel(cwd)
-	if !ok {
-		return nil
-	}
+	return nil
+}
 
+// recordClaudeBashWritesIn is recordClaudeBashWrites scoped to one repo root.
+func recordClaudeBashWritesIn(root, sessionID, transcriptPath, genType, command string) error {
 	// File deletions the command performed (e.g. `rm foo.html`), scoped to the
 	// command's actual rm/del targets so a file the USER deleted by hand isn't
 	// swept in. Done first (and unconditionally) so a command that ONLY deletes
@@ -296,6 +298,18 @@ func recordClaudeBashWrites(cwd, sessionID, transcriptPath, genType, command str
 		return err
 	}
 
+	for _, payload := range claudeBashWritePayloads(root, sessionID, transcriptPath, genType) {
+		if err := postToDaemon(payload); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// claudeBashWritePayloads builds the edit payloads for the files a Bash command
+// just wrote inside `root`. Split out from the recording so the resolution can be
+// asserted in tests without a running daemon.
+func claudeBashWritePayloads(root, sessionID, transcriptPath, genType string) []daemon.EditPayload {
 	files := recentlyChangedFiles(root, bashWriteWindow)
 	// none → read-only command (ls/grep/test); too many → bulk op we won't guess.
 	if len(files) == 0 || len(files) > maxBashWriteFiles {
@@ -305,6 +319,7 @@ func recordClaudeBashWrites(cwd, sessionID, transcriptPath, genType, command str
 	if repoID == "" {
 		repoID = root
 	}
+	out := make([]daemon.EditPayload, 0, len(files))
 	for _, rel := range files {
 		abs := filepath.Join(root, rel)
 		ranges := perLineShaRanges(abs)
@@ -329,18 +344,16 @@ func recordClaudeBashWrites(cwd, sessionID, transcriptPath, genType, command str
 			sessionID:      sessionID,
 			tool:           "claude",
 		})
-		if err := postToDaemon(payload); err != nil {
-			return err
-		}
+		out = append(out, payload)
 	}
-	return nil
+	return out
 }
 
 // gitDeletedFiles returns repo-relative source-file paths git reports as
 // deleted in the working tree (a 'D' in either status column). The files are
 // gone from disk, so their content must come from HEAD.
 func gitDeletedFiles(root string) []string {
-	out, err := exec.Command("git", "-C", root, "status", "--porcelain", "--untracked-files=no").Output()
+	out, err := gitutil.Output(root, "status", "--porcelain", "--untracked-files=no")
 	if err != nil {
 		return nil
 	}
@@ -368,7 +381,7 @@ func gitDeletedFiles(root string) []string {
 // at HEAD — the removed-line content hashes for a deleted file, so commit-time
 // attribution can credit the AI that deleted it.
 func headFileRemovedHashes(root, rel string) []DeletedLineHash {
-	out, err := exec.Command("git", "-C", root, "show", "HEAD:"+filepath.ToSlash(rel)).Output()
+	out, err := gitutil.Output(root, "show", "HEAD:"+filepath.ToSlash(rel))
 	if err != nil {
 		return nil
 	}
@@ -479,6 +492,28 @@ func recordShellDeletions(root, command, tool, genType, model, sessionID, transc
 	return nil
 }
 
+// recordShellDeletionsFrom is recordShellDeletions for a command whose only
+// location hint is the agent's cwd. It runs the scan for EVERY repo that cwd
+// resolves to: normally the single repo containing cwd, but — when the agent was
+// started ABOVE its repos, e.g. a workspace dir holding separate `backend/` and
+// `frontend/` clones — each repo nested beneath it. `git rev-parse` cannot find
+// those (it only searches upward), so without this every shell deletion from such
+// a session is dropped and the removed lines fall back to Human at commit.
+func recordShellDeletionsFrom(cwd, command, tool, genType, model, sessionID, transcriptPath, source string) error {
+	return recordShellDeletionsIn(gitutil.DiscoverRepos(cwd), command, tool, genType, model, sessionID, transcriptPath, source)
+}
+
+// recordShellDeletionsIn runs recordShellDeletions over an already-resolved set
+// of repo roots, for callers that need to know whether any repo was found at all.
+func recordShellDeletionsIn(roots []string, command, tool, genType, model, sessionID, transcriptPath, source string) error {
+	for _, root := range roots {
+		if err := recordShellDeletions(root, command, tool, genType, model, sessionID, transcriptPath, source); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // shellCommandFromInput pulls the shell command out of a tool's hook input,
 // accepting both `command` (Bash/Cursor Shell/Gemini/Copilot) and `cmd`.
 func shellCommandFromInput(raw json.RawMessage) string {
@@ -561,8 +596,7 @@ func perLineShaRangesFromContent(content string) []LineRange {
 // changed/untracked and whose on-disk mtime is within `window` of now. Using
 // git keeps the result bounded (usually a handful of paths) and gitignore-aware.
 func recentlyChangedFiles(root string, window time.Duration) []string {
-	cmd := exec.Command("git", "-C", root, "status", "--porcelain", "--untracked-files=all")
-	out, err := cmd.Output()
+	out, err := gitutil.Output(root, "status", "--porcelain", "--untracked-files=all")
 	if err != nil {
 		return nil
 	}
@@ -819,8 +853,7 @@ func findRepoRoot(filePath, fallbackCwd string) string {
 }
 
 func gitToplevel(dir string) (string, bool) {
-	cmd := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel")
-	out, err := cmd.Output()
+	out, err := gitutil.Output(dir, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return "", false
 	}

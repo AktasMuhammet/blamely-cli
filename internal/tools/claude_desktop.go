@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -407,7 +406,7 @@ func expandRelAtHead(host, rel string) []string {
 	if !strings.ContainsAny(rel, "*?[") {
 		return []string{rel}
 	}
-	out, err := exec.Command("git", "-C", host, "ls-tree", "-r", "--name-only", "HEAD").Output()
+	out, err := gitutil.Output(host, "ls-tree", "-r", "--name-only", "HEAD")
 	if err != nil {
 		return nil
 	}
@@ -476,7 +475,7 @@ func parseClaudeDesktopMounts(mainLog string) map[string]string {
 // repoStatusSignature is a content hash of `git status --porcelain`, used to
 // skip re-recording a working tree that hasn't changed since the last reconcile.
 func repoStatusSignature(root string) string {
-	out, err := exec.Command("git", "-C", root, "status", "--porcelain").Output()
+	out, err := gitutil.Output(root, "status", "--porcelain")
 	if err != nil {
 		return ""
 	}

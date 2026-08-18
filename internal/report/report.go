@@ -18,26 +18,32 @@ import (
 // RenderCommit prints a line-by-line attribution view for the given commit
 // by reading its blamely git note.
 func RenderCommit(sha string) error {
-	// Use cwd as repo path.
-	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	// The repo(s) at or below the cwd — see currentRepoRoots for why "below".
+	repos, err := currentRepoRoots()
 	if err != nil {
-		return fmt.Errorf("not a git repo: %w", err)
+		return err
 	}
-	repo := strings.TrimSpace(string(out))
-
-	body, err := readNote(repo, sha)
-	if err != nil {
-		return fmt.Errorf("no blamely note for %s: %w", sha, err)
+	var rendered int
+	for _, repo := range repos {
+		body, err := readNote(repo, sha)
+		if err != nil {
+			continue // this repo has no note for sha (nor, often, the commit)
+		}
+		var note gitnotes.Note
+		if err := json.Unmarshal(body, &note); err != nil {
+			return fmt.Errorf("parse note: %w", err)
+		}
+		meta, err := commitMeta(repo, sha)
+		if err != nil {
+			meta = commitMeta_{"sha": sha}
+		}
+		repoBanner(os.Stdout, repo, len(repos) > 1)
+		renderDashboard(os.Stdout, &note, meta, true)
+		rendered++
 	}
-	var note gitnotes.Note
-	if err := json.Unmarshal(body, &note); err != nil {
-		return fmt.Errorf("parse note: %w", err)
+	if rendered == 0 {
+		return fmt.Errorf("no blamely note for %s", sha)
 	}
-	meta, err := commitMeta(repo, sha)
-	if err != nil {
-		meta = commitMeta_{"sha": sha}
-	}
-	renderDashboard(os.Stdout, &note, meta, true)
 	return nil
 }
 
@@ -50,14 +56,21 @@ func RenderSince(since string) error {
 // HTML dashboard, writes it to outPath (a temp file when empty), optionally
 // opens it in the default browser, and returns the file path it wrote.
 func RenderCommitHTML(sha, outPath string, openFile bool) (string, error) {
-	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	repos, err := currentRepoRoots()
 	if err != nil {
-		return "", fmt.Errorf("not a git repo: %w", err)
+		return "", err
 	}
-	repo := strings.TrimSpace(string(out))
-
-	noteBytes, err := readNote(repo, sha)
-	if err != nil {
+	// One HTML file means one commit: take the first repo that actually has a
+	// note for `sha` rather than assuming the cwd's repo is the right one.
+	repo := repos[0]
+	var noteBytes []byte
+	for _, r := range repos {
+		if b, rerr := readNote(r, sha); rerr == nil {
+			repo, noteBytes = r, b
+			break
+		}
+	}
+	if noteBytes == nil {
 		return "", fmt.Errorf("no blamely note for %s: run `blamely attribute %s %s` first", sha, repo, sha)
 	}
 	var note gitnotes.Note

@@ -215,6 +215,7 @@ func tailCodexSession(ctx context.Context, path string, sink daemon.Sink, db *st
 type codexState struct {
 	model   string
 	genType string // resolved from session_meta (chat for IDE surfaces, else cli)
+	cwd     string // session working dir; fallback when a shell call omits workdir
 	pending []daemon.Event
 	sink    daemon.Sink
 }
@@ -342,6 +343,27 @@ type codexWrappedLine struct {
 	Payload   json.RawMessage `json:"payload"`
 }
 
+// codexWrappedEnvelope decides whether a line uses the wrapped envelope and, if
+// so, returns it. A wrapped line is any {"type", "payload": {...}} pair — the
+// known types are listed for clarity, but an unrecognized one with an object
+// payload is still treated as wrapped (it no-ops downstream) rather than being
+// handed to the flat parser, so a new envelope type — 0.145 added `world_state`
+// — can't be misread. Flat-format lines carry no `payload` field at all.
+func codexWrappedEnvelope(raw []byte) (*codexWrappedLine, bool) {
+	var env codexWrappedLine
+	if json.Unmarshal(raw, &env) != nil || env.Type == "" || len(env.Payload) == 0 {
+		return nil, false
+	}
+	switch env.Type {
+	case "session_meta", "response_item", "event_msg", "turn_context", "world_state":
+		return &env, true
+	}
+	if env.Payload[0] == '{' {
+		return &env, true
+	}
+	return nil, false
+}
+
 // processCodexLine handles one JSONL event from a Codex session. It carries
 // the latest seen model on the state, buffers patch-derived events, and
 // drains the buffer when a usage block arrives.
@@ -352,13 +374,9 @@ type codexWrappedLine struct {
 // below). We try the wrapped shape first since that's what current installs
 // produce, and fall back to the flat parser otherwise.
 func processCodexLine(raw []byte, st *codexState) {
-	var env codexWrappedLine
-	if err := json.Unmarshal(raw, &env); err == nil && len(env.Payload) > 0 {
-		switch env.Type {
-		case "turn_context", "event_msg", "session_meta", "response_item":
-			processCodexWrappedLine(&env, st)
-			return
-		}
+	if env, ok := codexWrappedEnvelope(raw); ok {
+		processCodexWrappedLine(env, st)
+		return
 	}
 
 	var ln codexLine
@@ -435,16 +453,26 @@ func processCodexWrappedLine(env *codexWrappedLine, st *codexState) {
 		var p struct {
 			Originator string `json:"originator"`
 			Source     string `json:"source"`
+			Cwd        string `json:"cwd"`
 		}
 		if json.Unmarshal(env.Payload, &p) == nil {
 			st.genType = codexGenType(p.Originator, p.Source)
+			if p.Cwd != "" {
+				st.cwd = p.Cwd
+			}
 		}
 	case "turn_context":
 		var p struct {
 			Model string `json:"model"`
+			Cwd   string `json:"cwd"`
 		}
-		if json.Unmarshal(env.Payload, &p) == nil && p.Model != "" {
-			st.model = p.Model
+		if json.Unmarshal(env.Payload, &p) == nil {
+			if p.Model != "" {
+				st.model = p.Model
+			}
+			if p.Cwd != "" {
+				st.cwd = p.Cwd
+			}
 		}
 	case "event_msg":
 		var head struct {
@@ -467,45 +495,95 @@ func processCodexWrappedLine(env *codexWrappedLine, st *codexState) {
 	}
 }
 
-// codexShellNames are the function-call names Codex uses to run a shell
-// command. shell_command is what current Codex builds emit (observed with the
-// VS Code surface, cli_version 0.142.0 — it names every PowerShell/bash exec
-// "shell_command"); exec_command and the rest cover other / older builds so a
-// shell deletion is caught regardless of the wrapper.
-var codexShellNames = map[string]bool{
-	"shell_command":    true,
-	"exec_command":     true,
-	"shell":            true,
-	"local_shell":      true,
-	"local_shell_call": true,
-	"container.exec":   true,
+// codexShellNameList are the tool names Codex uses to run a shell command.
+// shell_command is what current builds emit (observed with the VS Code surface,
+// cli_version 0.142.0 — it names every PowerShell/bash exec "shell_command");
+// exec_command and the rest cover other / older builds so a shell deletion is
+// caught regardless of the wrapper. Ordered (not just a set) so the 0.145+
+// script scan below walks candidates deterministically.
+var codexShellNameList = []string{
+	"shell_command",
+	"exec_command",
+	"local_shell_call",
+	"local_shell",
+	"container.exec",
+	"shell",
 }
 
-// emitCodexShellDeletions inspects a response_item function_call. When it's a
-// shell command that deletes files (`rm`/`git rm`, or Windows `del`/`erase`/
-// `Remove-Item`), it fingerprints each deleted file's HEAD content as removed
-// lines and buffers a codex event — mirroring how Claude handles a `Bash rm`,
-// so commit-time attribution credits Codex for the deletion instead of Human.
-func emitCodexShellDeletions(payload json.RawMessage, when time.Time, st *codexState) {
+// codexShellNames is codexShellNameList as a lookup set.
+var codexShellNames = func() map[string]bool {
+	m := make(map[string]bool, len(codexShellNameList))
+	for _, n := range codexShellNameList {
+		m[n] = true
+	}
+	return m
+}()
+
+// codexShellInvocation is one shell command recovered from a response_item,
+// in whichever shape the running Codex build encodes it.
+type codexShellInvocation struct {
+	Cmd     string
+	Workdir string
+}
+
+// codexShellInvocations extracts every shell command a response_item payload
+// runs. Two encodings are supported, because Codex changed shape at 0.145:
+//
+//	≤0.144  {"type":"function_call","name":"shell_command",
+//	         "arguments":"{\"command\":\"...\",\"workdir\":\"...\"}"}
+//	≥0.145  {"type":"custom_tool_call","name":"exec",
+//	         "input":"const r = await tools.shell_command({command:\"...\",
+//	                  \"workdir\":\"...\"}); text(r)\n"}
+//
+// The newer form routes every tool through one `exec` call whose body is a
+// JavaScript snippet, so the command is no longer a JSON field — it's a JS
+// string literal inside source text, and one script may issue several calls.
+func codexShellInvocations(payload json.RawMessage) []codexShellInvocation {
 	var p struct {
 		Type      string          `json:"type"`
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`
+		Input     json.RawMessage `json:"input"`
 	}
-	if json.Unmarshal(payload, &p) != nil || p.Type != "function_call" {
-		return
+	if json.Unmarshal(payload, &p) != nil {
+		return nil
 	}
-	if !codexShellNames[strings.ToLower(p.Name)] {
-		return
+	switch p.Type {
+	case "function_call", "custom_tool_call", "tool_call", "local_shell_call":
+	default:
+		return nil
 	}
-	// arguments is usually a JSON object, but some builds encode it as a JSON
-	// string-of-JSON — unwrap that first.
-	raw := p.Arguments
-	if len(raw) > 0 && raw[0] == '"' {
-		var s string
-		if json.Unmarshal(raw, &s) == nil {
-			raw = json.RawMessage(s)
+	// Legacy shape: the call itself IS the shell tool and carries JSON args.
+	if codexShellNames[strings.ToLower(p.Name)] {
+		if inv, ok := codexShellArgsJSON(p.Arguments); ok {
+			return []codexShellInvocation{inv}
 		}
+	}
+	// 0.145+ shape: a JS body that calls tools.shell_command(...). Keyed off the
+	// body's content rather than the wrapper's name ("exec" today), so a future
+	// rename of the wrapper doesn't break detection again.
+	src := codexJSONString(p.Input)
+	if src == "" {
+		src = codexJSONString(p.Arguments)
+	}
+	if src == "" {
+		return nil
+	}
+	return codexExecScriptShellCalls(src)
+}
+
+// codexShellArgsJSON reads the legacy `arguments` object. Some builds encode it
+// as a JSON string-of-JSON, so that is unwrapped first.
+func codexShellArgsJSON(raw json.RawMessage) (codexShellInvocation, bool) {
+	if len(raw) == 0 {
+		return codexShellInvocation{}, false
+	}
+	if raw[0] == '"' {
+		var s string
+		if json.Unmarshal(raw, &s) != nil {
+			return codexShellInvocation{}, false
+		}
+		raw = json.RawMessage(s)
 	}
 	var args struct {
 		Cmd     string `json:"cmd"`
@@ -514,15 +592,181 @@ func emitCodexShellDeletions(payload json.RawMessage, when time.Time, st *codexS
 		Cwd     string `json:"cwd"`
 	}
 	if json.Unmarshal(raw, &args) != nil {
-		return
+		return codexShellInvocation{}, false
 	}
-	cmd := args.Cmd
-	if cmd == "" {
-		cmd = args.Command
+	inv := codexShellInvocation{Cmd: args.Cmd, Workdir: args.Workdir}
+	if inv.Cmd == "" {
+		inv.Cmd = args.Command
 	}
-	workdir := args.Workdir
+	if inv.Workdir == "" {
+		inv.Workdir = args.Cwd
+	}
+	if inv.Cmd == "" {
+		return codexShellInvocation{}, false
+	}
+	return inv, true
+}
+
+// codexJSONString returns raw decoded as a JSON string, or "" if it isn't one.
+func codexJSONString(raw json.RawMessage) string {
+	if len(raw) == 0 || raw[0] != '"' {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		return ""
+	}
+	return s
+}
+
+// codexExecScriptShellCalls pulls (command, workdir) out of the JavaScript body
+// Codex 0.145+ hands its single `exec` tool, e.g.
+//
+//	const r = await tools.shell_command({command:"Remove-Item x", "workdir":"D:\\Dev"}); text(r)
+//
+// One script may run several commands, so every call site is scanned.
+func codexExecScriptShellCalls(src string) []codexShellInvocation {
+	var out []codexShellInvocation
+	seen := map[codexShellInvocation]bool{}
+	for _, name := range codexShellNameList {
+		needle := "tools." + name
+		for i := 0; i < len(src); {
+			j := strings.Index(src[i:], needle)
+			if j < 0 {
+				break
+			}
+			at := i + j + len(needle)
+			i = at
+			// Require a call here, so needle "tools.shell" doesn't also match
+			// inside "tools.shell_command" and double-report the command.
+			k := at
+			for k < len(src) && isJSSpaceByte(src[k]) {
+				k++
+			}
+			if k >= len(src) || src[k] != '(' {
+				continue
+			}
+			rest := src[k:]
+			inv := codexShellInvocation{
+				Cmd:     firstNonEmpty(jsObjectStringField(rest, "command"), jsObjectStringField(rest, "cmd")),
+				Workdir: firstNonEmpty(jsObjectStringField(rest, "workdir"), jsObjectStringField(rest, "cwd")),
+			}
+			if inv.Cmd == "" || seen[inv] {
+				continue
+			}
+			seen[inv] = true
+			out = append(out, inv)
+		}
+	}
+	return out
+}
+
+func isJSSpaceByte(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+func isJSWordByte(c byte) bool {
+	return c == '_' || c == '$' ||
+		(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+}
+
+// jsObjectStringField finds `key: "value"` in JS object-literal source and
+// returns the value with its escapes resolved. Tolerates quoted keys — Codex
+// emits the mixed `{command:"...", "workdir":"..."}` form — and single, double,
+// or backtick quoting. Returns "" when the key is absent or isn't a literal.
+func jsObjectStringField(src, key string) string {
+	for i := 0; i+len(key) <= len(src); i++ {
+		if !strings.HasPrefix(src[i:], key) {
+			continue
+		}
+		// Skip a match that's really the tail of a longer identifier, so "cmd"
+		// doesn't match "cmdline" and "command" doesn't match "shell_command".
+		if i > 0 {
+			p := src[i-1]
+			if isJSWordByte(p) {
+				continue
+			}
+			if (p == '"' || p == '\'') && i > 1 && isJSWordByte(src[i-2]) {
+				continue
+			}
+		}
+		j := i + len(key)
+		if j < len(src) && (src[j] == '"' || src[j] == '\'') {
+			j++
+		}
+		for j < len(src) && isJSSpaceByte(src[j]) {
+			j++
+		}
+		if j >= len(src) || src[j] != ':' {
+			continue
+		}
+		j++
+		for j < len(src) && isJSSpaceByte(src[j]) {
+			j++
+		}
+		if j >= len(src) {
+			return ""
+		}
+		if q := src[j]; q == '"' || q == '\'' || q == '`' {
+			if v, ok := scanJSStringLiteral(src[j:]); ok {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+// scanJSStringLiteral decodes the quoted JS string literal starting at src[0]
+// (which must be the opening quote). Escapes matter here: a Windows path is
+// written `D:\\Dev\\x` inside the JS body and has to come back as `D:\Dev\x`,
+// or the deleted file's path won't resolve.
+func scanJSStringLiteral(src string) (string, bool) {
+	if len(src) < 2 {
+		return "", false
+	}
+	quote := src[0]
+	var b strings.Builder
+	for i := 1; i < len(src); i++ {
+		switch c := src[i]; {
+		case c == '\\' && i+1 < len(src):
+			i++
+			switch src[i] {
+			case 'n':
+				b.WriteByte('\n')
+			case 'r':
+				b.WriteByte('\r')
+			case 't':
+				b.WriteByte('\t')
+			default:
+				b.WriteByte(src[i])
+			}
+		case c == quote:
+			return b.String(), true
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return "", false
+}
+
+// emitCodexShellDeletions inspects a response_item function_call. When it's a
+// shell command that deletes files (`rm`/`git rm`, or Windows `del`/`erase`/
+// `Remove-Item`), it fingerprints each deleted file's HEAD content as removed
+// lines and buffers a codex event — mirroring how Claude handles a `Bash rm`,
+// so commit-time attribution credits Codex for the deletion instead of Human.
+func emitCodexShellDeletions(payload json.RawMessage, when time.Time, st *codexState) {
+	for _, inv := range codexShellInvocations(payload) {
+		emitCodexShellDeletion(inv, when, st)
+	}
+}
+
+// emitCodexShellDeletion handles one recovered shell command.
+func emitCodexShellDeletion(inv codexShellInvocation, when time.Time, st *codexState) {
+	cmd := inv.Cmd
+	workdir := inv.Workdir
 	if workdir == "" {
-		workdir = args.Cwd
+		// 0.145+ scripts may omit workdir and inherit the session's cwd.
+		workdir = st.cwd
 	}
 	if cmd == "" || workdir == "" {
 		return
@@ -696,21 +940,29 @@ func emitCodexPatchApplyEvents(payload json.RawMessage, when time.Time, st *code
 	}
 }
 
-// flushCodexTokenCount reads an event_msg/token_count payload's
-// `info.last_token_usage` (the per-turn delta, not the running total) and
-// flushes any buffered patch events with it. The wrapped format has no
-// separate cache-write counter — only `cached_input_tokens`, which we map to
-// cache-read.
+// codexTokenUsage is one `info.*_token_usage` block from an event_msg/
+// token_count payload. `cached_input_tokens` maps to cache-read;
+// `cache_write_input_tokens` is only present from 0.145 on, and stays 0 for
+// older logs that never reported it.
+type codexTokenUsage struct {
+	InputTokens           int64 `json:"input_tokens"`
+	CachedInputTokens     int64 `json:"cached_input_tokens"`
+	CacheWriteInputTokens int64 `json:"cache_write_input_tokens"`
+	OutputTokens          int64 `json:"output_tokens"`
+}
+
+// codexTokenCountPayload is the event_msg/token_count body. `last_token_usage`
+// is the per-turn delta, which is what we attribute; the running total is
+// ignored.
+type codexTokenCountPayload struct {
+	Info struct {
+		LastTokenUsage codexTokenUsage `json:"last_token_usage"`
+	} `json:"info"`
+}
+
+// flushCodexTokenCount flushes any buffered patch events with this turn's usage.
 func flushCodexTokenCount(payload json.RawMessage, st *codexState) {
-	var p struct {
-		Info struct {
-			LastTokenUsage struct {
-				InputTokens       int64 `json:"input_tokens"`
-				CachedInputTokens int64 `json:"cached_input_tokens"`
-				OutputTokens      int64 `json:"output_tokens"`
-			} `json:"last_token_usage"`
-		} `json:"info"`
-	}
+	var p codexTokenCountPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return
 	}
@@ -718,7 +970,7 @@ func flushCodexTokenCount(payload json.RawMessage, st *codexState) {
 	if u.InputTokens == 0 && u.OutputTokens == 0 {
 		return
 	}
-	st.flush(u.InputTokens, u.OutputTokens, u.CachedInputTokens, 0, true)
+	st.flush(u.InputTokens, u.OutputTokens, u.CachedInputTokens, u.CacheWriteInputTokens, true)
 }
 
 // toDaemonLineRanges converts the local LineRange (shared with antigravity_chat.go's
@@ -934,6 +1186,43 @@ func ReadCodexSessionUsage(path string) (*TranscriptUsage, error) {
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(line) == 0 || line[0] != '{' {
+			continue
+		}
+		// Wrapped format (0.13x and up, incl. 0.145): model comes from
+		// turn_context, usage from event_msg/token_count. Without this branch the
+		// flat parse below finds neither and the hook records no tokens at all.
+		if env, ok := codexWrappedEnvelope(line); ok {
+			switch env.Type {
+			case "turn_context":
+				var p struct {
+					Model string `json:"model"`
+				}
+				if json.Unmarshal(env.Payload, &p) == nil && p.Model != "" {
+					model = p.Model
+				}
+			case "event_msg":
+				var head struct {
+					Type string `json:"type"`
+				}
+				if json.Unmarshal(env.Payload, &head) != nil || head.Type != "token_count" {
+					continue
+				}
+				var p codexTokenCountPayload
+				if json.Unmarshal(env.Payload, &p) != nil {
+					continue
+				}
+				u := p.Info.LastTokenUsage
+				if u.InputTokens == 0 && u.OutputTokens == 0 {
+					continue
+				}
+				last = &TranscriptUsage{
+					Model:            model,
+					InputTokens:      u.InputTokens,
+					OutputTokens:     u.OutputTokens,
+					CacheReadTokens:  u.CachedInputTokens,
+					CacheWriteTokens: u.CacheWriteInputTokens,
+				}
+			}
 			continue
 		}
 		var ln codexLine

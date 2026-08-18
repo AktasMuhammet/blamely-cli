@@ -67,8 +67,10 @@ func RecordCopilotFromStdin(r io.Reader) error {
 				return recordToolDeletionPath(path, p.Cwd, "copilot", gen, p.Model, p.SessionID, p.TranscriptPath, "copilot_delete")
 			}
 		case "run_in_terminal", "Bash", "shell", "Shell":
-			if root := findRepoRoot(p.Cwd, p.Cwd); root != "" {
-				return recordShellDeletions(root, shellCommandFromInput(p.ToolInput), "copilot", gen, p.Model, p.SessionID, p.TranscriptPath, "copilot_shell_delete")
+			// Resolved explicitly (rather than via recordShellDeletionsFrom) so a
+			// cwd in no repo at all still falls through to the session marker below.
+			if roots := gitutil.DiscoverRepos(p.Cwd); len(roots) > 0 {
+				return recordShellDeletionsIn(roots, shellCommandFromInput(p.ToolInput), "copilot", gen, p.Model, p.SessionID, p.TranscriptPath, "copilot_shell_delete")
 			}
 		}
 		// Payload didn't carry a file path: keep the session-marker fallback.

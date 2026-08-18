@@ -2,10 +2,11 @@ package authorship
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/blamely/blamely/internal/gitutil"
 )
 
 // workingLogRetainDepth bounds how many commits behind HEAD a base-SHA working-log
@@ -95,10 +96,10 @@ func looksLikeSHA(s string) bool {
 // non-ancestor (a divergent sibling base, or when HEAD is unresolvable) it returns
 // false so the caller keeps the dir — a sibling base may still back live work.
 func baseDepthBehindHead(repoRoot, sha string) (int, bool) {
-	if exec.Command("git", "-C", repoRoot, "merge-base", "--is-ancestor", sha, "HEAD").Run() != nil {
+	if _, aerr := gitutil.Output(repoRoot, "merge-base", "--is-ancestor", sha, "HEAD"); aerr != nil {
 		return 0, false // not an ancestor of HEAD (or no HEAD) → no meaningful depth
 	}
-	out, err := exec.Command("git", "-C", repoRoot, "rev-list", "--count", sha+"..HEAD").Output()
+	out, err := gitutil.Output(repoRoot, "rev-list", "--count", sha+"..HEAD")
 	if err != nil {
 		return 0, false
 	}
@@ -113,6 +114,6 @@ func baseDepthBehindHead(repoRoot, sha string) (int, bool) {
 // reachability, is the liveness signal: an unreachable-but-present commit may still
 // back uncommitted work, whereas a missing object can back nothing.
 func objectExists(repoRoot, sha string) bool {
-	cmd := exec.Command("git", "-C", repoRoot, "cat-file", "-e", sha)
-	return cmd.Run() == nil
+	_, err := gitutil.Output(repoRoot, "cat-file", "-e", sha)
+	return err == nil
 }

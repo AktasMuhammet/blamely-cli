@@ -49,9 +49,7 @@ func RecordGeminiFromStdin(r io.Reader) error {
 		}
 		switch p.ToolName {
 		case "run_shell_command", "shell", "Shell":
-			if root := findRepoRoot(p.Cwd, p.Cwd); root != "" {
-				return recordShellDeletions(root, shellCommandFromInput(p.ToolInput), "gemini", gt, "", p.SessionID, p.TranscriptPath, "gemini_shell_delete")
-			}
+			return recordShellDeletionsFrom(p.Cwd, shellCommandFromInput(p.ToolInput), "gemini", gt, "", p.SessionID, p.TranscriptPath, "gemini_shell_delete")
 		case "delete_file", "delete", "Delete", "remove_file":
 			if path := deletePathFromInput(p.ToolInput); path != "" {
 				return recordToolDeletionPath(path, p.Cwd, "gemini", gt, "", p.SessionID, p.TranscriptPath, "gemini_delete")

@@ -17,13 +17,36 @@ import (
 // RenderStats prints a deep single-commit view to stdout.
 // It reads the blamely git note for sha and combines it with commit metadata.
 func RenderStats(sha string) error {
-	repoPath, ok := gitutil.Toplevel(".")
-	if !ok {
-		return fmt.Errorf("not inside a git repository")
-	}
-	db, err := store.Open()
+	roots, err := currentRepoRoots()
 	if err != nil {
 		return err
+	}
+	// With several repos below the cwd, `sha` (usually HEAD) resolves in each of
+	// them independently: render every repo that has a note for it, and only
+	// complain when none does.
+	var rendered int
+	for _, root := range roots {
+		ok, err := renderStatsIn(root, sha, len(roots) > 1)
+		if err != nil {
+			return err
+		}
+		if ok {
+			rendered++
+		}
+	}
+	if rendered == 0 {
+		return fmt.Errorf("no blamely note for %s: run `blamely attribute %s %s` first", sha, roots[0], sha)
+	}
+	return nil
+}
+
+// renderStatsIn renders the stats dashboard for one repo, reporting false (with
+// no error) when that repo has no note for `sha` — a normal outcome when the
+// caller is iterating sibling repos.
+func renderStatsIn(repoPath, sha string, multi bool) (bool, error) {
+	db, err := store.Open()
+	if err != nil {
+		return false, err
 	}
 	defer db.Close()
 
@@ -34,11 +57,11 @@ func RenderStats(sha string) error {
 
 	noteBytes, err := readNote(repoPath, sha)
 	if err != nil {
-		return fmt.Errorf("no blamely note for %s: run `blamely attribute %s %s` first", sha, repoPath, sha)
+		return false, nil // no note here — the caller decides whether that's an error
 	}
 	var note gitnotes.Note
 	if err := json.Unmarshal(noteBytes, &note); err != nil {
-		return fmt.Errorf("parse note: %w", err)
+		return false, fmt.Errorf("parse note: %w", err)
 	}
 
 	// Commit metadata
@@ -60,29 +83,48 @@ func RenderStats(sha string) error {
 	if note.CodingTimeNanos == 0 {
 		note.CodingTimeNanos = sessionNanos
 	}
+	repoBanner(os.Stdout, repoPath, multi)
 	renderDashboard(os.Stdout, &note, meta, false)
-	return nil
+	return true, nil
 }
 
 // RenderCurrentStats prints the same deep view for the CURRENT uncommitted change
 // (`blamely stats` with no argument): it attributes the working-tree diff against HEAD
 // from the working logs, with no commit/note required.
 func RenderCurrentStats() error {
-	repoPath, ok := gitutil.Toplevel(".")
-	if !ok {
-		return fmt.Errorf("not inside a git repository")
-	}
-	note, err := gitnotes.AttributeWorkingTree(repoPath)
+	roots, err := currentRepoRoots()
 	if err != nil {
 		return err
 	}
-	if note == nil || len(note.Files) == 0 {
+	var rendered int
+	for _, root := range roots {
+		ok, err := renderCurrentStatsIn(root, len(roots) > 1)
+		if err != nil {
+			return err
+		}
+		if ok {
+			rendered++
+		}
+	}
+	if rendered == 0 {
 		fmt.Println("No uncommitted changes.")
-		return nil
+	}
+	return nil
+}
+
+// renderCurrentStatsIn renders the working-tree dashboard for one repo,
+// reporting false when that repo has no uncommitted changes.
+func renderCurrentStatsIn(repoPath string, multi bool) (bool, error) {
+	note, err := gitnotes.AttributeWorkingTree(repoPath)
+	if err != nil {
+		return false, err
+	}
+	if note == nil || len(note.Files) == 0 {
+		return false, nil
 	}
 	db, err := store.Open()
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer db.Close()
 	repoID, _ := gitutil.RepoID(repoPath)
@@ -94,8 +136,9 @@ func RenderCurrentStats() error {
 	if note.CodingTimeNanos == 0 {
 		note.CodingTimeNanos = sessionNanos
 	}
+	repoBanner(os.Stdout, repoPath, multi)
 	renderDashboard(os.Stdout, note, meta, false)
-	return nil
+	return true, nil
 }
 
 type commitMeta_ map[string]string

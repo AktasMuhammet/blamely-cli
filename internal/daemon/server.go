@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -21,6 +20,7 @@ import (
 	"time"
 
 	"github.com/blamely/blamely/internal/config"
+	"github.com/blamely/blamely/internal/gitutil"
 	"github.com/blamely/blamely/internal/store"
 )
 
@@ -421,7 +421,7 @@ func (s *Server) preChatSnapshot(w http.ResponseWriter, r *http.Request) {
 // headFileContent returns file's content at HEAD in repoPath, or ok=false if
 // the repo has no HEAD yet or the file isn't tracked there (e.g. a new file).
 func headFileContent(repoPath, file string) (string, bool) {
-	out, err := exec.Command("git", "-C", repoPath, "show", "HEAD:"+filepath.ToSlash(file)).Output()
+	out, err := gitutil.Output(repoPath, "show", "HEAD:"+filepath.ToSlash(file))
 	if err != nil {
 		return "", false
 	}

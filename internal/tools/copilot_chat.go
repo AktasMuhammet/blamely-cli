@@ -24,7 +24,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -263,44 +262,56 @@ func (w *chatSessionWatcher) run(ctx context.Context, sink daemon.Sink) error {
 	}
 }
 
-// scanRoot walks one workspaceStorage root and processes every chat session
-// file under it. It returns the newest session-file mtime it observed, which
-// run() uses to decide whether to keep polling at the fast active cadence.
+// scanRoot processes every chat session file under one workspaceStorage root.
+// It returns the newest session-file mtime it observed, which run() uses to
+// decide whether to keep polling at the fast active cadence.
+//
+// Two levels of ReadDir rather than a recursive walk. The layout is fixed —
+// <workspaceStorage>/<hash>/chatSessions/*.jsonl — but workspaceStorage also holds
+// every workspace's extension state, and VS Code never prunes it: on a developer
+// machine that is thousands of directories the walk descended into on every tick,
+// to reach a couple hundred files it could have addressed directly. Measured on a
+// 128-workspace profile, the recursive walk visited ~5500 entries; this visits
+// ~670, and it runs every 2 seconds while a chat is active.
 func (w *chatSessionWatcher) scanRoot(root string, state map[string]*sessionState, mu *sync.Mutex, sink daemon.Sink) time.Time {
 	if root == "" {
 		return time.Time{}
 	}
+	workspaces, err := os.ReadDir(root)
+	if err != nil {
+		return time.Time{} // root absent (editor not installed) — nothing to scan
+	}
 	var latest time.Time
-	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return filepath.SkipDir
+	for _, ws := range workspaces {
+		if !ws.IsDir() {
+			continue
+		}
+		// The chatEditingSessions sibling directory has different content we
+		// don't currently parse.
+		sessDir := filepath.Join(root, ws.Name(), "chatSessions")
+		entries, derr := os.ReadDir(sessDir)
+		if derr != nil {
+			continue // workspace has never opened a chat
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+				continue
 			}
-			return nil
+			// Skip stale sessions. A user with many workspaces accumulates hundreds
+			// of old chatSessions files (often multi-MB), but only a handful are ever
+			// active. Parsing them all on the first scan and stat-ing them every poll
+			// makes live detection slow and late — badly so on Windows. A reopened old
+			// chat gets a fresh mtime and is picked up again automatically;
+			// evictStale drops its state.
+			info, ierr := e.Info()
+			if ierr == nil && time.Since(info.ModTime()) > copilotChatStaleCutoff {
+				continue
+			}
+			if mtime := w.handleSessionFile(filepath.Join(sessDir, e.Name()), state, mu, sink); mtime.After(latest) {
+				latest = mtime
+			}
 		}
-		if d.IsDir() {
-			return nil
-		}
-		// Only chatSessions/*.jsonl. The chatEditingSessions sibling directory
-		// has different content we don't currently parse.
-		if !strings.HasSuffix(p, ".jsonl") || !strings.Contains(p, string(filepath.Separator)+"chatSessions"+string(filepath.Separator)) {
-			return nil
-		}
-		// Skip stale sessions. A user with many workspaces accumulates hundreds of
-		// old chatSessions files (often multi-MB), but only a handful are ever
-		// active. Parsing them all on the first scan and stat-ing them every poll
-		// makes live detection slow and late — badly so on Windows. Use the
-		// dirent's mtime (already gathered by the walk, no extra stat) to skip
-		// anything older than the stale cutoff. A reopened old chat gets a fresh
-		// mtime and is picked up again automatically; evictStale drops its state.
-		if info, ierr := d.Info(); ierr == nil && time.Since(info.ModTime()) > copilotChatStaleCutoff {
-			return nil
-		}
-		if mtime := w.handleSessionFile(p, state, mu, sink); mtime.After(latest) {
-			latest = mtime
-		}
-		return nil
-	})
+	}
 	return latest
 }
 

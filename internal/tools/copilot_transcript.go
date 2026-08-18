@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -527,7 +526,7 @@ func deletedFileLines(absPath string) []daemon.RemovedLineHash {
 		// Already removed on disk — read the version HEAD still has.
 		if wt, ok := gitutil.Toplevel(abs); ok {
 			if rel, rerr := filepath.Rel(wt, abs); rerr == nil && !strings.HasPrefix(rel, "..") {
-				if out, gerr := exec.Command("git", "-C", wt, "show", "HEAD:"+filepath.ToSlash(rel)).Output(); gerr == nil {
+				if out, gerr := gitutil.Output(wt, "show", "HEAD:"+filepath.ToSlash(rel)); gerr == nil {
 					data = out
 				}
 			}

@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/blamely/blamely/internal/gitnotes"
-	"github.com/blamely/blamely/internal/gitutil"
 )
 
 // blameDate formats a committer epoch (seconds) in the commit's own timezone
@@ -43,9 +42,12 @@ func blameDate(epoch int64, tz string) string {
 // number and the source text. It's `git blame` with the AI-vs-human story
 // layered on top, in the same premium visual language as the rest of report.
 func RenderBlame(file, rev string) error {
-	repo, ok := gitutil.Toplevel(".")
-	if !ok {
-		return fmt.Errorf("not inside a git repository")
+	// Resolved from the FILE, not the cwd: `blamely blame backend/src/app.py`
+	// run from a workspace dir above several clones names its own repo, and the
+	// cwd there is in none of them.
+	repo, err := repoRootForFile(file)
+	if err != nil {
+		return err
 	}
 	if rev == "" {
 		rev = "HEAD"

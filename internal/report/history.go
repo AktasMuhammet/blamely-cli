@@ -58,11 +58,12 @@ func RenderHistory(opts HistoryOptions) error {
 			return err
 		}
 	} else {
-		repoID, ok := gitutil.RepoID(".")
-		if !ok {
-			return fmt.Errorf("not inside a git repository; use --all to query all repos")
+		// Every repo at or below the cwd — one when we're inside a work tree,
+		// each nested clone when the cwd is the workspace dir above them.
+		repos, err = currentRepoIDs()
+		if err != nil {
+			return fmt.Errorf("%w; use --all to query all repos", err)
 		}
-		repos = []string{repoID}
 	}
 	if len(repos) == 0 {
 		fmt.Println("No repos with blamely data found.")

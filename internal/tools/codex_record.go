@@ -62,9 +62,7 @@ func RecordCodexFromStdin(r io.Reader) error {
 		// same removal twice).
 		name := strings.ToLower(p.ToolName)
 		if len(deletedViaPatch) == 0 && (looksLikePatch(name) || codexShellNames[name]) {
-			if root := findRepoRoot(p.Cwd, p.Cwd); root != "" {
-				return recordShellDeletions(root, shellCommandFromInput(p.ToolInput), "codex", gt, p.Model, p.SessionID, p.TranscriptPath, "codex_shell_delete")
-			}
+			return recordShellDeletionsFrom(p.Cwd, shellCommandFromInput(p.ToolInput), "codex", gt, p.Model, p.SessionID, p.TranscriptPath, "codex_shell_delete")
 		}
 		return nil
 	}

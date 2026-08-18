@@ -3,7 +3,6 @@ package authorship
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -110,7 +109,7 @@ func headContent(repoRoot, baseSHA, relPath string) string {
 		return ""
 	}
 	// git uses forward slashes in tree paths on every OS.
-	out, err := exec.Command("git", "-C", repoRoot, "show", baseSHA+":"+relPath).Output()
+	out, err := gitutil.Output(repoRoot, "show", baseSHA+":"+relPath)
 	if err != nil {
 		return "" // file not present at HEAD → treat as new
 	}
