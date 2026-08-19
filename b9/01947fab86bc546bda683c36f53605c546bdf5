@@ -1,0 +1,26 @@
+packaging/TRUST.md
+  s_60f8842c4cb39d::t_8a8fc8ac349db7 77,81-83,85-88,90-92
+.github/workflows/release.yml
+  s_60f8842c4cb39d::t_8a1b426edf0a10 449-450,480-481
+  s_60f8842c4cb39d::t_ef75b62f42dc13 394,451,486,506
+  s_60f8842c4cb39d::t_e9116e1af62c49 499
+packaging/README.md
+  s_60f8842c4cb39d::t_8a8fc8ac349db7 14-16,22
+  s_60f8842c4cb39d::t_78167a7c1d1951 13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "b901947fab86bc546bda683c36f53605c546bdf5",
+  "prompts": {},
+  "sessions": {
+    "s_60f8842c4cb39d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1b76dec0-46f0-41b8-acd2-756f9d8cee87",
+        "model": "claude-opus-5"
+      },
+      "human_author": "muhammet.aktas <muhammet@oobeya.io>"
+    }
+  }
+}
