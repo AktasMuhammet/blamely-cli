@@ -1,0 +1,31 @@
+internal/install/update.go
+  s_60f8842c4cb39d::t_641f6c15b06a2b 88-104,106,110-122
+  s_60f8842c4cb39d::t_11157acde6a174 437-471,476-480
+internal/install/stdio_windows.go
+  s_60f8842c4cb39d::t_b16b425c41eefa 1-31
+internal/install/stdio_other.go
+  s_60f8842c4cb39d::t_b16b425c41eefa 1-13
+internal/install/stdio_test.go
+  s_60f8842c4cb39d::t_36675aee89febe 1-75
+internal/install/update_test.go
+  s_60f8842c4cb39d::t_fddb674dfa7150 13,284,389,415,436
+  s_60f8842c4cb39d::t_641f6c15b06a2b 26
+  s_60f8842c4cb39d::t_f8b91d519c5a0d 366
+  s_60f8842c4cb39d::t_17a7155a74cc00 11,276-280,283,286-289,300-307,312-365,367-368
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "092889e2fa323cd9c14227ff5b1ee3920bb0e193",
+  "prompts": {},
+  "sessions": {
+    "s_60f8842c4cb39d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1b76dec0-46f0-41b8-acd2-756f9d8cee87",
+        "model": "claude-opus-5"
+      },
+      "human_author": "muhammet.aktas <muhammet@oobeya.io>"
+    }
+  }
+}
