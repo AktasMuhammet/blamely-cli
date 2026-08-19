@@ -1,0 +1,29 @@
+cmd/blamely/main.go
+  s_60f8842c4cb39d::t_092d2360348b1e 141-154,233-237
+  s_60f8842c4cb39d::t_afc04df0950ae5 223
+internal/daemon/update_test.go
+  s_60f8842c4cb39d::t_74cbd0b25fd2da 10,26,28,31,179,193-213,217-251,255-289,293-305
+  s_60f8842c4cb39d::t_259c0abe49917e 4,7-9,306-385
+  s_60f8842c4cb39d::t_d2bd1a68beef07 180-192,214-216,252-254,290-292
+internal/daemon/update.go
+  s_60f8842c4cb39d::t_4344e76866ecfb 26-29,64,67-72,90,113-115,117,120-121,130,139,142,144,147,152-173
+  s_60f8842c4cb39d::t_d2bd1a68beef07 110-112
+  s_60f8842c4cb39d::t_395b02ef70f0d9 35-38,41-53,76,79-89,97-109,118,127,132,140,145,151
+  s_60f8842c4cb39d::t_2e91cf4e609dad 126,136
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "4b8c2cfd12460116f3464d8fccf693392a775f91",
+  "prompts": {},
+  "sessions": {
+    "s_60f8842c4cb39d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1b76dec0-46f0-41b8-acd2-756f9d8cee87",
+        "model": "claude-opus-5"
+      },
+      "human_author": "muhammet.aktas <muhammet@oobeya.io>"
+    }
+  }
+}
