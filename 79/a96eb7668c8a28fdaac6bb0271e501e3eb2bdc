@@ -1,0 +1,24 @@
+internal/config/config_extended_test.go
+  s_60f8842c4cb39d::t_d6910cc53b24ed 7,56,63,268,326,361,386,410,424,448
+  s_60f8842c4cb39d::t_526e612f926207 322-325,327-360,362-385,387-409,411-423,425-447,449-456
+internal/config/config.go
+  s_60f8842c4cb39d::t_cd84e8ccc2dd38 441-526
+internal/install/install.go
+  s_60f8842c4cb39d::t_b47463fdda3be2 369-374
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "79a96eb7668c8a28fdaac6bb0271e501e3eb2bdc",
+  "prompts": {},
+  "sessions": {
+    "s_60f8842c4cb39d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1b76dec0-46f0-41b8-acd2-756f9d8cee87",
+        "model": "claude-opus-5"
+      },
+      "human_author": "muhammet.aktas <muhammet@oobeya.io>"
+    }
+  }
+}
