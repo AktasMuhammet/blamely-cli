@@ -464,7 +464,14 @@ func extractWithCloseRetry(zipPath, pluginsDir, label string) error {
 		}
 		fmt.Printf("\n  %s is open, so Windows won't let us replace its plugin files.\n", label)
 		fmt.Printf("  Close %s completely, then press Enter to retry (or type 'n' to skip): ", label)
-		line, _ := reader.ReadString('\n')
+		line, rerr := reader.ReadString('\n')
+		if rerr != nil {
+			// Nothing left to read: stdin was closed, or it is the null device,
+			// which Windows reports as a character device so stdinInteractive
+			// cannot tell it apart from a console. Without this the empty line
+			// matches no case and the loop reprints the prompt forever.
+			return err
+		}
 		switch strings.ToLower(strings.TrimSpace(line)) {
 		case "n", "no", "s", "skip":
 			return err

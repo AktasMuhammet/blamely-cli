@@ -8,7 +8,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,7 +23,7 @@ import (
 
 // stubInstaller replaces the hand-off for one test and restores the real one
 // afterwards, so a later test can't accidentally run against a nil installer.
-func stubInstaller(t *testing.T, fn func(bin string, args ...string) error) {
+func stubInstaller(t *testing.T, fn func(bin string, out io.Writer, args ...string) error) {
 	t.Helper()
 	prev := runInstaller
 	runInstaller = fn
@@ -271,10 +273,20 @@ func TestUpdate_DownloadsVerifiesAndHandsOff(t *testing.T) {
 	})
 	pinUpdateAPI(t, srv.URL)
 
+	installed, err := InstalledBinaryPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	var gotBin string
 	var gotArgs []string
-	stubInstaller(t, func(bin string, args ...string) error {
+	var installedAtHandOff string
+	stubInstaller(t, func(bin string, _ io.Writer, args ...string) error {
 		gotBin, gotArgs = bin, args
+		// The whole point of placing the binary before the hand-off: by the time
+		// the hand-off runs, the stable path ALREADY holds the new version.
+		body, _ := os.ReadFile(installed)
+		installedAtHandOff = string(body)
 		return nil
 	})
 
@@ -285,13 +297,74 @@ func TestUpdate_DownloadsVerifiesAndHandsOff(t *testing.T) {
 	if !res.Updated || res.To != "1.8.0" {
 		t.Fatalf("result = %+v, want Updated with To=1.8.0", res)
 	}
-	// The hand-off must run the STAGED binary's own installer, skipping plugins.
-	wantPrefix := filepath.Join(binDir, updateStagingPrefix+"v1.8.0")
-	if !strings.HasPrefix(gotBin, wantPrefix) {
-		t.Errorf("handed off %q, want a binary under %q", gotBin, wantPrefix)
+	if !strings.Contains(installedAtHandOff, "1.8.0") {
+		t.Errorf("stable path did not hold 1.8.0 when the hand-off ran:\n%s", installedAtHandOff)
+	}
+	// The hand-off runs the INSTALLED binary, not the staged copy: the staging
+	// dir is gone by then, and running the installed one lets its CopyBinary
+	// no-op instead of copying the file a second time.
+	if gotBin != installed {
+		t.Errorf("handed off %q, want the installed binary %q", gotBin, installed)
 	}
 	if strings.Join(gotArgs, " ") != "install --skip-plugins" {
 		t.Errorf("args = %v, want [install --skip-plugins]", gotArgs)
+	}
+	// Staging is consumed once the binary is placed.
+	if _, serr := os.Stat(filepath.Join(binDir, updateStagingPrefix+"v1.8.0")); !os.IsNotExist(serr) {
+		t.Errorf("staging dir survived a successful update: %v", serr)
+	}
+}
+
+// TestUpdate_BinaryIsUpdatedEvenWhenHandOffFails is the reason step 8 places the
+// binary itself. The hand-off is a child of this process and `blamely install`
+// kills this process's tree on Windows, so it cannot be the step the update
+// depends on. A failing hand-off must still leave the machine on the NEW
+// version — hooks and the autostart entry all point at the stable path, which
+// now holds it.
+func TestUpdate_BinaryIsUpdatedEvenWhenHandOffFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("see TestUpdate_DownloadsVerifiesAndHandsOff")
+	}
+	pinInstalledSelf(t)
+
+	archive := buildArchive(t, "blamely_v1.8.0_"+runtime.GOOS+"_"+runtime.GOARCH, fakeBinary("1.8.0"))
+	asset := platformAsset("v1.8.0")
+	sums := fmt.Sprintf("%s  %s\n", sha256Hex(archive), asset)
+	srv := releaseServer(t, "/releases/latest", "v1.8.0", map[string][]byte{
+		asset:        archive,
+		"SHA256SUMS": []byte(sums),
+	})
+	pinUpdateAPI(t, srv.URL)
+
+	stubInstaller(t, func(bin string, _ io.Writer, args ...string) error {
+		return errors.New("fork/exec: the request is not supported")
+	})
+
+	var out bytes.Buffer
+	res, err := Update(context.Background(), UpdateOptions{Current: "1.7.0", Out: &out})
+	if err != nil {
+		t.Fatalf("a failed hand-off must not fail the update: %v", err)
+	}
+	if !res.Updated || res.To != "1.8.0" {
+		t.Fatalf("result = %+v, want Updated with To=1.8.0", res)
+	}
+	if res.Reason == "" {
+		t.Error("a partial completion must be reported in Reason")
+	}
+
+	installed, err := InstalledBinaryPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(installed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "1.8.0") {
+		t.Errorf("the installed binary is not the new version:\n%s", body)
+	}
+	if !strings.Contains(out.String(), "`blamely install`") {
+		t.Errorf("the user was not told how to finish the install:\n%s", out.String())
 	}
 }
 
@@ -313,7 +386,7 @@ func TestUpdate_ChecksumMismatchAborts(t *testing.T) {
 	pinUpdateAPI(t, srv.URL)
 
 	called := false
-	stubInstaller(t, func(bin string, args ...string) error { called = true; return nil })
+	stubInstaller(t, func(bin string, _ io.Writer, args ...string) error { called = true; return nil })
 
 	res, err := Update(context.Background(), UpdateOptions{Current: "1.7.0", Out: &bytes.Buffer{}})
 	if err == nil {
@@ -339,7 +412,7 @@ func TestUpdate_NoNewerVersionIsNoop(t *testing.T) {
 	pinUpdateAPI(t, srv.URL)
 
 	called := false
-	stubInstaller(t, func(bin string, args ...string) error { called = true; return nil })
+	stubInstaller(t, func(bin string, _ io.Writer, args ...string) error { called = true; return nil })
 
 	res, err := Update(context.Background(), UpdateOptions{Current: "1.7.0", Out: &bytes.Buffer{}})
 	if err != nil {
@@ -360,7 +433,7 @@ func TestUpdate_RefusesWhenNotInstalledCopy(t *testing.T) {
 	// has to be path identity.
 	fakeHomeDir(t)
 	called := false
-	stubInstaller(t, func(bin string, args ...string) error { called = true; return nil })
+	stubInstaller(t, func(bin string, _ io.Writer, args ...string) error { called = true; return nil })
 
 	res, err := Update(context.Background(), UpdateOptions{Current: "1.7.0", Out: &bytes.Buffer{}})
 	if err == nil {
