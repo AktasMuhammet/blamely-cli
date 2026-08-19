@@ -111,12 +111,18 @@ func cursorGenType(p claudeHookPayload) string {
 // is distinguished by the presence of `cursor_version`: Cursor payloads
 // include it, Claude Code payloads do not.
 func RecordClaudeFromStdin(r io.Reader) error {
+	dbg := newClaudeDebug()
+
 	raw, err := readHookPayload(r)
 	if err != nil {
+		dbg.logf("payload", "read failed: %v", err)
 		return err
 	}
+	dbg.logf("payload", "%d bytes raw=%s", len(raw), debugField(string(raw)))
+
 	var p claudeHookPayload
 	if err := json.Unmarshal(raw, &p); err != nil {
+		dbg.logf("parse", "REJECTED: %v", err)
 		return fmt.Errorf("parse hook payload: %w", err)
 	}
 	// Cursor sends session_id under conversation_id in some versions.
@@ -126,12 +132,17 @@ func RecordClaudeFromStdin(r io.Reader) error {
 
 	isCursor := p.CursorVersion != ""
 
+	dbg.logf("parse", "tool_name=%s host=%s session=%s cwd=%s transcript=%s",
+		debugField(p.ToolName), debugHost(isCursor),
+		debugField(p.SessionID), debugField(p.Cwd), debugField(p.TranscriptPath))
+
 	// Cursor often omits transcript_path from the hook payload. Derive it from
 	// cwd + session_id using the known storage layout:
 	//   ~/.cursor/projects/<cwd-encoded>/agent-transcripts/<uuid>/<uuid>.jsonl
 	// where <cwd-encoded> is the cwd with leading slash removed and / → -.
 	if isCursor && p.TranscriptPath == "" && p.SessionID != "" && p.Cwd != "" {
 		p.TranscriptPath = cursorTranscriptPath(p.Cwd, p.SessionID)
+		dbg.logf("transcript", "derived (cursor layout) %s", debugField(p.TranscriptPath))
 	}
 
 	// Claude CLI also sometimes omits transcript_path. Derive it from cwd +
@@ -140,12 +151,21 @@ func RecordClaudeFromStdin(r io.Reader) error {
 	// where <cwd-encoded> replaces ALL slashes (including the leading /) with -.
 	if !isCursor && p.TranscriptPath == "" && p.SessionID != "" && p.Cwd != "" {
 		p.TranscriptPath = claudeTranscriptPath(p.Cwd, p.SessionID)
+		if p.TranscriptPath == "" {
+			dbg.logf("transcript", "%s", claudeTranscriptSearchDesc(p.Cwd, p.SessionID))
+		} else {
+			dbg.logf("transcript", "derived (claude layout) %s", debugField(p.TranscriptPath))
+		}
 	}
 
 	filePath, ranges, suggested, removed, newFullContent, err := extractClaudeRanges(p)
 	if err != nil {
+		dbg.logf("extract", "FAILED: %v", err)
 		return err
 	}
+	dbg.logf("extract", "file=%s ranges=%d suggested=%d removed=%d whole_file_write=%t",
+		debugField(filePath), len(ranges), suggested, len(removed), newFullContent != nil)
+
 	if filePath == "" {
 		// Cursor deletes a file with a dedicated `Delete` tool (payload: a bare
 		// `path`/`file_path`), and runs shell via `Shell`. Neither produces an
@@ -155,11 +175,14 @@ func RecordClaudeFromStdin(r io.Reader) error {
 			switch p.ToolName {
 			case "Delete":
 				if path := deletePathFromInput(p.ToolInput); path != "" {
+					dbg.logf("branch", "cursor Delete → %s", debugField(path))
 					return recordToolDeletionPath(path, p.Cwd, "cursor", cursorGenType(p), p.Model, p.SessionID, p.TranscriptPath, "cursor_delete")
 				}
 			case "Shell":
+				dbg.logf("branch", "cursor Shell → scan for deletions")
 				return recordShellDeletionsFrom(p.Cwd, shellCommandFromInput(p.ToolInput), "cursor", cursorGenType(p), p.Model, p.SessionID, p.TranscriptPath, "cursor_shell_delete")
 			}
+			dbg.logf("branch", "cursor %s produced no file path → nothing recorded", debugField(p.ToolName))
 			return nil
 		}
 		// No file-edit tool produced a path. A Bash command, however, may have
@@ -173,8 +196,14 @@ func RecordClaudeFromStdin(r io.Reader) error {
 			if gt == "" {
 				gt = "chat"
 			}
-			return recordClaudeBashWrites(p.Cwd, p.SessionID, p.TranscriptPath, gt, shellCommandFromInput(p.ToolInput))
+			cmdStr := shellCommandFromInput(p.ToolInput)
+			dbg.logf("branch", "claude Bash gen_type=%s cwd=%s cmd=%s → git-status scan",
+				gt, debugField(p.Cwd), debugField(cmdStr))
+			err := recordClaudeBashWrites(p.Cwd, p.SessionID, p.TranscriptPath, gt, cmdStr)
+			dbg.logf("post", "bash writes daemon=%s err=%v", daemonEndpointDesc(), err)
+			return err
 		}
+		dbg.logf("branch", "claude %s produced no file path → nothing recorded", debugField(p.ToolName))
 		return nil
 	}
 
@@ -190,6 +219,10 @@ func RecordClaudeFromStdin(r io.Reader) error {
 			rel = r
 		}
 	}
+	dbg.logf("resolve", "repo=%s worktree=%s rel=%s", debugField(repoPath), debugField(wt), debugField(rel))
+	if repoPath == "" {
+		dbg.logf("resolve", "WARNING: no repo resolved — the daemon will likely reject this edit")
+	}
 
 	// Write overwrites the whole file with no "before" content of its own —
 	// fetch the daemon's cached snapshot (the file's content as of its last
@@ -198,6 +231,7 @@ func RecordClaudeFromStdin(r io.Reader) error {
 		var wfRemoved []DeletedLineHash
 		ranges, wfRemoved = ResolveWholeFileWrite(repoPath, rel, *newFullContent, ranges)
 		removed = append(removed, wfRemoved...)
+		dbg.logf("wholefile", "resolved against snapshot → ranges=%d removed=%d", len(ranges), len(removed))
 	}
 
 	tool := "claude"
@@ -226,6 +260,7 @@ func RecordClaudeFromStdin(r io.Reader) error {
 	case !isCursor:
 		genType = ReadTranscriptGenType(p.TranscriptPath)
 	}
+	dbg.logf("gentype", "tool=%s gen_type=%s (from transcript=%t)", tool, debugField(genType), !isCursor)
 
 	payload := daemon.EditPayload{
 		Tool:           tool,
@@ -248,13 +283,30 @@ func RecordClaudeFromStdin(r io.Reader) error {
 		sessionID:      p.SessionID,
 		tool:           tool,
 	})
+	dbg.logf("usage", "model=%s in=%s out=%s cache_read=%s cache_write=%s",
+		debugField(payload.Model), debugTokens(payload.InputTokens), debugTokens(payload.OutputTokens),
+		debugTokens(payload.CacheReadTokens), debugTokens(payload.CacheWriteTokens))
 
 	// Attribution: mirror this edit into the working log
 	// BEFORE the daemon POST, so capture is daemon-independent. No-op when the flag
 	// is off; never affects the recording below.
 	captureAuthorship(repoPath, rel, tool, genType, payload.Model)
 
-	return postToDaemon(payload)
+	endpoint, reachable := daemonEndpoint()
+	dbg.logf("post", "→ %s payload lines=%d removed=%d",
+		endpoint, len(payload.Lines), len(payload.RemovedLines))
+	perr := postToDaemon(payload)
+	switch {
+	case perr != nil:
+		dbg.logf("post", "FAILED: %v", perr)
+	case !reachable:
+		// postToDaemon swallows the no-daemon case and returns nil, so this is
+		// the only place the dropped edit is reported.
+		dbg.logf("post", "DROPPED — no daemon to accept it (start it with `blamely install`)")
+	default:
+		dbg.logf("post", "ok")
+	}
+	return perr
 }
 
 const (

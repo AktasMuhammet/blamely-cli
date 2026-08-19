@@ -94,12 +94,9 @@ func (r EditorExtensionResult) AlreadyPresent() bool {
 }
 
 // InstallEditorExtensions drives the marketplace install for every known
-// VS Code-family editor present on the machine, returning one result per
-// target regardless of outcome so the caller can render a single consistent
-// "Editors" group (found-and-installed / found-and-already-there / absent /
-// failed).
+// VS Code-family editor present on the machine. Use
+// InstallEditorExtensionsFromVSIX to sideload a locally built package instead.
 func InstallEditorExtensions() []EditorExtensionResult {
-	results := make([]EditorExtensionResult, 0, len(editorExtensionTargets))
 	// Resolve the install source ONCE. Prefer a .vsix downloaded from Open VSX —
 	// installing by path is registry-independent, so it works on VS Code proper
 	// (whose Marketplace listing was delisted) as well as the Open-VSX forks. If
@@ -111,6 +108,38 @@ func InstallEditorExtensions() []EditorExtensionResult {
 		source = vsix
 		defer os.Remove(vsix)
 	}
+	return installEditorExtensionsFrom(source)
+}
+
+// InstallEditorExtensionsFromVSIX installs a LOCAL .vsix into every detected
+// VS Code-family editor, skipping the Open VSX download entirely. It is the
+// VS Code counterpart of InstallJetBrainsPluginFromZip: the offline installers
+// and scripts/install.sh use it to sideload a plugin built from source, so a
+// dev build is never silently replaced by the published one.
+//
+// The path is made absolute because the editor CLIs resolve a relative
+// --install-extension argument against their own working directory, not ours.
+func InstallEditorExtensionsFromVSIX(vsixPath string) ([]EditorExtensionResult, error) {
+	abs, err := filepath.Abs(vsixPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve %s: %w", vsixPath, err)
+	}
+	if !strings.EqualFold(filepath.Ext(abs), ".vsix") {
+		return nil, fmt.Errorf("%s is not a .vsix", abs)
+	}
+	if _, err := os.Stat(abs); err != nil {
+		return nil, fmt.Errorf("read %s: %w", abs, err)
+	}
+	return installEditorExtensionsFrom(abs), nil
+}
+
+// installEditorExtensionsFrom installs `source` — a .vsix path or a registry id
+// — into every known VS Code-family editor present on the machine, returning
+// one result per target regardless of outcome so the caller can render a single
+// consistent "Editors" group (found-and-installed / found-and-already-there /
+// absent / failed).
+func installEditorExtensionsFrom(source string) []EditorExtensionResult {
+	results := make([]EditorExtensionResult, 0, len(editorExtensionTargets))
 	for _, t := range editorExtensionTargets {
 		cliPath, _ := findEditorCLI(t)
 		r := EditorExtensionResult{Label: t.Label, CLIPath: cliPath}

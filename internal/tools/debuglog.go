@@ -7,10 +7,13 @@ package tools
 // and writes nothing to the database.
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -272,16 +275,58 @@ func DebugCodexLogs(ctx context.Context, out io.Writer) error {
 	return DebugWatchers(ctx, out, &CodexWatcher{})
 }
 
-// DebugClaudeLogs explains that Claude Code attribution is hook-driven and has
-// no passive log to tail, then traces the chat-session watcher in case Claude
-// is being used through a chat panel that persists a chatSessions JSONL.
-func DebugClaudeLogs(ctx context.Context, out io.Writer) error {
+// DebugClaudeLogs traces Claude Code attribution. Claude is hook-driven: the
+// PostToolUse hook pipes each edit to `blamely record claude`, which POSTs to
+// the daemon's /edit endpoint — there is no passive log file a watcher could
+// tail, so this command has two sources instead.
+//
+// Without --debug it follows the database: every new tool=claude row is printed
+// the moment it is recorded. That shows what SUCCEEDED.
+//
+// With --debug it also backfills and follows ~/.blamely/claude-debug.log, the
+// step-by-step trace each hook process writes (see claudedebug.go). That shows
+// what the hook actually did — including the runs that recorded nothing, which
+// are invisible in the database by definition and are what you are usually
+// looking for. Nothing is written to the database by this command.
+func DebugClaudeLogs(ctx context.Context, debug bool, out io.Writer) error {
 	fmt.Fprintln(out, "Claude Code attribution is hook-driven: the PostToolUse hook pipes each")
 	fmt.Fprintln(out, "edit to `blamely record claude`, which POSTs directly to the daemon's /edit")
-	fmt.Fprintln(out, "endpoint — there is no passive log file to tail. To trace it, replay a")
-	fmt.Fprintln(out, "captured hook payload through `blamely record claude` directly (errors")
-	fmt.Fprintln(out, "print to that command's own output, not ~/.blamely/daemon.log), or")
-	fmt.Fprintln(out, "inspect the git note after a commit. Nothing to stream here.")
+	fmt.Fprintln(out, "endpoint — there is no passive log file to tail.")
+	fmt.Fprintln(out)
+
+	if !debug {
+		fmt.Fprintln(out, "Following the database: every new tool=claude row is printed as it lands.")
+		fmt.Fprintln(out, "Edit a file from Claude Code now and watch for it below. Re-run with")
+		fmt.Fprintln(out, "--debug to also see the hook's own step-by-step trace, which covers the")
+		fmt.Fprintln(out, "runs that recorded NOTHING (bad payload, no repo, daemon down).")
+		fmt.Fprintln(out, "Ctrl-C to stop.")
+		fmt.Fprintln(out)
+		tailToolEdits(ctx, out, store.ToolClaude, "claude_hook")
+		return nil
+	}
+
+	fmt.Fprintln(out, "--debug: showing the hook's own trace. Each `blamely record claude` run")
+	fmt.Fprintln(out, "writes one block of lines sharing an invocation id, stepping through:")
+	fmt.Fprintln(out, "  payload    raw stdin the hook received (truncated)")
+	fmt.Fprintln(out, "  parse      tool_name / session / cwd / transcript_path, or the parse error")
+	fmt.Fprintln(out, "  transcript transcript path derived when the payload omitted it")
+	fmt.Fprintln(out, "  extract    the file and line ranges pulled out of tool_input")
+	fmt.Fprintln(out, "  branch     why a payload produced no file edit (Bash scan, no path, …)")
+	fmt.Fprintln(out, "  resolve    repo / worktree / repo-relative path")
+	fmt.Fprintln(out, "  gentype    chat vs cli vs completion, and where it came from")
+	fmt.Fprintln(out, "  usage      model and token counts read from the transcript")
+	fmt.Fprintln(out, "  post       the daemon endpoint and whether the POST succeeded")
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "If an edit is missing, read its block top-down — the first step that")
+	fmt.Fprintln(out, "reports empty/UNREACHABLE/REJECTED is the cause. Set BLAMELY_DEBUG_CLAUDE=0")
+	fmt.Fprintln(out, "to turn this logging off.")
+	fmt.Fprintln(out)
+
+	// Database rows in parallel: the hook log says what the hook sent, the DB
+	// says what the daemon kept. Seeing both at once is what separates "the
+	// hook never fired" from "the hook fired and the daemon dropped it".
+	go tailToolEdits(ctx, out, store.ToolClaude, "claude_hook")
+	tailClaudeDebugLog(ctx, out, claudeDebugBackfillLines)
 	return nil
 }
 
@@ -318,4 +363,143 @@ func DebugGeminiLogs(ctx context.Context, out io.Writer) error {
 func homeDir() string {
 	h, _ := config.Home()
 	return h
+}
+
+// claudeDebugBackfillLines is how much of the existing hook log
+// `blamely log claude --debug` prints before it starts following. The point of
+// the flag is to inspect requests that ALREADY happened, so the backfill is the
+// primary output, not a courtesy.
+const claudeDebugBackfillLines = 300
+
+// tailClaudeDebugLog backfills the tail of ~/.blamely/claude-debug.log and then
+// follows it until ctx is cancelled. The file is written by short-lived hook
+// processes, so it may not exist yet, may appear mid-follow, and may be rotated
+// out from under us — all three are handled by re-opening on stat mismatch.
+func tailClaudeDebugLog(ctx context.Context, out io.Writer, backfill int) {
+	path, err := ClaudeDebugLogPath()
+	if err != nil {
+		fmt.Fprintf(out, "[error] cannot resolve the hook log path: %v\n", err)
+		return
+	}
+	fmt.Fprintf(out, "Hook log: %s\n", abbreviateHome(path))
+	if _, err := os.Stat(path); err != nil {
+		fmt.Fprintf(out, "  (not created yet — it appears the first time Claude edits a file)\n")
+	}
+	fmt.Fprintln(out)
+
+	// Backfill from the rotated generation first, so a log that has just rolled
+	// over still shows the requests that preceded the roll.
+	lines := lastLinesOfFiles(backfill, path+claudeDebugRotatedSuffix, path)
+	if len(lines) > 0 {
+		fmt.Fprintf(out, "── last %d hook log line(s) ──\n", len(lines))
+		for _, l := range lines {
+			fmt.Fprintln(out, l)
+		}
+		fmt.Fprintf(out, "── following live ──\n")
+	}
+
+	followFile(ctx, path, out)
+}
+
+// lastLinesOfFiles returns up to n trailing lines across the given files, read
+// in order (oldest generation first).
+func lastLinesOfFiles(n int, paths ...string) []string {
+	var all []string
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		for _, l := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+			if l != "" {
+				all = append(all, l)
+			}
+		}
+	}
+	if len(all) > n {
+		all = all[len(all)-n:]
+	}
+	return all
+}
+
+// followFile prints lines appended to path from now on. It polls rather than
+// using fsnotify because the writers are separate hook processes and the file
+// is recreated on rotation: a stat-based poll handles create, append, truncate
+// and rename with one mechanism.
+func followFile(ctx context.Context, path string, out io.Writer) {
+	var (
+		f      *os.File
+		reader *bufio.Reader
+		offset int64
+	)
+	defer func() {
+		if f != nil {
+			f.Close()
+		}
+	}()
+
+	// Start at the current end so the follow phase shows only new lines; the
+	// backfill above already covered the history.
+	if fi, err := os.Stat(path); err == nil {
+		offset = fi.Size()
+	}
+
+	ticker := time.NewTicker(400 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		fi, err := os.Stat(path)
+		if err != nil {
+			// Rotated away or not created yet; drop the handle and retry.
+			if f != nil {
+				f.Close()
+				f, reader = nil, nil
+			}
+			offset = 0
+			continue
+		}
+		// Truncated or replaced by rotation: restart from the beginning so the
+		// new generation's first lines aren't skipped.
+		if fi.Size() < offset {
+			if f != nil {
+				f.Close()
+				f, reader = nil, nil
+			}
+			offset = 0
+		}
+		if f == nil {
+			nf, err := os.Open(path)
+			if err != nil {
+				continue
+			}
+			if _, err := nf.Seek(offset, io.SeekStart); err != nil {
+				nf.Close()
+				continue
+			}
+			f, reader = nf, bufio.NewReaderSize(nf, 1<<16)
+		}
+		for {
+			line, err := reader.ReadString('\n')
+			offset += int64(len(line))
+			if len(line) > 0 && strings.HasSuffix(line, "\n") {
+				fmt.Fprint(out, line)
+				continue
+			}
+			// Partial line (a hook is mid-write) or EOF: rewind the partial read
+			// so the next poll re-reads it whole.
+			offset -= int64(len(line))
+			if _, serr := f.Seek(offset, io.SeekStart); serr == nil {
+				reader.Reset(f)
+			}
+			if err != nil && !errors.Is(err, io.EOF) {
+				fmt.Fprintf(out, "[error] read %s: %v\n", abbreviateHome(path), err)
+			}
+			break
+		}
+	}
 }

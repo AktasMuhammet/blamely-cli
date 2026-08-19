@@ -42,7 +42,7 @@ func init() {
 // JetBrains plugins. The release workflow can still override it at link time via
 // `-ldflags "-X main.version=<tag>"`; otherwise this hardcoded value is what
 // `blamely --version` reports.
-var version = "1.8.1"
+var version = "1.8.2"
 
 // resolveVersion returns the effective CLI version. Precedence:
 //  1. an explicit -ldflags override (release builds);
@@ -114,6 +114,7 @@ func main() {
 	root.AddCommand(cmdInstall())
 	root.AddCommand(cmdUpdate())
 	root.AddCommand(cmdInstallJetbrainsZip())
+	root.AddCommand(cmdInstallVSIX())
 	root.AddCommand(cmdUninstall())
 	root.AddCommand(cmdRepair())
 	root.AddCommand(cmdDetect())
@@ -418,6 +419,45 @@ func cmdUpdate() *cobra.Command {
 	c.Flags().StringVar(&from, "from", "", "install this local release archive instead of downloading (air-gapped)")
 	c.Flags().StringVar(&sha256Sum, "sha256", "", "expected sha256 of --from's archive (required with --from)")
 	return c
+}
+
+// cmdInstallVSIX lets the offline/beta installers and scripts/install.sh
+// sideload a LOCAL .vsix using the CLI's own editor discovery (findEditorCLI),
+// which covers VS Code, Cursor, Antigravity and the other Code-OSS forks —
+// instead of each caller hardcoding a `code --install-extension` invocation and
+// missing the forks. The VS Code counterpart of install-jetbrains-zip. Hidden:
+// it's an installer helper, not an end-user command.
+func cmdInstallVSIX() *cobra.Command {
+	return &cobra.Command{
+		Use:    "install-vsix <plugin.vsix>",
+		Short:  "Install a local VS Code extension package into every detected editor",
+		Hidden: true,
+		Args:   cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			results, err := install.InstallEditorExtensionsFromVSIX(args[0])
+			if err != nil {
+				return err
+			}
+			n := 0
+			for _, r := range results {
+				switch {
+				case r.Err != nil:
+					fmt.Fprintf(os.Stderr, "  %s: %v\n", r.Label, r.Err)
+				case r.CLIPath == "":
+					// Editor not on this machine — not worth a line each.
+				case r.Installed || r.Updated:
+					n++
+					fmt.Printf("  %s: installed\n", r.Label)
+				}
+			}
+			if n == 0 {
+				fmt.Println("no VS Code-family editors detected")
+				return nil
+			}
+			fmt.Printf("extension installed into %d editor(s) — reload them to load it\n", n)
+			return nil
+		},
+	}
 }
 
 // cmdInstallJetbrainsZip lets the offline/beta installers sideload a LOCAL plugin
@@ -928,13 +968,28 @@ func cmdLogCodex() *cobra.Command {
 }
 
 func cmdLogClaude() *cobra.Command {
-	return &cobra.Command{
+	var debug bool
+	c := &cobra.Command{
 		Use:   "claude",
-		Short: "Explain how to trace Claude Code attribution (hook-driven)",
+		Short: "Tail Claude Code attribution: recorded edits, or the hook's own trace",
+		Long: "Claude Code is hook-driven — the PostToolUse hook pipes each edit to\n" +
+			"`blamely record claude`, which POSTs to the daemon — so there is no passive\n" +
+			"log to tail. This follows the database instead: every new tool=claude row is\n" +
+			"printed the moment it is recorded.\n\n" +
+			"Use --debug to also backfill and follow ~/.blamely/claude-debug.log, the\n" +
+			"step-by-step trace every hook process writes (payload → parse → extract →\n" +
+			"resolve → post). That is the only way to see the runs that recorded NOTHING\n" +
+			"— a malformed payload, a file outside any repo, or a daemon that wasn't\n" +
+			"running — because those never reach the database at all.\n\n" +
+			"The hook runs inside Claude Code, so its stdout/stderr is swallowed by the\n" +
+			"host; the log file is where that output goes. Set BLAMELY_DEBUG_CLAUDE=0 to\n" +
+			"disable the logging.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return tools.DebugClaudeLogs(cmd.Context(), os.Stdout)
+			return tools.DebugClaudeLogs(cmd.Context(), debug, os.Stdout)
 		},
 	}
+	c.Flags().BoolVar(&debug, "debug", false, "backfill and follow the hook's own step-by-step log (~/.blamely/claude-debug.log)")
+	return c
 }
 
 func cmdLogGemini() *cobra.Command {
