@@ -85,13 +85,47 @@ type UpdateResult struct {
 	Reason  string
 }
 
-// runInstaller executes the staged binary's own `install`. A package var so
-// tests can assert the hand-off without running a real install (the same seam
-// pattern as tools.cursorHomeDir).
-var runInstaller = func(bin string, args ...string) error {
+// runInstaller executes the staged binary's own `install`, sending its output to
+// out. A package var so tests can assert the hand-off without running a real
+// install (the same seam pattern as tools.cursorHomeDir).
+//
+// It deliberately does NOT inherit this process's own standard handles, which is
+// what it used to do:
+//
+//   - stdin is left nil (the child gets NUL / /dev/null). `blamely install` has
+//     prompts, but none that a hand-off should answer: the JetBrains
+//     plugin-locked retry is skipped when stdin is not interactive, and the
+//     uninstall blocker prompt treats a read error as "no". Inheriting ours
+//     bought nothing and could only fail.
+//   - stdout/stderr follow out, and an out that is an unusable *os.File is
+//     dropped rather than passed on. A console-less caller — the daemon's
+//     auto-update, or `blamely update` from a Scheduled Task — otherwise hands
+//     CreateProcess a std handle it rejects with ERROR_NOT_SUPPORTED, failing
+//     the hand-off for a staged binary that had just run fine. See
+//     usableStdHandle in stdio_windows.go for the mechanism.
+var runInstaller = func(bin string, out io.Writer, args ...string) error {
 	cmd := exec.Command(bin, args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	// One writer value for both streams, deliberately: os/exec gives the child a
+	// single pipe when Stdout and Stderr are interface-equal, so the two streams
+	// interleave into one goroutine's writes. Assigning two separately-derived
+	// values would make os/exec copy them concurrently and race any writer that
+	// is not safe for concurrent use.
+	w := childOutput(out)
+	cmd.Stdout, cmd.Stderr = w, w
 	return cmd.Run()
+}
+
+// childOutput adapts out for use as a child process's stdout/stderr. os/exec
+// inherits an *os.File's handle directly and pipes anything else, so this is
+// also the seam that decides which of those two the child gets.
+func childOutput(out io.Writer) io.Writer {
+	if out == nil {
+		return io.Discard
+	}
+	if f, ok := out.(*os.File); ok && !usableStdHandle(f) {
+		return io.Discard
+	}
+	return out
 }
 
 // executablePath resolves this process's own binary for the "am I the installed
@@ -408,21 +442,51 @@ func Update(ctx context.Context, opts UpdateOptions) (UpdateResult, error) {
 		res.To = normalizeVersion(lastField(gotVer))
 	}
 
-	// 8. Hand off to the NEW binary's own installer. It already replaces a
-	// running binary safely (placeBinary renames a locked destination aside and
-	// rolls back on failure), re-registers every tool hook idempotently, and
-	// restarts the daemon agent — no need to reimplement any of that here.
+	// 8. Put the new binary at the stable path OURSELVES, by rename.
+	//
+	// Everything that invokes blamely — each tool's PostToolUse hook, the global
+	// git hook, the autostart entry and the Windows keepalive task — spells that
+	// path literally and none of them is rewritten by an update. So swapping the
+	// file behind it IS the update: nothing else has to succeed for the new
+	// version to take over the next time the daemon starts.
+	//
+	// placeBinary makes that safe on Windows, where a running image cannot be
+	// overwritten but CAN be renamed: it moves the locked destination aside as
+	// <name>.old-<ts>, puts the new one in place, and rolls back if that fails.
+	// The old process keeps running from the renamed file until it restarts.
+	//
+	// This runs here rather than inside the hand-off below because the hand-off
+	// is a CHILD of this process, and `blamely install` kills this process —
+	// with its tree — on Windows. Anything that must survive for the update to
+	// count cannot depend on that child finishing.
+	installedPath, err := CopyBinary(binPath)
+	if err != nil {
+		res.Reason = "could not replace the installed binary"
+		return res, fmt.Errorf("install %s failed (the previous version is still in place): %w", res.To, err)
+	}
+	staged = true
+	_ = os.RemoveAll(stage)
+	res.Updated = true
+
+	// 9. Hand the REST off to the now-installed binary: re-register every tool
+	// hook (a new release may add one) and restart the daemon agent so the new
+	// version takes over immediately instead of at the next start.
+	//
+	// Best-effort by design. Step 8 already updated the version, so a failure
+	// here costs a hook refresh and an immediate restart — not the update. On
+	// Windows this step routinely takes the daemon (and, through the same kill,
+	// itself) down; the keepalive task then revives the daemon from the stable
+	// path, which now holds the new binary.
 	args := []string{"install"}
 	if !opts.WithPlugins {
 		args = append(args, "--skip-plugins")
 	}
-	if err := runInstaller(binPath, args...); err != nil {
-		return res, fmt.Errorf("install %s failed (the previous version is still in place; retry with %s): %w", res.To, binPath, err)
+	if err := runInstaller(installedPath, out, args...); err != nil {
+		res.Reason = "installed; the post-install step did not finish"
+		fmt.Fprintf(out, "blamely %s is in place, but finishing the install failed: %v\n"+
+			"Hooks keep working through the unchanged path. Run `blamely install` to refresh them.\n",
+			res.To, err)
 	}
-	staged = true
-	_ = os.RemoveAll(stage)
-
-	res.Updated = true
 	return res, nil
 }
 
