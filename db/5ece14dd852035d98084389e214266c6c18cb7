@@ -1,0 +1,59 @@
+internal/gitnotes/diff.go
+  s_60f8842c4cb39d::t_a20d389976bb4e 12-13,97-100,150,474,483,494,506,514,538
+internal/gitnotes/attribution_merge.go
+  s_60f8842c4cb39d::t_a20d389976bb4e 10-11,29
+internal/install/update.go
+  s_60f8842c4cb39d::t_a20d389976bb4e 23-24,109,706
+  s_60f8842c4cb39d::t_5284c1296f0ac9 110-116
+internal/install/lockcheck_windows.go
+  s_60f8842c4cb39d::t_a20d389976bb4e 13-14,85
+internal/install/detect.go
+  s_60f8842c4cb39d::t_a20d389976bb4e 10-11,210
+internal/gitutil/branch.go
+  s_60f8842c4cb39d::t_a20d389976bb4e 8-9,17,30,40,52,67,82,116,140
+internal/gitutil/run.go
+  s_60f8842c4cb39d::t_a20d389976bb4e 7-8,32,49
+internal/gitutil/repoid.go
+  s_60f8842c4cb39d::t_a20d389976bb4e 7-8,37,70
+internal/procattr/procattr_windows.go
+  s_60f8842c4cb39d::t_18ae93e2c5b3ec 1-41
+internal/install/agent_windows.go
+  s_60f8842c4cb39d::t_a20d389976bb4e 15-16,117,129,141,173,183,219-221,241,323,343,353-354
+internal/procattr/procattr_other.go
+  s_60f8842c4cb39d::t_18ae93e2c5b3ec 1-9
+internal/install/editorext.go
+  s_60f8842c4cb39d::t_a20d389976bb4e 14-15,135,214,287,329
+internal/install/hookspath.go
+  s_60f8842c4cb39d::t_a20d389976bb4e 14-15,81-82,287,319,332,342
+internal/gitnotes/attribution_gitops.go
+  s_60f8842c4cb39d::t_a20d389976bb4e 9-10,37,39,41,49
+internal/gitnotes/attribute.go
+  s_60f8842c4cb39d::t_a20d389976bb4e 20-21,1528,1912
+internal/install/bin_windows.go
+  s_60f8842c4cb39d::t_a20d389976bb4e 11-12,22,35,38-41,139
+  s_60f8842c4cb39d::t_ec9d6920cb95b2 144-147
+internal/gitnotes/attribution_parent.go
+  s_60f8842c4cb39d::t_a20d389976bb4e 6-7,14
+internal/gitnotes/attribution_worktree.go
+  s_60f8842c4cb39d::t_a20d389976bb4e 12-13,20
+internal/gitnotes/attribution_replay.go
+  s_60f8842c4cb39d::t_a20d389976bb4e 23-24,98
+internal/gitnotes/attribution_seed.go
+  s_60f8842c4cb39d::t_a20d389976bb4e 12-13,49,144,155,177,216,265,366
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "db5ece14dd852035d98084389e214266c6c18cb7",
+  "prompts": {},
+  "sessions": {
+    "s_60f8842c4cb39d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1b76dec0-46f0-41b8-acd2-756f9d8cee87",
+        "model": "claude-opus-5"
+      },
+      "human_author": "muhammet.aktas <muhammet@oobeya.io>"
+    }
+  }
+}
