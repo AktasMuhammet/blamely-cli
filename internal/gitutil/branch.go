@@ -5,6 +5,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/blamely/blamely/internal/procattr"
 )
 
 // BranchName returns the short name of the currently checked-out branch for the
@@ -12,7 +14,7 @@ import (
 // or git fails — callers treat "" as "no branch" (a detached/unknown session).
 func BranchName(p string) string {
 	dir := repoDir(p)
-	out, err := exec.Command("git", "-C", dir, "symbolic-ref", "--quiet", "--short", "HEAD").Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", dir, "symbolic-ref", "--quiet", "--short", "HEAD")).Output()
 	if err != nil {
 		return "" // detached HEAD or not a repo
 	}
@@ -25,7 +27,7 @@ func BranchName(p string) string {
 func DefaultBranch(p string) string {
 	dir := repoDir(p)
 	// origin/HEAD -> e.g. "origin/main"
-	if out, err := exec.Command("git", "-C", dir, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD").Output(); err == nil {
+	if out, err := procattr.Hide(exec.Command("git", "-C", dir, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")).Output(); err == nil {
 		ref := strings.TrimSpace(string(out))
 		if i := strings.LastIndexByte(ref, '/'); i >= 0 {
 			ref = ref[i+1:]
@@ -35,7 +37,7 @@ func DefaultBranch(p string) string {
 		}
 	}
 	for _, cand := range []string{"main", "master"} {
-		if err := exec.Command("git", "-C", dir, "rev-parse", "--verify", "--quiet", cand).Run(); err == nil {
+		if err := procattr.Hide(exec.Command("git", "-C", dir, "rev-parse", "--verify", "--quiet", cand)).Run(); err == nil {
 			return cand
 		}
 	}
@@ -47,7 +49,7 @@ func DefaultBranch(p string) string {
 // while editing: one session per (branch, HEAD) until the next commit advances HEAD.
 func HeadSHA(p string) string {
 	dir := repoDir(p)
-	out, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", dir, "rev-parse", "HEAD")).Output()
 	if err != nil {
 		return ""
 	}
@@ -62,7 +64,7 @@ func ParentCommitSHA(p, commitSHA string) string {
 		return ""
 	}
 	dir := repoDir(p)
-	out, err := exec.Command("git", "-C", dir, "rev-parse", commitSHA+"^").Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", dir, "rev-parse", commitSHA+"^")).Output()
 	if err != nil {
 		return ""
 	}
@@ -77,7 +79,7 @@ func MergeBase(p, ref string) string {
 		return ""
 	}
 	dir := repoDir(p)
-	out, err := exec.Command("git", "-C", dir, "merge-base", ref, "HEAD").Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", dir, "merge-base", ref, "HEAD")).Output()
 	if err != nil {
 		return ""
 	}
@@ -111,7 +113,7 @@ func InProgressRewrite(p string) bool {
 
 func anyMarker(p string, markers ...string) bool {
 	dir := repoDir(p)
-	gitDir, err := exec.Command("git", "-C", dir, "rev-parse", "--path-format=absolute", "--git-dir").Output()
+	gitDir, err := procattr.Hide(exec.Command("git", "-C", dir, "rev-parse", "--path-format=absolute", "--git-dir")).Output()
 	if err != nil {
 		return false
 	}
@@ -135,7 +137,7 @@ func anyMarker(p string, markers ...string) bool {
 // carry its AI attribution over.
 func CherryPickHead(p string) (sha string, ok bool) {
 	dir := repoDir(p)
-	gitDir, err := exec.Command("git", "-C", dir, "rev-parse", "--path-format=absolute", "--git-dir").Output()
+	gitDir, err := procattr.Hide(exec.Command("git", "-C", dir, "rev-parse", "--path-format=absolute", "--git-dir")).Output()
 	if err != nil {
 		return "", false
 	}

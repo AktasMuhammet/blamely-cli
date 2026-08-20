@@ -4,6 +4,8 @@ import (
 	"context"
 	"os/exec"
 	"time"
+
+	"github.com/blamely/blamely/internal/procattr"
 )
 
 // DefaultTimeout bounds a git invocation made from long-running code — the daemon
@@ -27,7 +29,7 @@ const DefaultTimeout = 30 * time.Second
 const waitDelay = 5 * time.Second
 
 // Output runs `git -C dir args...` under DefaultTimeout and returns its stdout.
-// Drop-in for exec.Command("git", "-C", dir, ...).Output() in daemon-resident code.
+// Drop-in for procattr.Hide(exec.Command("git", "-C", dir, ...)).Output() in daemon-resident code.
 func Output(dir string, args ...string) ([]byte, error) {
 	return OutputTimeout(DefaultTimeout, dir, args...)
 }
@@ -44,7 +46,7 @@ func OutputTimeout(d time.Duration, dir string, args ...string) ([]byte, error) 
 // set up the command further (stdin, extra env) before running it; the context
 // kills the process, and WaitDelay keeps Wait from outliving it.
 func Command(ctx context.Context, dir string, args ...string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+	cmd := procattr.Hide(exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...))
 	cmd.WaitDelay = waitDelay
 	return cmd
 }

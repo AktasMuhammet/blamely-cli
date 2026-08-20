@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/blamely/blamely/internal/authorship"
+
+	"github.com/blamely/blamely/internal/procattr"
 )
 
 // SeedCommittedWorkingLog writes a working log for relPath at (branch, baseSHA) that
@@ -44,7 +46,7 @@ func SeedCommittedWorkingLog(repoPath, branch, baseSHA, relPath string) error {
 // than one `git notes show` per commit — the per-commit spawns were the dominant cost
 // for files with long history, slow enough on Windows to trip the editor's timeout.
 func committedAuthorsByLine(repoPath, baseSHA, relPath string) []authorship.Author {
-	out, err := exec.Command("git", "-C", repoPath, "blame", "--porcelain", baseSHA, "--", relPath).Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", repoPath, "blame", "--porcelain", baseSHA, "--", relPath)).Output()
 	if err != nil {
 		return nil
 	}
@@ -139,7 +141,7 @@ func ShowFileAt(repoPath, sha, relPath string) (string, bool) {
 }
 
 func showFileAt(repoPath, sha, relPath string) (string, bool) {
-	out, err := exec.Command("git", "-C", repoPath, "show", sha+":"+relPath).Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", repoPath, "show", sha+":"+relPath)).Output()
 	if err != nil {
 		return "", false
 	}
@@ -150,7 +152,7 @@ func showFileAt(repoPath, sha, relPath string) (string, bool) {
 // show`). Used where exactly one note is needed (e.g. the inherited note on amend);
 // the seeding path uses prefetchSeedNotes to batch many.
 func loadNoteForSeed(repoPath, sha string) *Note {
-	out, err := exec.Command("git", "-C", repoPath, "notes", "--ref="+NotesRef, "show", sha).Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", repoPath, "notes", "--ref="+NotesRef, "show", sha)).Output()
 	if err != nil {
 		return nil
 	}
@@ -172,7 +174,7 @@ func prefetchSeedNotes(repoPath string, shas map[string]bool) map[string]*Note {
 	if len(shas) == 0 {
 		return notes
 	}
-	listOut, err := exec.Command("git", "-C", repoPath, "notes", "--ref="+NotesRef, "list").Output()
+	listOut, err := procattr.Hide(exec.Command("git", "-C", repoPath, "notes", "--ref="+NotesRef, "list")).Output()
 	if err != nil {
 		return notes // no notes ref / error → everything resolves to Human
 	}
@@ -211,7 +213,7 @@ func batchCatFileBlobs(repoPath string, objs []string) map[string][]byte {
 	if len(objs) == 0 {
 		return res
 	}
-	cmd := exec.Command("git", "-C", repoPath, "cat-file", "--batch")
+	cmd := procattr.Hide(exec.Command("git", "-C", repoPath, "cat-file", "--batch"))
 	cmd.Stdin = strings.NewReader(strings.Join(objs, "\n") + "\n")
 	out, err := cmd.Output()
 	if err != nil && len(out) == 0 {
@@ -260,7 +262,7 @@ func isHex40(s string) bool {
 // only changed lines (not every committed line). Empty/no diff → empty set.
 func UncommittedAddedLines(repoPath, relPath string) map[int]bool {
 	set := map[int]bool{}
-	out, err := exec.Command("git", "-C", repoPath, "diff", "HEAD", "--unified=0", "--no-color", "--", relPath).Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", repoPath, "diff", "HEAD", "--unified=0", "--no-color", "--", relPath)).Output()
 	if err != nil {
 		return set
 	}
@@ -361,7 +363,7 @@ func UntrackedFiles(repoPath string) map[string]bool {
 // to "every line changed" instead of showing a blank gutter. `git ls-files --others
 // --exclude-standard` lists exactly the untracked-and-not-ignored paths.
 func IsUntracked(repoPath, relPath string) bool {
-	out, err := exec.Command("git", "-C", repoPath, "ls-files", "--others", "--exclude-standard", "--", relPath).Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", repoPath, "ls-files", "--others", "--exclude-standard", "--", relPath)).Output()
 	if err != nil {
 		return false
 	}

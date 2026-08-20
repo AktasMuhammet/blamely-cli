@@ -7,6 +7,8 @@ import (
 	"runtime"
 
 	"github.com/blamely/blamely/internal/config"
+
+	"github.com/blamely/blamely/internal/procattr"
 )
 
 // Detected is the set of AI tools found on the current machine.
@@ -205,7 +207,7 @@ func detectCopilot() ToolPresence {
 
 	// `gh` extension list (last-resort).
 	if path, ok := lookPath("gh"); ok {
-		if out, err := exec.Command(path, "extension", "list").Output(); err == nil {
+		if out, err := procattr.Hide(exec.Command(path, "extension", "list")).Output(); err == nil {
 			if bytesContains(out, "copilot") {
 				hints = append(hints, path+" (gh copilot extension)")
 			}

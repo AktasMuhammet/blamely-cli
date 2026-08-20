@@ -17,6 +17,8 @@ import (
 	"github.com/blamely/blamely/internal/gitutil"
 	"github.com/blamely/blamely/internal/store"
 	"github.com/blamely/blamely/internal/tools"
+
+	"github.com/blamely/blamely/internal/procattr"
 )
 
 const NotesRef = "refs/notes/blamely"
@@ -1523,7 +1525,7 @@ func buildNote(db *store.DB, repoPath, sha string, commitNanos int64, added []Ad
 // file as it exists at sha, hashed the same way edits record added lines
 // (TrimRight "\r", blank lines skipped). nil on any git error.
 func committedLineSHAs(repoPath, sha, path string) map[string]int {
-	out, err := exec.Command("git", "-C", repoPath, "show", sha+":"+path).Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", repoPath, "show", sha+":"+path)).Output()
 	if err != nil {
 		return nil
 	}
@@ -1907,7 +1909,7 @@ func nullInt64(n sql.NullInt64) int64 {
 }
 
 func writeNote(repoPath, sha string, body []byte) error {
-	cmd := exec.Command("git", "-C", repoPath, "notes", "--ref="+NotesRef, "add", "-f", "-F", "-", sha)
+	cmd := procattr.Hide(exec.Command("git", "-C", repoPath, "notes", "--ref="+NotesRef, "add", "-f", "-F", "-", sha))
 	cmd.Stdin = strings.NewReader(string(body))
 	out, err := cmd.CombinedOutput()
 	if err != nil {

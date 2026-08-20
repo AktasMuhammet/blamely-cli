@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/blamely/blamely/internal/config"
+
+	"github.com/blamely/blamely/internal/procattr"
 )
 
 // Version is the running CLI version, assigned once at startup by cmd/blamely
@@ -104,7 +106,7 @@ type UpdateResult struct {
 //     the hand-off for a staged binary that had just run fine. See
 //     usableStdHandle in stdio_windows.go for the mechanism.
 var runInstaller = func(bin string, out io.Writer, args ...string) error {
-	cmd := exec.Command(bin, args...)
+	cmd := procattr.Hide(exec.Command(bin, args...))
 	// One writer value for both streams, deliberately: os/exec gives the child a
 	// single pipe when Stdout and Stderr are interface-equal, so the two streams
 	// interleave into one goroutine's writes. Assigning two separately-derived
@@ -701,7 +703,7 @@ func writeFileFrom(r io.Reader, dst string) error {
 func binaryVersion(ctx context.Context, bin string) (string, error) {
 	vctx, cancel := context.WithTimeout(ctx, updateSanityTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(vctx, bin, "--version").CombinedOutput()
+	out, err := procattr.Hide(exec.CommandContext(vctx, bin, "--version")).CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}

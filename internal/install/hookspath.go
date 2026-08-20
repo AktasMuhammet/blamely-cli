@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	"github.com/blamely/blamely/internal/config"
+
+	"github.com/blamely/blamely/internal/procattr"
 )
 
 // InstallGitHook sets core.hooksPath to ~/.blamely/git-hooks (globally) and
@@ -76,8 +78,8 @@ func postCommitName() string {
 }
 
 // writePostCommitScript renders a small shell script that:
-//   1. Calls `blamely attribute <repo> <sha>` (best-effort, never blocks the commit).
-//   2. Chains to a repo-local .git/hooks/post-commit if one exists.
+//  1. Calls `blamely attribute <repo> <sha>` (best-effort, never blocks the commit).
+//  2. Chains to a repo-local .git/hooks/post-commit if one exists.
 func writePostCommitScript(path, binaryPath string) error {
 	// We resolve the repo via `git rev-parse --show-toplevel` inside the script
 	// so the same hook works for every repo on this machine.
@@ -282,7 +284,7 @@ func RemoveLegacyRepoHooks(repoRoot string) {
 // gitDirFor resolves the .git directory for repoRoot, handling worktrees and
 // submodules where .git is a file pointing elsewhere.
 func gitDirFor(repoRoot string) (string, error) {
-	out, err := exec.Command("git", "-C", repoRoot, "rev-parse", "--git-dir").Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", repoRoot, "rev-parse", "--git-dir")).Output()
 	if err != nil {
 		return "", err
 	}
@@ -314,7 +316,7 @@ func isBlamelyManagedHook(path string) bool {
 }
 
 func readGlobalConfig(key string) (value string, present bool) {
-	out, err := exec.Command("git", "config", "--global", "--get", key).Output()
+	out, err := procattr.Hide(exec.Command("git", "config", "--global", "--get", key)).Output()
 	if err != nil {
 		// `git config --get` exits 1 when the key isn't set.
 		var ee *exec.ExitError
@@ -327,7 +329,7 @@ func readGlobalConfig(key string) (value string, present bool) {
 }
 
 func setGlobalConfig(key, value string) error {
-	cmd := exec.Command("git", "config", "--global", key, value)
+	cmd := procattr.Hide(exec.Command("git", "config", "--global", key, value))
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -337,7 +339,7 @@ func setGlobalConfig(key, value string) error {
 }
 
 func unsetGlobalConfig(key string) error {
-	cmd := exec.Command("git", "config", "--global", "--unset", key)
+	cmd := procattr.Hide(exec.Command("git", "config", "--global", "--unset", key))
 	// Exit code 5 = "no such variable" — fine.
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError
