@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/blamely/blamely/internal/procattr"
 )
 
 // blamelyExtensionID is the publisher.name identifier for the Blamely extension,
@@ -130,7 +132,7 @@ func InstallEditorExtensions() []EditorExtensionResult {
 		// extracting — guarantees the install below always lands the downloaded build.
 		if wasPresent {
 			if exactID := installedExtensionID(cliPath, blamelyExtensionID); exactID != "" {
-				_ = exec.Command(cliPath, "--uninstall-extension", exactID).Run()
+				_ = procattr.Hide(exec.Command(cliPath, "--uninstall-extension", exactID)).Run()
 			}
 		}
 		out, err := installExtensionWithRetry(cliPath, source)
@@ -209,7 +211,7 @@ const signatureVerificationRetries = 3
 // combined output and error of the last attempt.
 func installExtensionWithRetry(cliPath, source string) ([]byte, error) {
 	run := func() ([]byte, error) {
-		return exec.Command(cliPath, "--install-extension", source, "--force").CombinedOutput()
+		return procattr.Hide(exec.Command(cliPath, "--install-extension", source, "--force")).CombinedOutput()
 	}
 	out, err := run()
 	for attempt := 0; attempt < signatureVerificationRetries; attempt++ {
@@ -282,7 +284,7 @@ func UninstallEditorExtensions(labels []string) error {
 		if exactID == "" {
 			continue
 		}
-		if err := exec.Command(cliPath, "--uninstall-extension", exactID).Run(); err != nil && firstErr == nil {
+		if err := procattr.Hide(exec.Command(cliPath, "--uninstall-extension", exactID)).Run(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -324,7 +326,7 @@ func extensionInstalled(cliPath, id string) bool {
 // editor's own casing — which uninstall needs because `--uninstall-extension`
 // is case-sensitive on some Code-OSS forks.
 func installedExtensionID(cliPath, id string) string {
-	out, err := exec.Command(cliPath, "--list-extensions").Output()
+	out, err := procattr.Hide(exec.Command(cliPath, "--list-extensions")).Output()
 	if err != nil {
 		return ""
 	}

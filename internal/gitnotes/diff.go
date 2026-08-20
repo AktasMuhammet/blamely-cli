@@ -9,6 +9,8 @@ import (
 
 	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/tools"
+
+	"github.com/blamely/blamely/internal/procattr"
 )
 
 // linesSimilar reports whether a removed line (del) and an added line (add) at
@@ -92,10 +94,10 @@ const (
 // copy map for files git detected as copy-with-modifications.
 type CommitChange struct {
 	Added       []AddedLine
-	Deleted     map[string][]DeletedLine   // pre-commit path → deleted lines (pre-image)
-	Renames     map[string]string          // post-commit path → pre-commit path (renamed)
-	Copies      map[string]string          // post-commit path → pre-commit path (copied)
-	FileChanges map[string]FileChangeType  // post-commit path → file-level change kind
+	Deleted     map[string][]DeletedLine  // pre-commit path → deleted lines (pre-image)
+	Renames     map[string]string         // post-commit path → pre-commit path (renamed)
+	Copies      map[string]string         // post-commit path → pre-commit path (copied)
+	FileChanges map[string]FileChangeType // post-commit path → file-level change kind
 }
 
 // DeletedCount returns the per-file count derived from Deleted line numbers.
@@ -145,7 +147,7 @@ func DiffCommit(repoPath, sha string) (*CommitChange, error) {
 		}
 		args = []string{"-C", repoPath, "diff", "--unified=0", "--no-color", "-M", emptyTree, sha}
 	}
-	cmd := exec.Command("git", args...)
+	cmd := procattr.Hide(exec.Command("git", args...))
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -469,7 +471,7 @@ func parseHunkHeaderBothSides(s string) (delStart, addStart int, ok bool) {
 }
 
 func parentSHA(repoPath, sha string) (string, bool, error) {
-	out, err := exec.Command("git", "-C", repoPath, "rev-parse", sha+"^").Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", repoPath, "rev-parse", sha+"^")).Output()
 	if err != nil {
 		// First commit has no parent.
 		return "", false, nil
@@ -478,7 +480,7 @@ func parentSHA(repoPath, sha string) (string, bool, error) {
 }
 
 func emptyTreeSHA(repoPath string) (string, error) {
-	out, err := exec.Command("git", "-C", repoPath, "hash-object", "-t", "tree", "/dev/null").Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", repoPath, "hash-object", "-t", "tree", "/dev/null")).Output()
 	if err != nil {
 		// Fallback to the well-known empty tree SHA-1 hash.
 		return "4b825dc642cb6eb9a060e54bf8d69288fbee4904", nil
@@ -489,7 +491,7 @@ func emptyTreeSHA(repoPath string) (string, error) {
 // CommitMessage returns the full commit message body (subject + body) of sha.
 // Empty string on error so callers can tolerate detached/missing state.
 func CommitMessage(repoPath, sha string) string {
-	out, err := exec.Command("git", "-C", repoPath, "show", "-s", "--format=%B", sha).Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", repoPath, "show", "-s", "--format=%B", sha)).Output()
 	if err != nil {
 		return ""
 	}
@@ -501,7 +503,7 @@ func CommitMessage(repoPath, sha string) string {
 // produced. This is called immediately after the commit, while HEAD still
 // points to the new commit on the recording branch.
 func BranchName(repoPath string) string {
-	out, err := exec.Command("git", "-C", repoPath, "branch", "--show-current").Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", repoPath, "branch", "--show-current")).Output()
 	if err != nil {
 		return ""
 	}
@@ -509,7 +511,7 @@ func BranchName(repoPath string) string {
 }
 
 func CommitTimestampNanos(repoPath, sha string) (int64, error) {
-	out, err := exec.Command("git", "-C", repoPath, "show", "-s", "--format=%ct", sha).Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", repoPath, "show", "-s", "--format=%ct", sha)).Output()
 	if err != nil {
 		return 0, fmt.Errorf("git show: %w", err)
 	}
@@ -533,7 +535,7 @@ func lastFileTouchNanos(repoPath, ref, relPath string) int64 {
 	if ref == "" || relPath == "" {
 		return 0
 	}
-	out, err := exec.Command("git", "-C", repoPath, "log", "-1", "--format=%ct", ref, "--", relPath).Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", repoPath, "log", "-1", "--format=%ct", ref, "--", relPath)).Output()
 	if err != nil {
 		return 0
 	}

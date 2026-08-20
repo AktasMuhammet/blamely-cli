@@ -12,6 +12,8 @@ import (
 	"syscall"
 
 	"github.com/blamely/blamely/internal/config"
+
+	"github.com/blamely/blamely/internal/procattr"
 )
 
 const scheduledTaskName = "Blamely Daemon"
@@ -68,12 +70,6 @@ const (
 	legacyWatchdogTaskName = "Blamely Daemon Watchdog"
 )
 
-// createNoWindow (CREATE_NO_WINDOW) launches a console process with no console
-// window at all — the reliable way to start the console-subsystem blamely.exe
-// daemon without a cmd window flashing on screen. HideWindow alone is not
-// enough for console apps.
-const createNoWindow = 0x08000000
-
 var (
 	shell32           = syscall.NewLazyDLL("shell32.dll")
 	procIsUserAnAdmin = shell32.NewProc("IsUserAnAdmin")
@@ -118,7 +114,7 @@ func createOnLogonTask(binaryPath string) error {
 		"/SC", "ONLOGON",
 		"/RL", "LIMITED",
 	}
-	if out, err := exec.Command("schtasks", args...).CombinedOutput(); err != nil {
+	if out, err := procattr.Hide(exec.Command("schtasks", args...)).CombinedOutput(); err != nil {
 		return fmt.Errorf("schtasks /Create: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	allowBatteryStart(scheduledTaskName)
@@ -130,7 +126,7 @@ func installScheduledTask(binaryPath string) (string, error) {
 	// (e.g. an elevated session) can make /Create /F fail with "Access is
 	// denied" because the current user doesn't own it. Clear it first —
 	// best-effort, since a missing task also errors.
-	_ = exec.Command("schtasks", "/Delete", "/F", "/TN", scheduledTaskName).Run()
+	_ = procattr.Hide(exec.Command("schtasks", "/Delete", "/F", "/TN", scheduledTaskName)).Run()
 
 	if err := createOnLogonTask(binaryPath); err != nil {
 		return "", err
@@ -142,7 +138,7 @@ func installScheduledTask(binaryPath string) (string, error) {
 
 	// Kill any prior running instance so a reinstall picks up the new binary,
 	// then start the daemon now (hidden, via CREATE_NO_WINDOW). Both best-effort.
-	_ = exec.Command("schtasks", "/End", "/TN", scheduledTaskName).Run()
+	_ = procattr.Hide(exec.Command("schtasks", "/End", "/TN", scheduledTaskName)).Run()
 	_ = startDaemonNow(binaryPath)
 	return scheduledTaskName, nil
 }
@@ -174,7 +170,7 @@ func installUnprivilegedAgent(binaryPath string) (string, error) {
 func installKeepaliveTask(binaryPath string) error {
 	// Clear any stale task from a prior install under a different security
 	// context; a missing task also errors, so this is best-effort.
-	_ = exec.Command("schtasks", "/Delete", "/F", "/TN", keepaliveTaskName).Run()
+	_ = procattr.Hide(exec.Command("schtasks", "/Delete", "/F", "/TN", keepaliveTaskName)).Run()
 
 	args := []string{
 		"/Create", "/F",
@@ -184,7 +180,7 @@ func installKeepaliveTask(binaryPath string) error {
 		"/MO", fmt.Sprint(keepaliveMinutes),
 		"/RL", "LIMITED",
 	}
-	if out, err := exec.Command("schtasks", args...).CombinedOutput(); err != nil {
+	if out, err := procattr.Hide(exec.Command("schtasks", args...)).CombinedOutput(); err != nil {
 		return fmt.Errorf("schtasks /Create keepalive: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	allowBatteryStart(keepaliveTaskName)
@@ -220,11 +216,9 @@ func windowsStartupDir() (string, error) {
 // startDaemonNow launches the daemon for the current session with no console
 // window (CREATE_NO_WINDOW). HideWindow is kept as a belt-and-suspenders hint.
 func startDaemonNow(binaryPath string) error {
-	cmd := exec.Command(binaryPath, "daemon")
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		HideWindow:    true,
-		CreationFlags: createNoWindow,
-	}
+	// procattr.Hide is what supplies CREATE_NO_WINDOW here — the same flag every
+	// other subprocess now gets, rather than a second hand-rolled copy of it.
+	cmd := procattr.Hide(exec.Command(binaryPath, "daemon"))
 	if err := cmd.Start(); err != nil {
 		return err
 	}
@@ -244,7 +238,7 @@ func isSchtasksAccessDenied(err error) bool {
 
 // taskExists reports whether a Scheduled Task with the given name is registered.
 func taskExists(taskName string) bool {
-	return exec.Command("schtasks", "/Query", "/TN", taskName).Run() == nil
+	return procattr.Hide(exec.Command("schtasks", "/Query", "/TN", taskName)).Run() == nil
 }
 
 // EnsureDaemonAgent is the daemon's startup self-heal: it re-asserts the
@@ -326,7 +320,7 @@ func writeShortcut(lnkPath, target, args string) error {
 			"$s.WindowStyle=7;$s.Description='Blamely background service';$s.Save()",
 		lnkPath, target, args, filepath.Dir(target),
 	)
-	out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script).CombinedOutput()
+	out, err := procattr.Hide(exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script)).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("create startup shortcut: %w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -346,7 +340,7 @@ func removeLegacyAgentArtifacts() {
 	if dir, err := config.BlamelyDir(); err == nil {
 		_ = os.Remove(filepath.Join(dir, "bin", legacyStartupVBSName))
 	}
-	_ = exec.Command("schtasks", "/Delete", "/F", "/TN", legacyWatchdogTaskName).Run()
+	_ = procattr.Hide(exec.Command("schtasks", "/Delete", "/F", "/TN", legacyWatchdogTaskName)).Run()
 }
 
 func UninstallDaemonAgent() error {
@@ -356,8 +350,8 @@ func UninstallDaemonAgent() error {
 	}
 	// Remove the periodic keepalive. Best-effort: it won't exist on installs
 	// that predate it, and a missing task makes /Delete error.
-	_ = exec.Command("schtasks", "/Delete", "/F", "/TN", keepaliveTaskName).Run()
-	err := exec.Command("schtasks", "/Delete", "/F", "/TN", scheduledTaskName).Run()
+	_ = procattr.Hide(exec.Command("schtasks", "/Delete", "/F", "/TN", keepaliveTaskName)).Run()
+	err := procattr.Hide(exec.Command("schtasks", "/Delete", "/F", "/TN", scheduledTaskName)).Run()
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {

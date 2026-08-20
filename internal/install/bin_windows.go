@@ -8,7 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"syscall"
+
+	"github.com/blamely/blamely/internal/procattr"
 )
 
 // killProcess terminates a specific PID (and its child tree) on Windows by PID
@@ -18,7 +19,7 @@ import (
 // from the daemon's own PID file, never our own (killRunningDaemon guards
 // against pid == os.Getpid()). /T also reaps the daemon's child processes.
 func killProcess(pid int) error {
-	return exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid)).Run()
+	return procattr.Hide(exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid))).Run()
 }
 
 // killOtherDaemonProcesses synchronously kills every blamely.exe EXCEPT this
@@ -31,12 +32,13 @@ func killProcess(pid int) error {
 // running and kept the dir locked".
 func killOtherDaemonProcesses() {
 	self := "PID ne " + strconv.Itoa(os.Getpid())
-	_ = exec.Command("taskkill", "/F", "/T", "/IM", "blamely.exe", "/FI", self).Run()
+	_ = procattr.Hide(exec.Command("taskkill", "/F", "/T", "/IM", "blamely.exe", "/FI", self)).Run()
 }
 
-// detachedProcess is CREATE_NO_WINDOW | DETACHED_PROCESS so the cleanup shell
-// keeps running after this process (and its console) exits.
-const detachedProcess = 0x08000000 | 0x00000008
+// detachedProcess is DETACHED_PROCESS: the cleanup shell keeps running after
+// this process (and its console) exits. CREATE_NO_WINDOW comes from
+// procattr.Hide, which every subprocess goes through.
+const detachedProcess = 0x00000008
 
 // removeInstalledBinary cannot delete the currently-running blamely.exe
 // directly — Windows locks an executing image, so os.Remove fails with
@@ -134,15 +136,15 @@ func removeInstalledBinary(p string, extraFiles []string, purgeRoot string) erro
 		`ping 127.0.0.1 -n 2 >nul & %s & ping 127.0.0.1 -n 3 >nul & %s & ping 127.0.0.1 -n 3 >nul & %s`,
 		killClean, killClean, killClean,
 	)
-	cmd := exec.Command("cmd", "/c", script)
+	cmd := procattr.Hide(exec.Command("cmd", "/c", script))
 	// Run the cleanup from a directory OUTSIDE the tree being deleted, so the
 	// detached process's own working directory can never hold a lock that blocks
 	// the rmdir. (Inherited CWD could otherwise sit inside ~/.blamely.)
 	cmd.Dir = os.TempDir()
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		HideWindow:    true,
-		CreationFlags: detachedProcess,
-	}
+	// procattr.Hide already added CREATE_NO_WINDOW; this shell additionally needs
+	// DETACHED_PROCESS so it survives our own exit. OR it in rather than
+	// replacing SysProcAttr, which would drop what Hide set.
+	cmd.SysProcAttr.CreationFlags |= detachedProcess
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("schedule binary removal: %w", err)
 	}

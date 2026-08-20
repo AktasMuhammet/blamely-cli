@@ -6,6 +6,8 @@ import (
 
 	"github.com/blamely/blamely/internal/authorship"
 	"github.com/blamely/blamely/internal/gitutil"
+
+	"github.com/blamely/blamely/internal/procattr"
 )
 
 // Git-op robustness for Attribution (docs/attribution-v2-design.md §8, Phase 5).
@@ -32,11 +34,11 @@ func ensureNotesFollowRewrites(repoPath string) {
 	if !authorship.Enabled() {
 		return
 	}
-	if out, err := exec.Command("git", "-C", repoPath, "config", "--get", "notes.rewriteMode").Output(); err != nil ||
+	if out, err := procattr.Hide(exec.Command("git", "-C", repoPath, "config", "--get", "notes.rewriteMode")).Output(); err != nil ||
 		strings.TrimSpace(string(out)) != "overwrite" {
-		_ = exec.Command("git", "-C", repoPath, "config", "notes.rewriteMode", "overwrite").Run()
+		_ = procattr.Hide(exec.Command("git", "-C", repoPath, "config", "notes.rewriteMode", "overwrite")).Run()
 	}
-	out, err := exec.Command("git", "-C", repoPath, "config", "--get-all", "notes.rewriteRef").Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", repoPath, "config", "--get-all", "notes.rewriteRef")).Output()
 	if err == nil {
 		for _, l := range strings.Split(string(out), "\n") {
 			if strings.TrimSpace(l) == NotesRef {
@@ -44,7 +46,7 @@ func ensureNotesFollowRewrites(repoPath string) {
 			}
 		}
 	}
-	_ = exec.Command("git", "-C", repoPath, "config", "--add", "notes.rewriteRef", NotesRef).Run()
+	_ = procattr.Hide(exec.Command("git", "-C", repoPath, "config", "--add", "notes.rewriteRef", NotesRef)).Run()
 }
 
 // attributionShouldSkip reports whether to skip (re)attribution because a history-
