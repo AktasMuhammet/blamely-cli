@@ -599,16 +599,23 @@ func changedSourceFiles(root string) []string {
 // is within `window` of now — the ones the command that just ran actually wrote,
 // as opposed to everything the working tree happens to have changed.
 func recentlyChangedFiles(root string, window time.Duration) []string {
+	return withinMtimeWindow(root, changedSourceFiles(root), window)
+}
+
+// withinMtimeWindow is recentlyChangedFiles over an already-resolved file list, so
+// a caller that needs BOTH the full changed set and the recently-written subset
+// pays for only one `git status`.
+func withinMtimeWindow(root string, files []string, window time.Duration) []string {
 	cutoff := time.Now().Add(-window)
-	var files []string
-	for _, rel := range changedSourceFiles(root) {
+	var out []string
+	for _, rel := range files {
 		info, err := os.Stat(filepath.Join(root, rel))
 		if err != nil || info.ModTime().Before(cutoff) {
 			continue
 		}
-		files = append(files, rel)
+		out = append(out, rel)
 	}
-	return files
+	return out
 }
 
 // bashWriteWindowFor sizes the mtime window to the command that just ran.

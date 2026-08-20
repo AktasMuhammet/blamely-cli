@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/blamely/blamely/internal/authorship"
 	"github.com/blamely/blamely/internal/daemon"
 	"github.com/blamely/blamely/internal/gitutil"
 )
@@ -38,6 +39,15 @@ type shellWriteOpts struct {
 	Window time.Duration
 }
 
+// mtimeWindow is Window with the floor applied — how recently a file must have
+// been modified to count as written by this command.
+func (o shellWriteOpts) mtimeWindow() time.Duration {
+	if o.Window <= 0 {
+		return bashWriteWindow
+	}
+	return o.Window
+}
+
 // recordShellWrites attributes the files that changed while a shell command ran,
 // for every repo under cwd. A cwd ABOVE the repos (a workspace dir holding
 // separate `backend/` and `frontend/` clones) resolves to every repo nested
@@ -67,7 +77,13 @@ func recordShellWritesIn(root, command string, o shellWriteOpts) error {
 	if err := recordShellDeletions(root, command, o.Tool, o.GenType, o.Model, o.SessionID, o.TranscriptPath, o.DeleteSource); err != nil {
 		return err
 	}
-	for _, payload := range shellWritePayloads(root, o) {
+	// ONE `git status` for the whole hook: the write attribution and the baseline
+	// sweep both derive from this list. The hook runs on every tool call, so an
+	// extra git invocation here is a process per call — exactly the cost we avoid
+	// by not registering a second hook event.
+	changed := changedSourceFiles(root)
+	written := withinMtimeWindow(root, changed, o.mtimeWindow())
+	for _, payload := range shellWritePayloadsFrom(root, written, o) {
 		// Mirror into the Attribution working log BEFORE the daemon POST, exactly
 		// like every edit-tool path does. The commit-time flip reads the working
 		// log, so a shell-written file stays invisible to it however many DB rows
@@ -78,19 +94,55 @@ func recordShellWritesIn(root, command string, o shellWriteOpts) error {
 			return err
 		}
 	}
+	captureBaselinesForUntouchedFiles(root, changed, written)
 	return nil
+}
+
+// captureBaselinesForUntouchedFiles snapshots the pre-edit baseline of every
+// changed source file this command did NOT write, so a LATER command that does
+// write one of them diffs against its real prior content instead of against the
+// commit.
+//
+// This is the reason blamely does not need a PreToolUse hook to stay honest. A
+// pre-hook would be a second process on every single tool call; the same
+// protection falls out of the post-hook we already run, because an agent runs
+// far more read-only commands than writes and each of those establishes the
+// baselines before anything is written.
+//
+// Files inside the command's own mtime window are excluded — those are the ones
+// it may have just written, and capturing their POST-write content as the
+// baseline would fold the agent's new lines into it, so they would never be
+// attributed to anyone. captureBaselineIfUntracked skips anything Attribution
+// already tracks, so this only ever fills in files with no working log.
+func captureBaselinesForUntouchedFiles(root string, changed, written []string) {
+	if len(changed) > maxShellBaselineFiles {
+		return // mid-rebase / mid-checkout, not mid-authoring
+	}
+	touched := make(map[string]bool, len(written))
+	for _, rel := range written {
+		touched[rel] = true
+	}
+	untouched := make([]string, 0, len(changed))
+	for _, rel := range changed {
+		if !touched[rel] {
+			untouched = append(untouched, rel)
+		}
+	}
+	authorship.PutBaselinesIfUntracked(root, untouched)
 }
 
 // shellWritePayloads builds the edit payloads for the files a shell command just
 // wrote inside `root`. Split out from the recording so the resolution can be
-// asserted in tests without a running daemon. Each file is recorded as a
-// medium-confidence whole-file edit, matching how a Write is stored.
+// asserted in tests without a running daemon.
 func shellWritePayloads(root string, o shellWriteOpts) []daemon.EditPayload {
-	window := o.Window
-	if window <= 0 {
-		window = bashWriteWindow
-	}
-	files := recentlyChangedFiles(root, window)
+	return shellWritePayloadsFrom(root, recentlyChangedFiles(root, o.mtimeWindow()), o)
+}
+
+// shellWritePayloadsFrom is shellWritePayloads over an already-resolved file list,
+// so the caller can reuse one `git status` for both the attribution and the
+// baseline sweep. Each file is recorded as a medium-confidence whole-file edit,
+// matching how a Write is stored.
+func shellWritePayloadsFrom(root string, files []string, o shellWriteOpts) []daemon.EditPayload {
 	// none → read-only command (ls/grep/test); too many → bulk op we won't guess.
 	if len(files) == 0 || len(files) > maxBashWriteFiles {
 		return nil

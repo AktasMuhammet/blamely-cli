@@ -28,21 +28,22 @@ const (
 // Adding to this list automatically gets the install path; uninstall scans
 // the full `hooks` map regardless and will still find our markers.
 //
-// PreToolUse used to be excluded here because "at PreToolUse time Write
-// operations record the OLD file content as an AI claim, covering human-typed
-// lines and making them appear as AI in subsequent commits". That was real, and
-// it had two causes, both now fixed:
+// PreToolUse is deliberately NOT registered, and the reason is cost, not
+// correctness: a hook is an external command, so hooking a second event spawns
+// another blamely process on EVERY tool call — latency the user pays constantly,
+// and one more short-lived binary launch for endpoint protection to inspect.
 //
-//   - the registration never passed --pre, so the pre-hook ran the FULL recording
-//     path against the pre-edit content (recordHookCommandForEvent);
-//   - the baseline capture overwrote the stored baseline of an already-tracked
-//     file, stranding its line numbers (tools.captureBaselineIfUntracked).
+// The pre-edit baseline that event would capture is instead taken on the
+// PostToolUse path we already run, for the files the command did NOT write
+// (tools.captureBaselinesForUntouchedFiles). Read-only calls — the majority of
+// what an agent runs — establish those baselines before any write happens.
 //
-// With those closed the pre-hook only ever snapshots a diff baseline, which is
-// what lets a shell write claim the lines the command changed instead of every
-// uncommitted change the file had accumulated. Cursor (cursorhook.go) is still
-// PostToolUse-only and can follow once this has run in the wild.
-var claudeHookEvents = []string{"PostToolUse", "PreToolUse"}
+// The historic reason for excluding it was different and is now fixed: the
+// registration never passed --pre, so the pre-hook ran the FULL recording path
+// against the pre-edit content and credited the agent with lines that were
+// already there. Tools whose PreToolUse IS registered (codex, copilot, gemini)
+// now get the flag from recordHookCommandForEvent.
+var claudeHookEvents = []string{"PostToolUse"}
 
 // InstallClaudeHook ensures exactly ONE blamely record-hook is the FIRST hook
 // of every event we care about under ~/.claude/settings.json (PostToolUse
@@ -102,11 +103,23 @@ func installClaudeHookAt(settingsPath, binaryPath string) (added bool, err error
 
 	hooks := getMap(root, "hooks", true)
 
+	// Strip our hook from EVERY event first, not just the ones we are about to
+	// register. An event we used to register and no longer do (PreToolUse was
+	// registered by one build) would otherwise keep firing forever, because a
+	// reinstall never visits it. Stripping the whole map makes install converge on
+	// claudeHookEvents whichever build wrote the file.
+	for event := range hooks {
+		entries := getSlice(hooks, event)
+		stripped := stripBlamelyMatcherGroups(entries, blamelyHookMarker)
+		if len(stripped) == 0 {
+			delete(hooks, event)
+			continue
+		}
+		hooks[event] = stripped
+	}
 	for _, event := range claudeHookEvents {
 		command := recordHookCommandForEvent(binaryPath, "claude", event)
-		entries := getSlice(hooks, event)
-		entries = stripBlamelyMatcherGroups(entries, blamelyHookMarker)
-		entries = prependIntoMatcherGroup(entries, claudeHookMatcher, command)
+		entries := prependIntoMatcherGroup(getSlice(hooks, event), claudeHookMatcher, command)
 		hooks[event] = entries
 	}
 	root["hooks"] = hooks
