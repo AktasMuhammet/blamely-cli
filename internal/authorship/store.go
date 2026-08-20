@@ -111,6 +111,15 @@ func PutBaseline(repoRoot, branch, baseSHA, relPath, content string) error {
 // instead of defaulting to Human (I5). It is a no-op if a working log already
 // exists, so it never clobbers uncommitted state. nowMS=0 leaves the stamp unset
 // (the next Update restamps). Held under the same per-file lock as Update.
+//
+// A pre-edit baseline with NO working log next to it is the third case: the
+// pre-hook (`record --pre`) captured the file's content before an agent ran, and
+// that content is NEWER than the commit because the file already had uncommitted
+// changes nobody observed. That baseline is kept, and the divergence from the
+// commit is folded into the seeded log as Human — the same rule an unobserved line
+// gets everywhere else. Overwriting it with the committed content instead is what
+// made the very next edit diff against the commit and claim the user's own
+// uncommitted lines for the agent.
 func SeedWorkingLog(repoRoot, branch, baseSHA, relPath, content string, lines []LineAttribution, nowMS int64) error {
 	rel := cleanRel(relPath)
 	wlPath := WorkingLogPath(repoRoot, branch, baseSHA, relPath)
@@ -127,12 +136,22 @@ func SeedWorkingLog(repoRoot, branch, baseSHA, relPath, content string, lines []
 			Schema: WorkingLogSchema, File: rel, BaseSHA: baseSHA,
 			BlobSHA: sha256Hex(content), UpdatedMS: nowMS, Lines: lines,
 		}
+		stored, hadBaseline := loadBaseline(basePath)
+		if hadBaseline && stored != content {
+			// Re-key the committed attributions onto the captured content: unchanged
+			// committed lines keep their author, the uncommitted divergence is Human.
+			wl = Attribute(wl, content, stored, HumanAuthor(), nowMS)
+			wl.File, wl.BaseSHA, wl.UpdatedMS = rel, baseSHA, nowMS
+		}
 		data, err := json.MarshalIndent(wl, "", "  ")
 		if err != nil {
 			return err
 		}
 		if err := atomicWrite(wlPath, data); err != nil {
 			return err
+		}
+		if hadBaseline {
+			return nil // keep the captured pre-edit baseline
 		}
 		return atomicWrite(basePath, []byte(content))
 	})

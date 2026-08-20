@@ -258,11 +258,21 @@ func RecordClaudeFromStdin(r io.Reader) error {
 }
 
 const (
-	// bashWriteWindow bounds how recently a file must have been modified to be
-	// credited to the Bash command that just ran. The PostToolUse hook fires
-	// immediately after the command, so a generous window absorbs hook latency
-	// while still excluding files the user edited minutes earlier.
+	// bashWriteWindow is the FLOOR of the mtime window that decides whether a
+	// changed file is credited to the Bash command that just ran. It absorbs hook
+	// latency for a command that writes and exits immediately; a command that
+	// keeps running widens the window to its own duration — see
+	// bashWriteWindowFor.
 	bashWriteWindow = 15 * time.Second
+	// maxBashWriteWindow is the CEILING of that widening. Unbounded, a stale or
+	// bogus transcript timestamp would open the window across the whole session
+	// and credit the AI for files the user edited by hand hours earlier.
+	maxBashWriteWindow = 10 * time.Minute
+	// transcriptTailLimit bounds how much of the transcript's END we read to find
+	// the running command's start time. Transcripts reach megabytes over a long
+	// session and this runs inside EVERY Bash PostToolUse hook, so the read must
+	// not scale with session length.
+	transcriptTailLimit = 512 << 10
 	// maxBashWriteFiles caps how many changed files we attribute to one command.
 	// A larger change set is almost certainly a bulk operation (build, codegen,
 	// `git checkout`, `npm install`) rather than authored content — we skip
@@ -270,83 +280,39 @@ const (
 	maxBashWriteFiles = 30
 )
 
-// recordClaudeBashWrites attributes source files that changed while a Claude
-// Bash command ran. It uses `git status` (not a filesystem walk) so the scan is
-// bounded and automatically respects .gitignore — build output and node_modules
-// never appear. Each changed source file is recorded as a medium-confidence
-// claude edit covering the whole file, matching how a Write is stored, so the
-// existing commit-time attribution credits it without any further changes.
-// A cwd ABOVE the repos (a workspace dir holding separate `backend/` and
-// `frontend/` clones) resolves to every repo nested beneath it, so an agent
-// started there still gets its shell writes attributed — see DiscoverRepos.
-func recordClaudeBashWrites(cwd, sessionID, transcriptPath, genType, command string) error {
-	for _, root := range gitutil.DiscoverRepos(cwd) {
-		if err := recordClaudeBashWritesIn(root, sessionID, transcriptPath, genType, command); err != nil {
-			return err
-		}
+// claudeShellWriteOpts is Claude's half of the shared shell-write path
+// (shellwrite.go). Unlike the other agents, Claude's transcript lets us recover
+// when the command STARTED, so the mtime window can cover its whole run instead
+// of a fixed floor.
+func claudeShellWriteOpts(sessionID, transcriptPath, genType string) shellWriteOpts {
+	return shellWriteOpts{
+		Tool:           "claude",
+		GenType:        genType,
+		SessionID:      sessionID,
+		TranscriptPath: transcriptPath,
+		WriteSource:    "claude_bash_fswrite",
+		DeleteSource:   "claude_bash_delete",
+		Window:         bashWriteWindowFor(transcriptPath),
 	}
-	return nil
+}
+
+// recordClaudeBashWrites attributes source files that changed while a Claude Bash
+// command ran — see shellwrite.go for how the files are resolved and why the
+// working-log mirror is not optional.
+func recordClaudeBashWrites(cwd, sessionID, transcriptPath, genType, command string) error {
+	return recordShellWrites(cwd, command, claudeShellWriteOpts(sessionID, transcriptPath, genType))
 }
 
 // recordClaudeBashWritesIn is recordClaudeBashWrites scoped to one repo root.
 func recordClaudeBashWritesIn(root, sessionID, transcriptPath, genType, command string) error {
-	// File deletions the command performed (e.g. `rm foo.html`), scoped to the
-	// command's actual rm/del targets so a file the USER deleted by hand isn't
-	// swept in. Done first (and unconditionally) so a command that ONLY deletes
-	// — leaving recentlyChangedFiles empty — still records its removals.
-	if err := recordShellDeletions(root, command, "claude", genType, "", sessionID, transcriptPath, "claude_bash_delete"); err != nil {
-		return err
-	}
-
-	for _, payload := range claudeBashWritePayloads(root, sessionID, transcriptPath, genType) {
-		if err := postToDaemon(payload); err != nil {
-			return err
-		}
-	}
-	return nil
+	return recordShellWritesIn(root, command, claudeShellWriteOpts(sessionID, transcriptPath, genType))
 }
 
 // claudeBashWritePayloads builds the edit payloads for the files a Bash command
 // just wrote inside `root`. Split out from the recording so the resolution can be
 // asserted in tests without a running daemon.
 func claudeBashWritePayloads(root, sessionID, transcriptPath, genType string) []daemon.EditPayload {
-	files := recentlyChangedFiles(root, bashWriteWindow)
-	// none → read-only command (ls/grep/test); too many → bulk op we won't guess.
-	if len(files) == 0 || len(files) > maxBashWriteFiles {
-		return nil
-	}
-	repoID, _ := gitutil.RepoID(resolveSymlinks(root))
-	if repoID == "" {
-		repoID = root
-	}
-	out := make([]daemon.EditPayload, 0, len(files))
-	for _, rel := range files {
-		abs := filepath.Join(root, rel)
-		ranges := perLineShaRanges(abs)
-		if len(ranges) == 0 {
-			continue
-		}
-		payload := daemon.EditPayload{
-			Tool:           "claude",
-			Confidence:     "medium",
-			GenType:        genType,
-			RepoPath:       repoID,
-			FilePath:       rel,
-			SuggestedLines: int64(len(ranges)),
-			Lines:          toDaemonRanges(ranges),
-			RawMeta: fmt.Sprintf(`{"session_id":%q,"tool":"claude","source":"claude_bash_fswrite","transcript_path":%q}`,
-				sessionID, transcriptPath),
-		}
-		// Backfill model + token usage from the session transcript, exactly like
-		// the Write/Edit hook path — otherwise the row has an empty model.
-		applyHookUsage(&payload, hookUsageOptions{
-			transcriptPath: transcriptPath,
-			sessionID:      sessionID,
-			tool:           "claude",
-		})
-		out = append(out, payload)
-	}
-	return out
+	return shellWritePayloads(root, claudeShellWriteOpts(sessionID, transcriptPath, genType))
 }
 
 // gitDeletedFiles returns repo-relative source-file paths git reports as
@@ -592,15 +558,15 @@ func perLineShaRangesFromContent(content string) []LineRange {
 	return out
 }
 
-// recentlyChangedFiles returns repo-relative paths that git reports as
-// changed/untracked and whose on-disk mtime is within `window` of now. Using
-// git keeps the result bounded (usually a handful of paths) and gitignore-aware.
-func recentlyChangedFiles(root string, window time.Duration) []string {
+// changedSourceFiles returns repo-relative paths that git reports as
+// changed/untracked and that look like authored source. Using git keeps the
+// result bounded (usually a handful of paths) and gitignore-aware, so build
+// output and node_modules never appear.
+func changedSourceFiles(root string) []string {
 	out, err := gitutil.Output(root, "status", "--porcelain", "--untracked-files=all")
 	if err != nil {
 		return nil
 	}
-	cutoff := time.Now().Add(-window)
 	var files []string
 	for _, line := range strings.Split(string(out), "\n") {
 		// Porcelain v1 lines are "XY <path>" (3-char status prefix). Renames
@@ -621,15 +587,108 @@ func recentlyChangedFiles(root string, window time.Duration) []string {
 		if err != nil || info.IsDir() || info.Size() == 0 {
 			continue
 		}
-		if info.ModTime().Before(cutoff) {
-			continue
-		}
 		if !looksLikeSourceFile(abs) {
 			continue
 		}
 		files = append(files, path)
 	}
 	return files
+}
+
+// recentlyChangedFiles narrows changedSourceFiles to the files whose on-disk mtime
+// is within `window` of now — the ones the command that just ran actually wrote,
+// as opposed to everything the working tree happens to have changed.
+func recentlyChangedFiles(root string, window time.Duration) []string {
+	cutoff := time.Now().Add(-window)
+	var files []string
+	for _, rel := range changedSourceFiles(root) {
+		info, err := os.Stat(filepath.Join(root, rel))
+		if err != nil || info.ModTime().Before(cutoff) {
+			continue
+		}
+		files = append(files, rel)
+	}
+	return files
+}
+
+// bashWriteWindowFor sizes the mtime window to the command that just ran.
+//
+// The PostToolUse hook fires when the command EXITS, so a fixed window silently
+// drops every file a long command wrote: `python3 - <<PYEOF … PYEOF && black . &&
+// pytest` writes its files in the first second and exits forty seconds later, by
+// which point a 15s window excludes all of them and the AI's work commits as
+// Human. We take the command's start time from the transcript's last Bash
+// tool_use and cover its whole run plus bashWriteWindow of hook slack, clamped to
+// maxBashWriteWindow. Falls back to the bare floor whenever that start time can't
+// be read, so a missing or unparseable transcript behaves exactly as before.
+func bashWriteWindowFor(transcriptPath string) time.Duration {
+	startNanos := lastBashToolUseNanos(transcriptPath)
+	if startNanos <= 0 {
+		return bashWriteWindow
+	}
+	elapsed := time.Since(time.Unix(0, startNanos))
+	if elapsed < 0 {
+		return bashWriteWindow // clock skew — never widen on a future timestamp
+	}
+	switch w := elapsed + bashWriteWindow; {
+	case w < bashWriteWindow:
+		return bashWriteWindow
+	case w > maxBashWriteWindow:
+		return maxBashWriteWindow
+	default:
+		return w
+	}
+}
+
+// lastBashToolUseNanos returns the timestamp of the most recent `Bash` tool_use in
+// the transcript — when the command that just finished STARTED. It reads a
+// bounded tail and walks it backwards, so the cost is independent of how long the
+// session has been running. Returns 0 when the path is empty, unreadable, or holds
+// no Bash call in its tail.
+func lastBashToolUseNanos(path string) int64 {
+	if path == "" {
+		return 0
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || info.Size() == 0 {
+		return 0
+	}
+	off := int64(0)
+	if info.Size() > transcriptTailLimit {
+		off = info.Size() - transcriptTailLimit
+	}
+	buf := make([]byte, info.Size()-off)
+	n, _ := f.ReadAt(buf, off)
+	lines := strings.Split(string(buf[:n]), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		// A tail cut mid-line leaves a partial first entry; requiring the opening
+		// brace skips it (and any blank line) rather than counting a failed parse.
+		if line == "" || line[0] != '{' {
+			continue
+		}
+		var ent tsOpEntry
+		if json.Unmarshal([]byte(line), &ent) != nil {
+			continue
+		}
+		var msg struct {
+			Content []tsOpToolUse `json:"content"`
+		}
+		if json.Unmarshal(ent.Message, &msg) != nil {
+			continue
+		}
+		for _, u := range msg.Content {
+			if u.Type == "tool_use" && u.Name == "Bash" {
+				return parseTranscriptTime(ent.Timestamp)
+			}
+		}
+	}
+	return 0
 }
 
 // extractClaudeRanges returns the file path, the located line ranges after

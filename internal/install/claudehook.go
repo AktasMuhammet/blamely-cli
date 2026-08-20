@@ -28,11 +28,21 @@ const (
 // Adding to this list automatically gets the install path; uninstall scans
 // the full `hooks` map regardless and will still find our markers.
 //
-// PreToolUse is intentionally excluded — see the matching comment in
-// cursorhook.go for the full explanation. Short version: at PreToolUse time
-// Write operations record the OLD file content as an AI claim, covering
-// human-typed lines and making them appear as AI in subsequent commits.
-var claudeHookEvents = []string{"PostToolUse"}
+// PreToolUse used to be excluded here because "at PreToolUse time Write
+// operations record the OLD file content as an AI claim, covering human-typed
+// lines and making them appear as AI in subsequent commits". That was real, and
+// it had two causes, both now fixed:
+//
+//   - the registration never passed --pre, so the pre-hook ran the FULL recording
+//     path against the pre-edit content (recordHookCommandForEvent);
+//   - the baseline capture overwrote the stored baseline of an already-tracked
+//     file, stranding its line numbers (tools.captureBaselineIfUntracked).
+//
+// With those closed the pre-hook only ever snapshots a diff baseline, which is
+// what lets a shell write claim the lines the command changed instead of every
+// uncommitted change the file had accumulated. Cursor (cursorhook.go) is still
+// PostToolUse-only and can follow once this has run in the wild.
+var claudeHookEvents = []string{"PostToolUse", "PreToolUse"}
 
 // InstallClaudeHook ensures exactly ONE blamely record-hook is the FIRST hook
 // of every event we care about under ~/.claude/settings.json (PostToolUse
@@ -91,9 +101,9 @@ func installClaudeHookAt(settingsPath, binaryPath string) (added bool, err error
 	before := canonJSON(root)
 
 	hooks := getMap(root, "hooks", true)
-	command := recordHookCommand(binaryPath, "claude")
 
 	for _, event := range claudeHookEvents {
+		command := recordHookCommandForEvent(binaryPath, "claude", event)
 		entries := getSlice(hooks, event)
 		entries = stripBlamelyMatcherGroups(entries, blamelyHookMarker)
 		entries = prependIntoMatcherGroup(entries, claudeHookMatcher, command)
