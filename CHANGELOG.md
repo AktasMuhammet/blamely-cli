@@ -4,6 +4,11 @@ Notable changes to the **Blamely CLI** follow [Keep a Changelog](https://keepach
 
 ## [Unreleased]
 
+### Fixed
+
+- **Uninstall no longer flashes a burst of black command windows (Windows).** Removing Blamely used to blink a dozen or more console windows across the screen, one after another, looking like something was pinging in a loop. The cleanup that runs after uninstall now does its work in a single hidden window.
+- **Uninstall now actually deletes Blamely's files (Windows).** The final cleanup step — which removes `~/.blamely`, the program itself, the database and the logs once Blamely has exited — was silently failing, so an uninstall that reported success could leave those files on disk and the background service registered. They are now removed as intended.
+
 ## [1.6.9] - 2026-07-27
 
 ### Fixed

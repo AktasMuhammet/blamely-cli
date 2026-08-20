@@ -198,11 +198,12 @@ func installKeepaliveTask(binaryPath string) error {
 // PowerShell or a policy-restricted box keeps the schtasks defaults, which is
 // exactly the pre-patch behavior.
 func allowBatteryStart(taskName string) {
-	_ = exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command",
+	_ = procattr.Hide(exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command",
 		fmt.Sprintf(
 			"Set-ScheduledTask -TaskName '%s' -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable)",
 			taskName,
-		)).Run()
+		),
+	)).Run()
 }
 
 func windowsStartupDir() (string, error) {

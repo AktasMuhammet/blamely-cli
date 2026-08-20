@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"syscall"
 
 	"github.com/blamely/blamely/internal/procattr"
 )
@@ -35,10 +36,25 @@ func killOtherDaemonProcesses() {
 	_ = procattr.Hide(exec.Command("taskkill", "/F", "/T", "/IM", "blamely.exe", "/FI", self)).Run()
 }
 
-// detachedProcess is DETACHED_PROCESS: the cleanup shell keeps running after
-// this process (and its console) exits. CREATE_NO_WINDOW comes from
-// procattr.Hide, which every subprocess goes through.
-const detachedProcess = 0x00000008
+// createNewConsole is CREATE_NEW_CONSOLE: the cleanup shell gets a console of
+// its OWN, which SysProcAttr.HideWindow (STARTF_USESHOWWINDOW + SW_HIDE) then
+// creates hidden.
+//
+// This replaces CREATE_NO_WINDOW | DETACHED_PROCESS, which made uninstall flash
+// a rapid burst of ~20 console windows across the screen — pings and taskkills
+// visibly blinking one after another. Both of those flags leave the shell with
+// NO console at all, and a console-less parent running a CONSOLE program gets
+// that child a brand new, VISIBLE console (the exact mechanism procattr exists
+// to suppress — see internal/procattr). procattr.Hide cannot help here: it fixes
+// children we spawn ourselves, and every process in this script is spawned by
+// cmd.exe, which has no way to pass CREATE_NO_WINDOW down. Giving the shell one
+// hidden console instead means ping/taskkill/schtasks INHERIT it and none of
+// them allocates a window.
+//
+// A separate console also keeps the detachment DETACHED_PROCESS provided: the
+// shell isn't attached to the terminal the user ran `blamely uninstall` in, so
+// it survives our exit and that terminal closing.
+const createNewConsole = 0x00000010
 
 // removeInstalledBinary cannot delete the currently-running blamely.exe
 // directly — Windows locks an executing image, so os.Remove fails with
@@ -136,19 +152,51 @@ func removeInstalledBinary(p string, extraFiles []string, purgeRoot string) erro
 		`ping 127.0.0.1 -n 2 >nul & %s & ping 127.0.0.1 -n 3 >nul & %s & ping 127.0.0.1 -n 3 >nul & %s`,
 		killClean, killClean, killClean,
 	)
-	cmd := procattr.Hide(exec.Command("cmd", "/c", script))
-	// Run the cleanup from a directory OUTSIDE the tree being deleted, so the
-	// detached process's own working directory can never hold a lock that blocks
-	// the rmdir. (Inherited CWD could otherwise sit inside ~/.blamely.)
-	cmd.Dir = os.TempDir()
-	// procattr.Hide already added CREATE_NO_WINDOW; this shell additionally needs
-	// DETACHED_PROCESS so it survives our own exit. OR it in rather than
-	// replacing SysProcAttr, which would drop what Hide set.
-	cmd.SysProcAttr.CreationFlags |= detachedProcess
-	if err := cmd.Start(); err != nil {
+	if err := runDetachedShell(script); err != nil {
 		return fmt.Errorf("schedule binary removal: %w", err)
 	}
-	// Release so we don't wait on the detached cleanup; it outlives us.
+	return nil
+}
+
+// runDetachedShell starts script in a cmd.exe that keeps running after this
+// process exits and shows no window.
+//
+// Split out of removeInstalledBinary so a test can exercise the two things this
+// is easy to get wrong on Windows — quote delivery and window suppression —
+// without running the cleanup's destructive taskkill/schtasks lines against the
+// developer's own machine.
+func runDetachedShell(script string) error {
+	cmd := exec.Command("cmd")
+	// Run from a directory OUTSIDE the tree being deleted, so the detached
+	// process's own working directory can never hold a lock that blocks the
+	// rmdir. (Inherited CWD could otherwise sit inside ~/.blamely.)
+	cmd.Dir = os.TempDir()
+	// The script is handed over as a RAW command line (CmdLine), not as an argv
+	// element, and the shell gets a hidden console of its own. Both matter:
+	//
+	//   CmdLine — os/exec quotes any argument containing a double quote the
+	//   CommandLineToArgvW way, turning `"` into `\"`. cmd.exe does not implement
+	//   that escape; it reads the backslash as an ordinary character. So passing
+	//   the script as an argv element delivered `del /f /q \"C:\...\"` and
+	//   `schtasks /delete /f /tn \"Blamely Daemon\"` to the shell: every path and
+	//   task name arrived with a literal backslash-quote glued on, every command
+	//   failed, and every failure was swallowed by its own `>nul 2>&1`. The whole
+	//   deferred cleanup ran as nothing but three pings, which is why the bin
+	//   directory, db.sqlite and daemon.log outlived the uninstall. CmdLine is
+	//   passed to CreateProcessW verbatim, so cmd.exe sees the quotes it needs.
+	//
+	//   HideWindow + CREATE_NEW_CONSOLE — see the comment on createNewConsole:
+	//   procattr.Hide would leave this shell console-less, and each console
+	//   program it runs would then flash a window of its own.
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: createNewConsole,
+		CmdLine:       "/c " + script,
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	// Release so we don't wait on the cleanup; it outlives us.
 	_ = cmd.Process.Release()
 	return nil
 }
