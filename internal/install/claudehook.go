@@ -28,10 +28,21 @@ const (
 // Adding to this list automatically gets the install path; uninstall scans
 // the full `hooks` map regardless and will still find our markers.
 //
-// PreToolUse is intentionally excluded — see the matching comment in
-// cursorhook.go for the full explanation. Short version: at PreToolUse time
-// Write operations record the OLD file content as an AI claim, covering
-// human-typed lines and making them appear as AI in subsequent commits.
+// PreToolUse is deliberately NOT registered, and the reason is cost, not
+// correctness: a hook is an external command, so hooking a second event spawns
+// another blamely process on EVERY tool call — latency the user pays constantly,
+// and one more short-lived binary launch for endpoint protection to inspect.
+//
+// The pre-edit baseline that event would capture is instead taken on the
+// PostToolUse path we already run, for the files the command did NOT write
+// (tools.captureBaselinesForUntouchedFiles). Read-only calls — the majority of
+// what an agent runs — establish those baselines before any write happens.
+//
+// The historic reason for excluding it was different and is now fixed: the
+// registration never passed --pre, so the pre-hook ran the FULL recording path
+// against the pre-edit content and credited the agent with lines that were
+// already there. Tools whose PreToolUse IS registered (codex, copilot, gemini)
+// now get the flag from recordHookCommandForEvent.
 var claudeHookEvents = []string{"PostToolUse"}
 
 // InstallClaudeHook ensures exactly ONE blamely record-hook is the FIRST hook
@@ -91,12 +102,24 @@ func installClaudeHookAt(settingsPath, binaryPath string) (added bool, err error
 	before := canonJSON(root)
 
 	hooks := getMap(root, "hooks", true)
-	command := recordHookCommand(binaryPath, "claude")
 
-	for _, event := range claudeHookEvents {
+	// Strip our hook from EVERY event first, not just the ones we are about to
+	// register. An event we used to register and no longer do (PreToolUse was
+	// registered by one build) would otherwise keep firing forever, because a
+	// reinstall never visits it. Stripping the whole map makes install converge on
+	// claudeHookEvents whichever build wrote the file.
+	for event := range hooks {
 		entries := getSlice(hooks, event)
-		entries = stripBlamelyMatcherGroups(entries, blamelyHookMarker)
-		entries = prependIntoMatcherGroup(entries, claudeHookMatcher, command)
+		stripped := stripBlamelyMatcherGroups(entries, blamelyHookMarker)
+		if len(stripped) == 0 {
+			delete(hooks, event)
+			continue
+		}
+		hooks[event] = stripped
+	}
+	for _, event := range claudeHookEvents {
+		command := recordHookCommandForEvent(binaryPath, "claude", event)
+		entries := prependIntoMatcherGroup(getSlice(hooks, event), claudeHookMatcher, command)
 		hooks[event] = entries
 	}
 	root["hooks"] = hooks

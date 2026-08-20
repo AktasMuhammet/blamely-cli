@@ -73,7 +73,7 @@ type UpdateOptions struct {
 	Channel     string // defaults to UpdateChannel()
 	Force       bool   // install even at the same version, and from a non-installed copy
 	DryRun      bool   // resolve and compare, then stop before downloading
-	WithPlugins bool   // also reinstall the IDE plugins (off: never clobber a sideloaded dev build)
+	SkipPlugins bool   // leave the IDE plugins alone (off: an update brings them along)
 	FromArchive string // air-gap: install this local archive instead of downloading
 	ExpectSHA   string // required with FromArchive — the archive's sha256
 	Out         io.Writer
@@ -140,6 +140,26 @@ var executablePath = os.Executable
 // UpdateChannel resolves which release channel to update from: $BLAMELY_CHANNEL
 // (one-off override, mirrors the installer), then update.channel in config (how
 // a fleet pins itself), then "latest".
+// postUpdateInstallArgs is the argv the finished update hands off to the freshly
+// installed binary, to re-register the hooks and restart the daemon.
+//
+// The IDE plugins come along by default. The CLI, the VS Code plugin and the
+// JetBrains plugin release in lockstep at one version, so an update that moved only
+// the CLI produces exactly the drift lockstep exists to prevent — a 1.8.x CLI
+// beside a 1.6.0 editor plugin, which is what accumulates on a machine that only
+// ever auto-updates. SkipPlugins opts out, for a sideloaded dev build a marketplace
+// build would overwrite.
+//
+// Split out from Update so the decision is asserted on every OS: the end-to-end
+// update test is skipped on Windows.
+func postUpdateInstallArgs(opts UpdateOptions) []string {
+	args := []string{"install"}
+	if opts.SkipPlugins {
+		args = append(args, "--skip-plugins")
+	}
+	return args
+}
+
 func UpdateChannel() string {
 	if c := strings.TrimSpace(os.Getenv("BLAMELY_CHANNEL")); c != "" {
 		return c
@@ -479,11 +499,7 @@ func Update(ctx context.Context, opts UpdateOptions) (UpdateResult, error) {
 	// Windows this step routinely takes the daemon (and, through the same kill,
 	// itself) down; the keepalive task then revives the daemon from the stable
 	// path, which now holds the new binary.
-	args := []string{"install"}
-	if !opts.WithPlugins {
-		args = append(args, "--skip-plugins")
-	}
-	if err := runInstaller(installedPath, out, args...); err != nil {
+	if err := runInstaller(installedPath, out, postUpdateInstallArgs(opts)...); err != nil {
 		res.Reason = "installed; the post-install step did not finish"
 		fmt.Fprintf(out, "blamely %s is in place, but finishing the install failed: %v\n"+
 			"Hooks keep working through the unchanged path. Run `blamely install` to refresh them.\n",

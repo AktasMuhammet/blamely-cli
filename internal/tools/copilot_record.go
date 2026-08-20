@@ -67,10 +67,22 @@ func RecordCopilotFromStdin(r io.Reader) error {
 				return recordToolDeletionPath(path, p.Cwd, "copilot", gen, p.Model, p.SessionID, p.TranscriptPath, "copilot_delete")
 			}
 		case "run_in_terminal", "Bash", "shell", "Shell":
-			// Resolved explicitly (rather than via recordShellDeletionsFrom) so a
-			// cwd in no repo at all still falls through to the session marker below.
+			// The terminal tool both WRITES and deletes: a script, a heredoc or a
+			// formatter run through it produces no edit range at all, so without the
+			// write half everything Copilot authors through the terminal commits as
+			// Human. recordShellWritesInRoots covers both (deletions first).
+			// Resolved explicitly (rather than via recordShellWrites) so a cwd in no
+			// repo at all still falls through to the session marker below.
 			if roots := gitutil.DiscoverRepos(p.Cwd); len(roots) > 0 {
-				return recordShellDeletionsIn(roots, shellCommandFromInput(p.ToolInput), "copilot", gen, p.Model, p.SessionID, p.TranscriptPath, "copilot_shell_delete")
+				return recordShellWritesInRoots(roots, shellCommandFromInput(p.ToolInput), shellWriteOpts{
+					Tool:           "copilot",
+					GenType:        gen,
+					Model:          p.Model,
+					SessionID:      p.SessionID,
+					TranscriptPath: p.TranscriptPath,
+					WriteSource:    "copilot_shell_fswrite",
+					DeleteSource:   "copilot_shell_delete",
+				})
 			}
 		}
 		// Payload didn't carry a file path: keep the session-marker fallback.

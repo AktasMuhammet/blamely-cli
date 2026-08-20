@@ -306,12 +306,28 @@ func TestUpdate_DownloadsVerifiesAndHandsOff(t *testing.T) {
 	if gotBin != installed {
 		t.Errorf("handed off %q, want the installed binary %q", gotBin, installed)
 	}
-	if strings.Join(gotArgs, " ") != "install --skip-plugins" {
-		t.Errorf("args = %v, want [install --skip-plugins]", gotArgs)
+	// The hand-off installs the IDE plugins too: CLI and plugins release in
+	// lockstep at one version, so an update that moved only the CLI would leave the
+	// editor plugin behind. --skip-plugins is the opt-out (asserted below).
+	if strings.Join(gotArgs, " ") != "install" {
+		t.Errorf("args = %v, want [install]", gotArgs)
 	}
 	// Staging is consumed once the binary is placed.
 	if _, serr := os.Stat(filepath.Join(binDir, updateStagingPrefix+"v1.8.0")); !os.IsNotExist(serr) {
 		t.Errorf("staging dir survived a successful update: %v", serr)
+	}
+}
+
+// The hand-off's argv, asserted directly so it is covered on Windows too — the
+// end-to-end test above is skipped there, and this is the whole of the
+// plugins-follow-the-CLI decision.
+func TestPostUpdateInstallArgs(t *testing.T) {
+	if got := strings.Join(postUpdateInstallArgs(UpdateOptions{}), " "); got != "install" {
+		t.Errorf("default = %q, want %q: an update must bring the IDE plugins along, "+
+			"or the CLI drifts ahead of the editor plugin it releases in lockstep with", got, "install")
+	}
+	if got := strings.Join(postUpdateInstallArgs(UpdateOptions{SkipPlugins: true}), " "); got != "install --skip-plugins" {
+		t.Errorf("SkipPlugins = %q, want %q", got, "install --skip-plugins")
 	}
 }
 

@@ -51,9 +51,8 @@ func InstallCopilotHook(binaryPath string) (added bool, hookPath string, err err
 	before := canonJSON(root)
 
 	hooks := getMap(root, "hooks", true)
-	command := recordHookCommand(binaryPath, "copilot")
-
 	for _, event := range copilotHookEvents {
+		command := recordHookCommandForEvent(binaryPath, "copilot", event)
 		entries := getSlice(hooks, event)
 		// Strip any existing blamely entry (dedupe / drop stale path), then
 		// prepend a single fresh one first — a failing third-party hook ordered
