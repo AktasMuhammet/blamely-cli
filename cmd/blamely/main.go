@@ -344,7 +344,7 @@ func cmdUpdate() *cobra.Command {
 		check       bool
 		force       bool
 		dryRun      bool
-		withPlugins bool
+		skipPlugins bool
 		channel     string
 		from        string
 		sha256Sum   string
@@ -391,7 +391,7 @@ func cmdUpdate() *cobra.Command {
 				Channel:     channel,
 				Force:       force,
 				DryRun:      dryRun,
-				WithPlugins: withPlugins,
+				SkipPlugins: skipPlugins,
 				FromArchive: from,
 				ExpectSHA:   sha256Sum,
 				Out:         out,
@@ -412,8 +412,8 @@ func cmdUpdate() *cobra.Command {
 	c.Flags().BoolVar(&check, "check", false, "only report whether a newer version exists")
 	c.Flags().BoolVar(&force, "force", false, "install even at the same version, and from a non-installed copy")
 	c.Flags().BoolVar(&dryRun, "dry-run", false, "resolve and compare versions, then stop before downloading")
-	c.Flags().BoolVar(&withPlugins, "with-plugins", false,
-		"also reinstall the IDE plugins (off by default so an update never clobbers a sideloaded dev build)")
+	c.Flags().BoolVar(&skipPlugins, "skip-plugins", false,
+		"leave the IDE plugins alone (they are updated with the CLI by default, so all three stay on one version)")
 	c.Flags().StringVar(&channel, "channel", "", "release channel to update from (default: latest)")
 	c.Flags().StringVar(&from, "from", "", "install this local release archive instead of downloading (air-gapped)")
 	c.Flags().StringVar(&sha256Sum, "sha256", "", "expected sha256 of --from's archive (required with --from)")
