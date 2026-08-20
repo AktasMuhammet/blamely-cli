@@ -4,6 +4,7 @@ internal/gitnotes/attribution_merge.go
   s_60f8842c4cb39d::t_a20d389976bb4e 10-11,29
 internal/install/update.go
   s_60f8842c4cb39d::t_a20d389976bb4e 23-24,107,707
+  s_60f8842c4cb39d::t_5284c1296f0ac9 108-114
 internal/install/lockcheck_windows.go
   s_60f8842c4cb39d::t_a20d389976bb4e 13-14,85
 internal/install/detect.go
