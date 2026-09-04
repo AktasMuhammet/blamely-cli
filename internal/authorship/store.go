@@ -401,3 +401,142 @@ func MigrateWorkingLogs(repoRoot, branch, oldBase, newBase string, committed map
 	}
 	return nil
 }
+
+// AdoptWorkingLogsAtBase moves working logs left behind under a DIFFERENT branch
+// name, at the same base commit, into (branch, baseSHA).
+//
+// The working log is keyed by (branch, base_sha), but branching does not touch
+// the working tree:
+//
+//	git checkout -b feature      # HEAD unmoved, uncommitted edits unmoved
+//
+// leaves every log the agents and the editor wrote this session under
+// working_logs/master/<sha>/, while everything from that moment on — including
+// the commit-time flip — looks under working_logs/feature/<sha>/. The flip finds
+// nothing, keeps each file's prior attribution, and the AI work the user just
+// branched off ships in the note as Human. This is the single most common way a
+// developer actually works (build on the default branch, branch when it's time to
+// commit), so it was also the most common way attribution was lost.
+//
+// base_sha is what makes the adoption sound: it names the exact commit the logs
+// were diffed against. A log under another branch at the SAME base describes the
+// same working tree — the one that is about to be committed here. Logs at any
+// other base are left untouched.
+//
+// A file already tracked under (branch, baseSHA) always wins: it was written after
+// the branch switch and is fresher. Everything else — per-file logs, their
+// baselines, and the shared .deletions.jsonl — is moved, not copied, so the next
+// branch switch can't adopt the same records a second time.
+//
+// Best-effort: a file that fails to move is skipped, never fatal. Returns how many
+// files were adopted.
+func AdoptWorkingLogsAtBase(repoRoot, branch, baseSHA string) (adopted int) {
+	if repoRoot == "" || branch == "" || baseSHA == "" {
+		return 0
+	}
+	root := filepath.Join(repoRoot, ".git", "blamely", "working_logs")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return 0
+	}
+	want := sanitizeComponent(branch)
+	for _, e := range entries {
+		if !e.IsDir() || e.Name() == want {
+			continue
+		}
+		donor := filepath.Join(root, e.Name(), sanitizeComponent(baseSHA))
+		if st, serr := os.Stat(donor); serr != nil || !st.IsDir() {
+			continue
+		}
+		adopted += adoptFrom(repoRoot, branch, baseSHA, e.Name())
+	}
+	return adopted
+}
+
+// adoptFrom moves one donor branch dir's logs at baseSHA into (branch, baseSHA).
+func adoptFrom(repoRoot, branch, baseSHA, donorBranch string) (adopted int) {
+	logs, err := ListWorkingLogs(repoRoot, donorBranch, baseSHA)
+	if err != nil {
+		return 0
+	}
+	for _, wl := range logs {
+		rel := wl.File
+		if rel == "" {
+			continue
+		}
+		dstLog := WorkingLogPath(repoRoot, branch, baseSHA, rel)
+		if _, serr := os.Stat(dstLog); serr == nil {
+			// Written after the branch switch — the fresher record wins. Drop the
+			// donor copy so a later adoption doesn't reconsider it.
+			_ = os.Remove(WorkingLogPath(repoRoot, donorBranch, baseSHA, rel))
+			_ = os.Remove(BaselinePath(repoRoot, donorBranch, baseSHA, rel))
+			continue
+		}
+		if !moveFile(WorkingLogPath(repoRoot, donorBranch, baseSHA, rel), dstLog) {
+			continue
+		}
+		// The baseline is the content the log's line numbers describe; a log without
+		// it re-seeds from scratch, so move it too (absence is not fatal).
+		_ = moveFile(BaselinePath(repoRoot, donorBranch, baseSHA, rel),
+			BaselinePath(repoRoot, branch, baseSHA, rel))
+		adopted++
+	}
+	if adopted > 0 {
+		adoptDeletions(repoRoot, branch, baseSHA, donorBranch)
+	}
+	// Leave a donor dir that still holds records (a file we skipped); drop an empty one.
+	if rem, rerr := ListWorkingLogs(repoRoot, donorBranch, baseSHA); rerr == nil && len(rem) == 0 {
+		_ = os.RemoveAll(workingLogDir(repoRoot, donorBranch, baseSHA))
+	}
+	return adopted
+}
+
+// adoptDeletions appends the donor's deletion records to this branch's log. It is a
+// shared append-only JSONL, so it is concatenated rather than renamed — the target
+// may already hold records written since the branch switch.
+func adoptDeletions(repoRoot, branch, baseSHA, donorBranch string) {
+	src := deletionsLogPath(repoRoot, donorBranch, baseSHA)
+	data, err := os.ReadFile(src)
+	if err != nil || len(data) == 0 {
+		return
+	}
+	dst := deletionsLogPath(repoRoot, branch, baseSHA)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return
+	}
+	f, err := os.OpenFile(dst, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	if data[len(data)-1] != '\n' {
+		data = append(data, '\n')
+	}
+	_, werr := f.Write(data)
+	f.Close()
+	if werr == nil {
+		_ = os.Remove(src)
+	}
+}
+
+// moveFile renames src to dst, falling back to copy+remove when the rename crosses
+// a device boundary. Reports whether dst now holds the content.
+func moveFile(src, dst string) bool {
+	if _, err := os.Stat(src); err != nil {
+		return false
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return false
+	}
+	if err := os.Rename(src, dst); err == nil {
+		return true
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return false
+	}
+	if err := atomicWrite(dst, data); err != nil {
+		return false
+	}
+	_ = os.Remove(src)
+	return true
+}

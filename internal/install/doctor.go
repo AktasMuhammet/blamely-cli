@@ -4,12 +4,15 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
 	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/daemon"
+	"github.com/blamely/blamely/internal/procattr"
 	"github.com/blamely/blamely/internal/updatehint"
 )
 
@@ -156,6 +159,67 @@ func (d *doctor) gitHook() {
 	} else {
 		d.ok("post-commit script", hookFile)
 	}
+	d.hooksPathOverride(hooksDir)
+}
+
+// hooksPathOverride reports a repo whose OWN core.hooksPath shadows ours.
+//
+// core.hooksPath is a single value, not a search path, and repo-local config
+// beats global. A repo that sets it — Husky writes core.hooksPath=.husky, and
+// pre-commit/lefthook do the same — silently disables EVERY Blamely hook there:
+// no post-commit means no note is ever written, and no pre-push means no note
+// is ever pushed. Nothing about that is visible, which is exactly why doctor
+// has to say it out loud.
+//
+// Scoped to the current directory's repo: doctor has no repo argument, and the
+// user runs it from the repo they are complaining about.
+func (d *doctor) hooksPathOverride(ourHooksDir string) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return
+	}
+	if _, err := runGit(cwd, "rev-parse", "--is-inside-work-tree"); err != nil {
+		return // not in a repo — nothing repo-specific to check
+	}
+	effective, err := runGit(cwd, "config", "--get", "core.hooksPath")
+	if err != nil || effective == "" {
+		return
+	}
+	if sameHooksDir(effective, ourHooksDir) {
+		return
+	}
+	d.bad("repo core.hooksPath", fmt.Sprintf("%s overrides Blamely's hooks in this repo", effective),
+		fmt.Sprintf("this repo sets its own hooks dir (Husky/lefthook/pre-commit), so Blamely's post-commit and pre-push never run here — "+
+			"copy post-commit, pre-push and post-rewrite from %s into %s, or drop it with `git config --unset core.hooksPath`",
+			ourHooksDir, effective))
+}
+
+// sameHooksDir compares two hooks-dir settings tolerantly: git returns the value
+// verbatim, so it can come back relative, with a trailing separator, or (on
+// Windows) with the other slash and a different case.
+func sameHooksDir(a, b string) bool {
+	norm := func(v string) string {
+		v = strings.TrimRight(filepath.ToSlash(strings.TrimSpace(v)), "/")
+		if abs, err := filepath.Abs(v); err == nil {
+			v = filepath.ToSlash(abs)
+		}
+		if runtime.GOOS == "windows" {
+			v = strings.ToLower(v)
+		}
+		return v
+	}
+	return norm(a) == norm(b)
+}
+
+// runGit runs a git command in dir and returns its trimmed stdout.
+func runGit(dir string, args ...string) (string, error) {
+	cmd := procattr.Hide(exec.Command("git", args...))
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 func (d *doctor) path() {

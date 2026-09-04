@@ -160,11 +160,45 @@ REMOTE="$1"
 # need to pass it along after consuming it ourselves.
 STDIN=$(cat)
 
-# Push attribution notes to the same remote — silently ignore errors (remote
-# may not accept notes refs, or there may be no notes yet).
+# Push attribution notes to the same remote.
+#
 # --no-verify is REQUIRED: core.hooksPath is set globally, so without it this
 # nested push would re-trigger this same pre-push hook, recursing forever.
-git push --no-verify "$REMOTE" refs/notes/blamely 2>/dev/null || true
+#
+# The plain push is NOT enough on its own. refs/notes/blamely is a normal ref, so
+# the moment the remote copy moves ahead of ours — a teammate pushing their own
+# attribution, or our own amend/rebase making post-rewrite rebuild notes — the
+# push is rejected as non-fast-forward. That rejection used to be swallowed by a
+# trailing "|| true", and since nothing ever reconciled the two sides, EVERY later
+# push failed the same way: attribution silently stopped reaching the remote for
+# good, with no error anywhere. So on rejection we fetch the remote notes, merge
+# them, and retry once.
+sync_blamely_notes() {
+    # No notes yet (nothing committed with Blamely installed) — nothing to do.
+    git rev-parse --verify --quiet refs/notes/blamely >/dev/null 2>&1 || return 0
+
+    if git push --no-verify "$REMOTE" refs/notes/blamely >/dev/null 2>&1; then
+        return 0
+    fi
+
+    git fetch --quiet "$REMOTE" "+refs/notes/blamely:refs/notes/blamely-remote" >/dev/null 2>&1 || return 1
+
+    # -s ours resolves the only real conflict — both sides annotating the SAME
+    # commit — in favour of our note. A commit's note is written by whoever
+    # committed it, so an overlap means our own commit was re-attributed locally
+    # (amend/rebase), never a teammate's data being discarded. Notes for commits
+    # only the remote has are taken over untouched.
+    GIT_NOTES_REF=refs/notes/blamely git notes merge -s ours refs/notes/blamely-remote >/dev/null 2>&1
+    git update-ref -d refs/notes/blamely-remote >/dev/null 2>&1
+
+    git push --no-verify "$REMOTE" refs/notes/blamely >/dev/null 2>&1
+}
+
+if ! sync_blamely_notes; then
+    # Visible, but never fatal: the user's own push must still go through. Silence
+    # here is what let the problem live undetected.
+    echo "blamely: could not sync refs/notes/blamely to $REMOTE - attribution stays local (git push $REMOTE refs/notes/blamely to see why)" >&2
+fi
 
 REPO=$(git rev-parse --show-toplevel 2>/dev/null) || { printf '%s\n' "$STDIN"; exit 0; }
 

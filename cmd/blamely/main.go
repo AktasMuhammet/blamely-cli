@@ -708,6 +708,11 @@ func cmdAuthorship() *cobra.Command {
 			// files would restrict to an empty gutter anyway, so they're simply omitted;
 			// the plugin replaces its whole map each refresh, so an omitted file == a
 			// cleared gutter, identical in effect.
+			// Claim any working logs still filed under the branch this work started
+			// on (see authorship.AdoptWorkingLogsAtBase): after `git checkout -b`
+			// the gutter would otherwise read an empty dir and repaint every AI line
+			// as Human, well before the commit ever happens.
+			authorship.AdoptWorkingLogsAtBase(ctx.RepoRoot, ctx.Branch, ctx.BaseSHA)
 			if all {
 				changedByFile := gitnotes.UncommittedAddedLinesAll(ctx.RepoRoot)
 				untracked := gitnotes.UntrackedFiles(ctx.RepoRoot)
