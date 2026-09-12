@@ -27,10 +27,11 @@ const devinGenType = "cli"
 //   - No `cwd`. Every other tool tells us where the agent was working; Devin
 //     does not, so repo resolution falls back to the hook process's own working
 //     directory (Devin spawns the hook inside the project) — see devinCwd.
-//   - No `transcript_path`. There is no session file to read, which means token
-//     usage and model name are simply unavailable for Devin edits. hook_usage.go
-//     has an explicit `devin` case so this does not silently fall through to the
-//     Claude transcript parser.
+//   - No `transcript_path`. Devin does keep a per-session ATIF transcript
+//     (<config dir>/cli/transcripts/<session_id>.json) but never points at it,
+//     so model name and token usage are looked up by `session_id` instead — see
+//     devin_usage.go. hook_usage.go has an explicit `devin` case so this does
+//     not silently fall through to the Claude transcript parser.
 //
 // `prompt_id` is Devin-specific (Claude Code has no such field) and is the
 // signal used to tell a Devin payload apart from a Claude one — see IsDevinHookPayload.
@@ -140,8 +141,9 @@ func postDevinEdit(p devinHookPayload, cwd, filePath string, ranges []LineRange,
 		RawMeta: fmt.Sprintf(`{"session_id":%q,"prompt_id":%q,"tool":%q,"source":"devin_hook"}`,
 			p.SessionID, p.PromptID, p.ToolName),
 	}
-	// No transcript means no usage to apply, but route through the same helper
-	// so a future Devin release that adds transcript_path works for free.
+	// Model + token usage are recovered from Devin's own session transcript,
+	// keyed by session_id (devin_usage.go); transcriptPath is passed along so a
+	// future Devin release that starts sending it can be honoured too.
 	applyHookUsage(&payload, hookUsageOptions{
 		transcriptPath: p.TranscriptPath,
 		sessionID:      p.SessionID,

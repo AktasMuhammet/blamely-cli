@@ -4,6 +4,10 @@ Notable changes to the **Blamely CLI** follow [Keep a Changelog](https://keepach
 
 ## [Unreleased]
 
+### Fixed
+
+- **Devin CLI edits now show which model wrote them, and how many tokens it used.** Devin's hook doesn't say which model is running, so lines it wrote were recorded with no model at all. Blamely now reads the model (for example `swe-2-high`) and per-step token counts from the session transcript Devin keeps on disk, matched by the session id in the hook. Devin's models also get the Devin glyph in the HTML report's leaderboard.
+
 ## [1.6.9] - 2026-07-27
 
 ### Fixed

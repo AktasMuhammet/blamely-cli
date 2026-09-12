@@ -466,6 +466,10 @@ func toolForModel(model string) string {
 	case strings.Contains(m, "gpt"), strings.HasPrefix(m, "o1"),
 		strings.HasPrefix(m, "o3"), strings.HasPrefix(m, "o4"), strings.Contains(m, "codex"):
 		return "codex"
+	case strings.HasPrefix(m, "swe-"), strings.Contains(m, "devin"):
+		// Devin's own models are recorded by resolved uid (swe-2-high) or, before
+		// the first agent step, by display label (SWE-2 High).
+		return "devin"
 	}
 	return ""
 }

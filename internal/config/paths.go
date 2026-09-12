@@ -36,6 +36,8 @@ const (
 	devinDirName        = "devin"
 	devinConfig         = "config.json"
 	devinStateDirName   = ".devin"
+	devinCliSubdir      = "cli"
+	devinTranscripts    = "transcripts"
 )
 
 func Home() (string, error) {
@@ -341,6 +343,18 @@ func DevinConfigDir() (string, error) {
 		return filepath.Join(xdg, devinDirName), nil
 	}
 	return filepath.Join(home, ".config", devinDirName), nil
+}
+
+// DevinTranscriptsDir is <DevinConfigDir>/cli/transcripts, where Devin CLI
+// rewrites one ATIF transcript per session (<session_id>.json) after every
+// agent step. It is the only on-disk source of the model and token usage behind
+// a Devin CLI edit, since the hook payload carries neither.
+func DevinTranscriptsDir() (string, error) {
+	dir, err := DevinConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, devinCliSubdir, devinTranscripts), nil
 }
 
 // DevinStateDir is ~/.devin — the CLI's local state/extension dir. Used for

@@ -51,14 +51,17 @@ func readHookUsage(opt hookUsageOptions) *TranscriptUsage {
 			}
 		}
 	case "devin":
-		// Devin CLI's hook payload carries no transcript_path and it writes no
-		// session transcript we can read, so there is no model or token usage to
-		// recover. This case exists to keep devin OUT of the claude default
-		// below — falling through would parse an unrelated Claude transcript and
-		// attach another session's token counts to a Devin edit.
+		// Devin CLI's hook payload carries no transcript_path, but the CLI keeps
+		// an ATIF transcript per session under <config dir>/cli/transcripts/,
+		// named by the same session_id the hook sends. Model (the resolved model
+		// uid, e.g. swe-2-high) and per-step token counts come from there.
 		//
-		// If a future Devin release starts sending transcript_path, wire the
-		// reader in here rather than removing the case.
+		// The explicit case also keeps devin OUT of the claude default below —
+		// falling through would parse an unrelated Claude transcript and attach
+		// another session's token counts to a Devin edit.
+		if u, _ := ReadDevinTranscriptUsage(opt.sessionID); u != nil {
+			return u
+		}
 		return nil
 	default: // claude
 		if u, _ := ReadTranscriptUsage(opt.transcriptPath); u != nil {

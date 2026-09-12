@@ -172,6 +172,7 @@ func TestToolForModel(t *testing.T) {
 		"claude-opus-4-8": "claude", "claude-sonnet-4-6": "claude",
 		"gemini-3-flash": "gemini", "composer-2.5": "cursor",
 		"gpt-4o": "codex", "o3-mini": "codex", "copilot-gpt-5": "copilot",
+		"swe-2-high": "devin", "SWE-2 High": "devin",
 		"grok-2": "", "llama-3": "", "": "",
 	}
 	for model, want := range cases {
