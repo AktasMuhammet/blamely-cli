@@ -2,6 +2,7 @@ package tools
 
 import (
 	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -35,7 +36,7 @@ const devinCloudEditPayload = `{"kind":"tool_call","content":{
   "status":"completed"}}`
 
 func TestParseDevinACPEdit_LocalWrite(t *testing.T) {
-	payload := replaceAll(devinLocalWritePayload, "%PATH%", "/tmp/demo.html")
+	payload := replaceAll(devinLocalWritePayload, "%PATH%", jsonStringValue("/tmp/demo.html"))
 	e, ok := parseDevinACPEdit(payload)
 	if !ok {
 		t.Fatal("expected a local write to parse as an edit")
@@ -110,7 +111,7 @@ func TestReadDevinACPRows_ReadsEditsAndAdvancesCursor(t *testing.T) {
 	}
 	path := newDevinSessionDB(t, dir, []struct{ Kind, Payload string }{
 		{"user_message", `{"kind":"user_message"}`},
-		{"tool_call", replaceAll(devinLocalWritePayload, "%PATH%", target)},
+		{"tool_call", replaceAll(devinLocalWritePayload, "%PATH%", jsonStringValue(target))},
 		{"agent_thought", `{"kind":"agent_thought"}`},
 		{"tool_call", devinCloudEditPayload},
 	})
@@ -139,7 +140,7 @@ func TestReadDevinACPRows_ResumesFromCursor(t *testing.T) {
 	if err := os.WriteFile(target, []byte("x\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	payload := replaceAll(devinLocalWritePayload, "%PATH%", target)
+	payload := replaceAll(devinLocalWritePayload, "%PATH%", jsonStringValue(target))
 	path := newDevinSessionDB(t, dir, []struct{ Kind, Payload string }{
 		{"tool_call", payload},
 		{"tool_call", payload},
@@ -164,7 +165,7 @@ func TestReadDevinACPRows_RespectsLimit(t *testing.T) {
 	if err := os.WriteFile(target, []byte("x\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	payload := replaceAll(devinLocalWritePayload, "%PATH%", target)
+	payload := replaceAll(devinLocalWritePayload, "%PATH%", jsonStringValue(target))
 	var rows []struct{ Kind, Payload string }
 	for i := 0; i < 10; i++ {
 		rows = append(rows, struct{ Kind, Payload string }{"tool_call", payload})
@@ -212,4 +213,12 @@ func indexOf(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+func jsonStringValue(s string) string {
+	b, _ := json.Marshal(s)
+	if len(b) < 2 {
+		return s
+	}
+	return string(b[1 : len(b)-1])
 }

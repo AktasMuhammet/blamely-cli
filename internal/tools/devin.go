@@ -286,6 +286,11 @@ func devinAbsPath(path, cwd string) string {
 	if path == "" || filepath.IsAbs(path) || cwd == "" {
 		return path
 	}
+	// On Windows, a path that starts with '\' is rooted on the current volume.
+	// It is not "relative to cwd", so keep it as-is.
+	if filepath.Separator == '\\' && strings.HasPrefix(path, `\`) {
+		return path
+	}
 	return filepath.Join(cwd, path)
 }
 
