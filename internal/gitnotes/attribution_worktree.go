@@ -9,13 +9,15 @@ import (
 	"github.com/blamely/blamely/internal/config"
 	"github.com/blamely/blamely/internal/gitutil"
 	"github.com/blamely/blamely/internal/store"
+
+	"github.com/blamely/blamely/internal/procattr"
 )
 
 // DiffWorkingTree diffs the working tree against HEAD (tracked changes, staged +
 // unstaged) and parses it like DiffCommit, so the CURRENT uncommitted change can be
 // attributed and shown by `blamely stats` before a commit exists.
 func DiffWorkingTree(repoPath string) (*CommitChange, error) {
-	cmd := exec.Command("git", "-C", repoPath, "diff", "--unified=0", "--no-color", "-M", "HEAD")
+	cmd := procattr.Hide(exec.Command("git", "-C", repoPath, "diff", "--unified=0", "--no-color", "-M", "HEAD"))
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err

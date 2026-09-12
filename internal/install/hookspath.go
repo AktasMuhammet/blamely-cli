@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	"github.com/blamely/blamely/internal/config"
+
+	"github.com/blamely/blamely/internal/procattr"
 )
 
 // InstallGitHook sets core.hooksPath to ~/.blamely/git-hooks (globally) and
@@ -81,8 +83,8 @@ func postCommitName() string {
 }
 
 // writePostCommitScript renders a small shell script that:
-//   1. Calls `blamely attribute <repo> <sha>` (best-effort, never blocks the commit).
-//   2. Chains to a repo-local .git/hooks/post-commit if one exists.
+//  1. Calls `blamely attribute <repo> <sha>` (best-effort, never blocks the commit).
+//  2. Chains to a repo-local .git/hooks/post-commit if one exists.
 func writePostCommitScript(path, binaryPath string) error {
 	// We resolve the repo via `git rev-parse --show-toplevel` inside the script
 	// so the same hook works for every repo on this machine.
@@ -215,11 +217,45 @@ REMOTE="$1"
 # need to pass it along after consuming it ourselves.
 STDIN=$(cat)
 
-# Push attribution notes to the same remote — silently ignore errors (remote
-# may not accept notes refs, or there may be no notes yet).
+# Push attribution notes to the same remote.
+#
 # --no-verify is REQUIRED: core.hooksPath is set globally, so without it this
 # nested push would re-trigger this same pre-push hook, recursing forever.
-git push --no-verify "$REMOTE" refs/notes/blamely 2>/dev/null || true
+#
+# The plain push is NOT enough on its own. refs/notes/blamely is a normal ref, so
+# the moment the remote copy moves ahead of ours — a teammate pushing their own
+# attribution, or our own amend/rebase making post-rewrite rebuild notes — the
+# push is rejected as non-fast-forward. That rejection used to be swallowed by a
+# trailing "|| true", and since nothing ever reconciled the two sides, EVERY later
+# push failed the same way: attribution silently stopped reaching the remote for
+# good, with no error anywhere. So on rejection we fetch the remote notes, merge
+# them, and retry once.
+sync_blamely_notes() {
+    # No notes yet (nothing committed with Blamely installed) — nothing to do.
+    git rev-parse --verify --quiet refs/notes/blamely >/dev/null 2>&1 || return 0
+
+    if git push --no-verify "$REMOTE" refs/notes/blamely >/dev/null 2>&1; then
+        return 0
+    fi
+
+    git fetch --quiet "$REMOTE" "+refs/notes/blamely:refs/notes/blamely-remote" >/dev/null 2>&1 || return 1
+
+    # -s ours resolves the only real conflict — both sides annotating the SAME
+    # commit — in favour of our note. A commit's note is written by whoever
+    # committed it, so an overlap means our own commit was re-attributed locally
+    # (amend/rebase), never a teammate's data being discarded. Notes for commits
+    # only the remote has are taken over untouched.
+    GIT_NOTES_REF=refs/notes/blamely git notes merge -s ours refs/notes/blamely-remote >/dev/null 2>&1
+    git update-ref -d refs/notes/blamely-remote >/dev/null 2>&1
+
+    git push --no-verify "$REMOTE" refs/notes/blamely >/dev/null 2>&1
+}
+
+if ! sync_blamely_notes; then
+    # Visible, but never fatal: the user's own push must still go through. Silence
+    # here is what let the problem live undetected.
+    echo "blamely: could not sync refs/notes/blamely to $REMOTE - attribution stays local (git push $REMOTE refs/notes/blamely to see why)" >&2
+fi
 
 REPO=$(git rev-parse --show-toplevel 2>/dev/null) || { printf '%s\n' "$STDIN"; exit 0; }
 
@@ -339,7 +375,7 @@ func RemoveLegacyRepoHooks(repoRoot string) {
 // gitDirFor resolves the .git directory for repoRoot, handling worktrees and
 // submodules where .git is a file pointing elsewhere.
 func gitDirFor(repoRoot string) (string, error) {
-	out, err := exec.Command("git", "-C", repoRoot, "rev-parse", "--git-dir").Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", repoRoot, "rev-parse", "--git-dir")).Output()
 	if err != nil {
 		return "", err
 	}
@@ -371,7 +407,7 @@ func isBlamelyManagedHook(path string) bool {
 }
 
 func readGlobalConfig(key string) (value string, present bool) {
-	out, err := exec.Command("git", "config", "--global", "--get", key).Output()
+	out, err := procattr.Hide(exec.Command("git", "config", "--global", "--get", key)).Output()
 	if err != nil {
 		// `git config --get` exits 1 when the key isn't set.
 		var ee *exec.ExitError
@@ -384,7 +420,7 @@ func readGlobalConfig(key string) (value string, present bool) {
 }
 
 func setGlobalConfig(key, value string) error {
-	cmd := exec.Command("git", "config", "--global", key, value)
+	cmd := procattr.Hide(exec.Command("git", "config", "--global", key, value))
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -394,7 +430,7 @@ func setGlobalConfig(key, value string) error {
 }
 
 func unsetGlobalConfig(key string) error {
-	cmd := exec.Command("git", "config", "--global", "--unset", key)
+	cmd := procattr.Hide(exec.Command("git", "config", "--global", "--unset", key))
 	// Exit code 5 = "no such variable" — fine.
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError

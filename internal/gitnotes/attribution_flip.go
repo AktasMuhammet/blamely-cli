@@ -53,6 +53,13 @@ func flipNoteToWorkingLog(repoPath string, note *Note) {
 	if parent == "" {
 		return
 	}
+	// Branching does not move HEAD, so `git checkout -b feature` leaves this
+	// commit's working logs filed under the branch the work was DONE on while the
+	// flip looks under the branch it is being COMMITTED on. Same base commit, same
+	// working tree, different key — and the flip silently found nothing, shipping
+	// the session's AI work as Human. Claim those logs before reading. No-op in the
+	// normal case where the branch never changed.
+	authorship.AdoptWorkingLogsAtBase(repoPath, note.Branch, parent)
 	flipAddsAtBase(repoPath, note.Branch, parent, note)
 }
 

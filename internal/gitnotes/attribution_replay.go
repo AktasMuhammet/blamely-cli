@@ -20,6 +20,8 @@ import (
 	"strings"
 
 	"github.com/blamely/blamely/internal/gitutil"
+
+	"github.com/blamely/blamely/internal/procattr"
 )
 
 type replayKind int
@@ -93,7 +95,7 @@ func replayFromMessage(msg string) replayCtx {
 }
 
 func commitMessage(repoPath, sha string) string {
-	out, err := exec.Command("git", "-C", repoPath, "log", "-1", "--format=%B", sha).Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", repoPath, "log", "-1", "--format=%B", sha)).Output()
 	if err != nil {
 		return ""
 	}

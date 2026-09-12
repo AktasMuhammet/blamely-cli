@@ -86,6 +86,47 @@ func RecordEdit(absPath string, author Author) (*WorkingLog, error) {
 	return Update(ctx.RepoRoot, ctx.Branch, ctx.BaseSHA, ctx.RelPath, string(data), fallback, author, 0)
 }
 
+// PutBaselinesIfUntracked snapshots the current content of each repo-relative path
+// under repoRoot as its pre-edit baseline, skipping any file Attribution already
+// tracks (whose stored baseline is what its line attributions describe).
+//
+// The working-log key (branch + base SHA) is resolved ONCE for the whole batch
+// rather than per file. That matters because the caller is a tool hook that runs
+// on every single tool call: ResolveContext costs three git invocations, so a
+// per-file resolve would spawn dozens of processes per call — worse than the extra
+// hook process this whole path exists to avoid.
+//
+// Best-effort and silent: a baseline we fail to write only costs precision on the
+// next edit, and this runs inside a hook that must never fail the host tool.
+func PutBaselinesIfUntracked(repoRoot string, relPaths []string) {
+	if !Enabled() || repoRoot == "" || len(relPaths) == 0 {
+		return
+	}
+	top := repoRoot
+	if resolved, err := filepath.EvalSymlinks(top); err == nil {
+		top = resolved
+	}
+	branch := gitutil.BranchName(top)
+	if branch == "" {
+		branch = "DETACHED"
+	}
+	base := gitutil.HeadSHA(top)
+	if base == "" {
+		base = "INITIAL"
+	}
+	for _, rel := range relPaths {
+		rel = filepath.ToSlash(rel)
+		if wl, err := loadWorkingLogFile(WorkingLogPath(top, branch, base, rel)); err == nil && wl != nil {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(top, filepath.FromSlash(rel)))
+		if err != nil {
+			continue
+		}
+		_ = PutBaseline(top, branch, base, rel, string(data))
+	}
+}
+
 // CaptureBaseline records the file's CURRENT content as the pre-edit baseline —
 // the `record --pre` fallback (Decision B). Call it before a terminal agent writes
 // a file the editor isn't tracking live; the next RecordEdit diffs against it.

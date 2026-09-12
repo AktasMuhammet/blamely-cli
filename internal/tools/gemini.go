@@ -49,7 +49,18 @@ func RecordGeminiFromStdin(r io.Reader) error {
 		}
 		switch p.ToolName {
 		case "run_shell_command", "shell", "Shell":
-			return recordShellDeletionsFrom(p.Cwd, shellCommandFromInput(p.ToolInput), "gemini", gt, "", p.SessionID, p.TranscriptPath, "gemini_shell_delete")
+			// run_shell_command both WRITES and deletes: a script, a heredoc or a
+			// formatter run through it produces no edit range at all, so without the
+			// write half everything Gemini authors through the shell commits as
+			// Human. recordShellWrites covers both (deletions first).
+			return recordShellWrites(p.Cwd, shellCommandFromInput(p.ToolInput), shellWriteOpts{
+				Tool:           "gemini",
+				GenType:        gt,
+				SessionID:      p.SessionID,
+				TranscriptPath: p.TranscriptPath,
+				WriteSource:    "gemini_shell_fswrite",
+				DeleteSource:   "gemini_shell_delete",
+			})
 		case "delete_file", "delete", "Delete", "remove_file":
 			if path := deletePathFromInput(p.ToolInput); path != "" {
 				return recordToolDeletionPath(path, p.Cwd, "gemini", gt, "", p.SessionID, p.TranscriptPath, "gemini_delete")

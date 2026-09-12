@@ -88,9 +88,9 @@ func installCodexHookAt(configPath, binaryPath string) (added bool, err error) {
 	root["features"] = features
 
 	hooks := getMap(root, "hooks", true)
-	command := recordHookCommand(binaryPath, "codex")
 
 	for _, event := range codexHookEvents {
+		command := recordHookCommandForEvent(binaryPath, "codex", event)
 		groups := getSlice(hooks, event)
 		// Strip any existing blamely group first (dedupe repeats / drop a stale
 		// binary path), then prepend a single fresh one so blamely runs first —

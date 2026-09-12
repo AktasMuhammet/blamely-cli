@@ -12,14 +12,29 @@
 .PARAMETER Action
     install (default) | rebuild | uninstall | repair | doctor
 
+.PARAMETER WithPlugins
+    Also install the VS Code-family and JetBrains IDE plugins from the
+    marketplace. Off by default for local dev installs (same default as
+    scripts/install.sh): the download is slow and, more importantly, it
+    overwrites a sideloaded dev build of the plugin under test.
+
 .EXAMPLE
     pwsh -File scripts\install.ps1
+    pwsh -File scripts\install.ps1 -WithPlugins
     pwsh -File scripts\install.ps1 uninstall
+
+.NOTES
+    Keep this file pure ASCII. Windows PowerShell 5.1 decodes a BOM-less
+    script with the system ANSI codepage, so a UTF-8 em dash lands as a
+    curly quote - which PowerShell accepts as a string delimiter - and the
+    whole file fails to parse. Use plain hyphens, not typographic dashes.
 #>
 
 param(
     [ValidateSet('install', 'rebuild', 'uninstall', 'repair', 'doctor')]
-    [string]$Action = 'install'
+    [string]$Action = 'install',
+
+    [switch]$WithPlugins
 )
 
 $ErrorActionPreference = 'Stop'
@@ -58,7 +73,7 @@ function Build-Binary {
 
 function Add-ToUserPath {
     # Append %USERPROFILE%\.blamely\bin to the per-user PATH (persistent).
-    # No-op if already present. Doesn't affect the current session — caller
+    # No-op if already present. Doesn't affect the current session - caller
     # must open a new shell.
     $entry = $StableDir
     $current = [Environment]::GetEnvironmentVariable('PATH', 'User')
@@ -87,11 +102,19 @@ function Do-Install {
     Build-Binary
 
     Info "Running blamely install..."
-    & $StableBin install
+    if ($WithPlugins) {
+        & $StableBin install
+    } else {
+        & $StableBin install --skip-plugins
+    }
     if ($LASTEXITCODE -ne 0) { Die "blamely install failed (exit $LASTEXITCODE)" }
+    if (-not $WithPlugins) {
+        Info "Skipped IDE/editor plugin install (local dev default) - pass -WithPlugins to include it."
+    }
     Ok "Blamely installed."
 
-    # The Go installer's path.go skips Windows; do it here via the registry.
+    # Belt and braces: `blamely install` already writes the HKCU Environment
+    # Path entry (install.InstallPathEntry), so this is normally a no-op.
     Add-ToUserPath
 
     # Best-effort cleanup of legacy hooks (no-op if there are none).
@@ -101,7 +124,7 @@ function Do-Install {
     Write-Host "  Run " -NoNewline; Write-Host "blamely status" -ForegroundColor Cyan -NoNewline
     Write-Host " to verify the daemon is running."
     Write-Host "  Run " -NoNewline; Write-Host "git commit" -ForegroundColor Cyan -NoNewline
-    Write-Host " in any repo — you should see the AI/Human bar."
+    Write-Host " in any repo - you should see the AI/Human bar."
     Write-Host "  Open a NEW PowerShell so the PATH update takes effect."
 }
 
@@ -109,7 +132,7 @@ function Do-Rebuild {
     Require-Go
     Build-Binary
     Write-Host ""
-    Write-Host "  Rebuilt only — install state was not touched."
+    Write-Host "  Rebuilt only - install state was not touched."
 }
 
 function Do-Uninstall {
@@ -122,7 +145,7 @@ function Do-Uninstall {
         & blamely uninstall
         Ok "Blamely configuration removed."
     } else {
-        Write-Host "  blamely binary not found — skipping uninstall step."
+        Write-Host "  blamely binary not found - skipping uninstall step."
         Write-Host "  Manually remove $env:USERPROFILE\.blamely and run:"
         Write-Host "    git config --global --unset core.hooksPath"
     }

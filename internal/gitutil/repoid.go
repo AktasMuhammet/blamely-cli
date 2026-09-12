@@ -4,6 +4,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/blamely/blamely/internal/procattr"
 )
 
 // RepoID returns the canonical repository identifier for the file/dir at `p`.
@@ -32,7 +34,7 @@ func RepoID(p string) (string, bool) {
 		// AI edit is silently dropped → it falls to Human at commit.
 		dir = filepath.Dir(p)
 	}
-	out, err := exec.Command("git", "-C", dir, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", dir, "rev-parse", "--path-format=absolute", "--git-common-dir")).Output()
 	if err != nil {
 		return "", false
 	}
@@ -65,7 +67,7 @@ func Toplevel(p string) (string, bool) {
 		// absolute one (which wouldn't match `git diff` at commit → Human).
 		dir = filepath.Dir(p)
 	}
-	out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel")).Output()
 	if err != nil {
 		return "", false
 	}

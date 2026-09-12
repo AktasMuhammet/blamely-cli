@@ -7,6 +7,8 @@ import (
 
 	"github.com/blamely/blamely/internal/authorship"
 	"github.com/blamely/blamely/internal/config"
+
+	"github.com/blamely/blamely/internal/procattr"
 )
 
 // restrictMergeToResolution narrows a MERGE commit's added lines to the conflict
@@ -24,7 +26,7 @@ func restrictMergeToResolution(repoPath, sha string, change *CommitChange) {
 	if change == nil || !authorship.Enabled() {
 		return
 	}
-	out, err := exec.Command("git", "-C", repoPath, "rev-parse", "-q", "--verify", sha+"^2").Output()
+	out, err := procattr.Hide(exec.Command("git", "-C", repoPath, "rev-parse", "-q", "--verify", sha+"^2")).Output()
 	if err != nil {
 		return // not a merge (no second parent)
 	}

@@ -62,7 +62,27 @@ func RecordCodexFromStdin(r io.Reader) error {
 		// same removal twice).
 		name := strings.ToLower(p.ToolName)
 		if len(deletedViaPatch) == 0 && (looksLikePatch(name) || codexShellNames[name]) {
-			return recordShellDeletionsFrom(p.Cwd, shellCommandFromInput(p.ToolInput), "codex", gt, p.Model, p.SessionID, p.TranscriptPath, "codex_shell_delete")
+			cmd := shellCommandFromInput(p.ToolInput)
+			if codexShellNames[name] {
+				// A real shell command also WRITES: a script, a heredoc or a formatter
+				// run through it produces no edit range at all, so without the write
+				// half everything Codex authors through the shell commits as Human.
+				// recordShellWrites covers both (deletions first).
+				return recordShellWrites(p.Cwd, cmd, shellWriteOpts{
+					Tool:           "codex",
+					GenType:        gt,
+					Model:          p.Model,
+					SessionID:      p.SessionID,
+					TranscriptPath: p.TranscriptPath,
+					WriteSource:    "codex_shell_fswrite",
+					DeleteSource:   "codex_shell_delete",
+				})
+			}
+			// apply_patch whose primary path we couldn't extract: the written paths
+			// live in the patch BODY, not in tool_input, and the patch is not a shell
+			// command — so only its deletions are recoverable here. Attributing every
+			// changed file to a patch would over-claim; documented gap.
+			return recordShellDeletionsFrom(p.Cwd, cmd, "codex", gt, p.Model, p.SessionID, p.TranscriptPath, "codex_shell_delete")
 		}
 		return nil
 	}

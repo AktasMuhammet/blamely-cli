@@ -10,6 +10,8 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+
+	"github.com/blamely/blamely/internal/procattr"
 )
 
 // editorImages are the Windows process images that keep Blamely's editor plugin
@@ -80,7 +82,7 @@ func runningBlockers() []blocker {
 // pidsByImage returns the PIDs of every running process with the given image
 // name, parsed from `tasklist` CSV output (no header row).
 func pidsByImage(image string) []int {
-	out, err := exec.Command("tasklist", "/FI", "IMAGENAME eq "+image, "/FO", "CSV", "/NH").Output()
+	out, err := procattr.Hide(exec.Command("tasklist", "/FI", "IMAGENAME eq "+image, "/FO", "CSV", "/NH")).Output()
 	if err != nil {
 		return nil
 	}

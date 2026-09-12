@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -42,7 +43,7 @@ func init() {
 // JetBrains plugins. The release workflow can still override it at link time via
 // `-ldflags "-X main.version=<tag>"`; otherwise this hardcoded value is what
 // `blamely --version` reports.
-var version = "1.8.1"
+var version = "1.8.2"
 
 // maxMergedAttributeScan caps how many incoming commits the post-merge hook
 // will look at. A pull after a long absence — or a first fetch of a big repo —
@@ -145,6 +146,34 @@ func main() {
 	}
 }
 
+// logWriter forwards a child process's output into the standard logger, one
+// log line per output line, so the daemon's auto-update leaves the installer's
+// own messages in daemon.log instead of dropping them.
+//
+// Child output arrives in arbitrary chunks, not whole lines, so Write buffers
+// until a newline and logs complete lines only; CR is stripped so CRLF output
+// from a Windows installer doesn't leave a trailing \r in daemon.log. A final
+// unterminated line stays buffered — installer output ends with a newline, and
+// a truncated last line is not worth a Flush hook on an io.Writer.
+type logWriter struct {
+	buf []byte
+}
+
+func (w *logWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	for {
+		i := bytes.IndexByte(w.buf, '\n')
+		if i < 0 {
+			return len(p), nil
+		}
+		line := strings.TrimRight(string(w.buf[:i]), "\r")
+		w.buf = w.buf[i+1:]
+		if strings.TrimSpace(line) != "" {
+			log.Printf("update: %s", line)
+		}
+	}
+}
+
 func cmdDaemon() *cobra.Command {
 	var background bool
 	c := &cobra.Command{
@@ -214,6 +243,7 @@ func cmdDaemon() *cobra.Command {
 			// Hand the daemon its update check/apply as closures: internal/daemon
 			// cannot import internal/install (install imports daemon), so this is
 			// the same indirection the watcher lists above use.
+			daemon.CurrentVersion = install.Version
 			daemon.CheckUpdate = func(ctx context.Context) (updatehint.Hint, bool, error) {
 				rel, newer, err := install.CheckForUpdate(ctx, install.Version)
 				if err != nil {
@@ -223,7 +253,11 @@ func cmdDaemon() *cobra.Command {
 				return updatehint.Hint{Version: rel.Version, Tag: rel.Tag, URL: url}, newer, nil
 			}
 			daemon.ApplyUpdate = func(ctx context.Context) error {
-				_, err := install.Update(ctx, install.UpdateOptions{Current: install.Version, Out: io.Discard})
+				// Route the updater's own output — including the staged
+				// installer's stderr — into daemon.log. It used to be discarded,
+				// which left a failed auto-update reported as an exit status with
+				// no diagnosis anywhere on the machine.
+				_, err := install.Update(ctx, install.UpdateOptions{Current: install.Version, Out: &logWriter{}})
 				return err
 			}
 			return daemon.Run(cmd.Context())
@@ -354,7 +388,7 @@ func cmdUpdate() *cobra.Command {
 		check       bool
 		force       bool
 		dryRun      bool
-		withPlugins bool
+		skipPlugins bool
 		channel     string
 		from        string
 		sha256Sum   string
@@ -401,7 +435,7 @@ func cmdUpdate() *cobra.Command {
 				Channel:     channel,
 				Force:       force,
 				DryRun:      dryRun,
-				WithPlugins: withPlugins,
+				SkipPlugins: skipPlugins,
 				FromArchive: from,
 				ExpectSHA:   sha256Sum,
 				Out:         out,
@@ -422,8 +456,8 @@ func cmdUpdate() *cobra.Command {
 	c.Flags().BoolVar(&check, "check", false, "only report whether a newer version exists")
 	c.Flags().BoolVar(&force, "force", false, "install even at the same version, and from a non-installed copy")
 	c.Flags().BoolVar(&dryRun, "dry-run", false, "resolve and compare versions, then stop before downloading")
-	c.Flags().BoolVar(&withPlugins, "with-plugins", false,
-		"also reinstall the IDE plugins (off by default so an update never clobbers a sideloaded dev build)")
+	c.Flags().BoolVar(&skipPlugins, "skip-plugins", false,
+		"leave the IDE plugins alone (they are updated with the CLI by default, so all three stay on one version)")
 	c.Flags().StringVar(&channel, "channel", "", "release channel to update from (default: latest)")
 	c.Flags().StringVar(&from, "from", "", "install this local release archive instead of downloading (air-gapped)")
 	c.Flags().StringVar(&sha256Sum, "sha256", "", "expected sha256 of --from's archive (required with --from)")
@@ -686,6 +720,11 @@ func cmdAuthorship() *cobra.Command {
 			// files would restrict to an empty gutter anyway, so they're simply omitted;
 			// the plugin replaces its whole map each refresh, so an omitted file == a
 			// cleared gutter, identical in effect.
+			// Claim any working logs still filed under the branch this work started
+			// on (see authorship.AdoptWorkingLogsAtBase): after `git checkout -b`
+			// the gutter would otherwise read an empty dir and repaint every AI line
+			// as Human, well before the commit ever happens.
+			authorship.AdoptWorkingLogsAtBase(ctx.RepoRoot, ctx.Branch, ctx.BaseSHA)
 			if all {
 				changedByFile := gitnotes.UncommittedAddedLinesAll(ctx.RepoRoot)
 				untracked := gitnotes.UntrackedFiles(ctx.RepoRoot)

@@ -42,6 +42,41 @@ func recordHookCommand(binaryPath, tool string) string {
 	return p + " record " + tool
 }
 
+// recordHookCommandForEvent is recordHookCommand plus the flag the event needs.
+//
+// A PreToolUse hook MUST pass --pre. Without it the pre-hook runs the full
+// recording path against the file's PRE-edit content, so the AI is credited with
+// the lines that were there BEFORE it wrote anything — the user's own work
+// included. --pre instead snapshots that content as the diff baseline, which is
+// the whole point of hooking the event: the matching PostToolUse record then
+// attributes only what the agent actually changed.
+//
+// The " record <tool>" marker survives the suffix, so uninstall and the
+// dedupe-on-reinstall scan (which match on that substring) keep working.
+func recordHookCommandForEvent(binaryPath, tool, event string) string {
+	cmd := recordHookCommand(binaryPath, tool)
+	if isPreEditHookEvent(event) {
+		return cmd + " --pre"
+	}
+	return cmd
+}
+
+// preEditHookEvents are the BEFORE-the-tool-runs event names, across every agent's
+// own spelling: Claude/Copilot "PreToolUse", Codex "pre_tool_use", Gemini
+// "BeforeTool". Compared case-insensitively.
+var preEditHookEvents = []string{"pretooluse", "pre_tool_use", "beforetool"}
+
+// isPreEditHookEvent reports whether event fires BEFORE the tool writes.
+func isPreEditHookEvent(event string) bool {
+	e := strings.ToLower(strings.TrimSpace(event))
+	for _, p := range preEditHookEvents {
+		if e == p {
+			return true
+		}
+	}
+	return false
+}
+
 // InstalledBinaryPath returns the path where `blamely install` keeps a stable
 // copy of the binary, so the post-commit hook and the daemon agent keep
 // working even if the user moves or deletes the dev binary.
