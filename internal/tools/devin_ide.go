@@ -198,9 +198,14 @@ func (w *DevinIDEWatcher) handleSessionDB(path string, state map[string]*devinID
 	}
 
 	if emit {
+		nextPos := from
 		for _, r := range rows {
-			w.recordDevinIDEEdit(path, r, sink)
+			if !w.recordDevinIDEEdit(path, r, sink) {
+				break
+			}
+			nextPos = r.Position
 		}
+		maxPos = nextPos
 	}
 
 	mu.Lock()
@@ -345,24 +350,24 @@ func parseDevinACPEdit(payload string) (devinACPEdit, bool) {
 }
 
 // recordDevinIDEEdit turns one recovered edit into a daemon Event.
-func (w *DevinIDEWatcher) recordDevinIDEEdit(dbPath string, e devinACPEdit, sink daemon.Sink) {
+func (w *DevinIDEWatcher) recordDevinIDEEdit(dbPath string, e devinACPEdit, sink daemon.Sink) bool {
 	// A cloud session's container path (/home/ubuntu/repos/...) will not exist
 	// here, which is exactly how those rows get filtered out. A local path that
 	// has since been deleted is skipped too — without the file there is no way
 	// to place the lines.
 	abs := e.Path
 	if !filepath.IsAbs(abs) {
-		return
+		return true
 	}
 	if _, err := os.Stat(abs); err != nil {
-		return
+		return true
 	}
 	if r, err := filepath.EvalSymlinks(abs); err == nil {
 		abs = r
 	}
 	repo, _ := gitutil.RepoID(abs)
 	if repo == "" {
-		return
+		return true
 	}
 	wt, _ := gitutil.Toplevel(abs)
 	rel := abs
@@ -377,7 +382,7 @@ func (w *DevinIDEWatcher) recordDevinIDEEdit(dbPath string, e devinACPEdit, sink
 	// lines are theirs, not the agent's.
 	ranges := perLineShaRangesFromContent(e.NewText)
 	if len(ranges) == 0 {
-		return
+		return true
 	}
 	removed := RemovedLineHashes(e.OldText, e.NewText)
 
@@ -396,9 +401,10 @@ func (w *DevinIDEWatcher) recordDevinIDEEdit(dbPath string, e devinACPEdit, sink
 	}
 	if err := sink.Record(ev); err != nil {
 		log.Printf("devin-ide sink: %v", err)
-		return
+		return false
 	}
 	log.Printf("devin-ide: edit %s lines=%d", rel, len(ranges))
+	return true
 }
 
 func devinIDEEvictStale(state map[string]*devinIDESessionState, mu *sync.Mutex) {
