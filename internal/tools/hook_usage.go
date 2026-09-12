@@ -5,7 +5,7 @@ import "github.com/blamely/blamely/internal/daemon"
 type hookUsageOptions struct {
 	transcriptPath string
 	sessionID      string
-	tool           string // claude | cursor | copilot | codex | gemini
+	tool           string // claude | cursor | copilot | codex | gemini | devin
 }
 
 // applyHookUsage enriches a record-hook payload with model + token counts from
@@ -50,6 +50,19 @@ func readHookUsage(opt hookUsageOptions) *TranscriptUsage {
 				return u
 			}
 		}
+	case "devin":
+		// Devin CLI's hook payload carries no transcript_path, but the CLI keeps
+		// an ATIF transcript per session under <config dir>/cli/transcripts/,
+		// named by the same session_id the hook sends. Model (the resolved model
+		// uid, e.g. swe-2-high) and per-step token counts come from there.
+		//
+		// The explicit case also keeps devin OUT of the claude default below —
+		// falling through would parse an unrelated Claude transcript and attach
+		// another session's token counts to a Devin edit.
+		if u, _ := ReadDevinTranscriptUsage(opt.sessionID); u != nil {
+			return u
+		}
+		return nil
 	default: // claude
 		if u, _ := ReadTranscriptUsage(opt.transcriptPath); u != nil {
 			return u
