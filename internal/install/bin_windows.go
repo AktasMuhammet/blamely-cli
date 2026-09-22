@@ -13,27 +13,44 @@ import (
 	"github.com/blamely/blamely/internal/procattr"
 )
 
-// killProcess terminates a specific PID (and its child tree) on Windows by PID
-// alone — no IMAGENAME filter. Targeting the exact PID is both reliable (taskkill
-// filter wildcards are finicky and an exact image name misses a renamed/dev
-// daemon) and safe to call from the uninstaller: it's the daemon's PID, read
-// from the daemon's own PID file, never our own (killRunningDaemon guards
-// against pid == os.Getpid()). /T also reaps the daemon's child processes.
+// killProcess terminates a specific PID on Windows by PID alone — no IMAGENAME
+// filter. Targeting the exact PID is both reliable (taskkill filter wildcards are
+// finicky and an exact image name misses a renamed/dev daemon) and safe to call
+// from the uninstaller: it's the daemon's PID, read from the daemon's own PID
+// file, never our own (killRunningDaemon guards against pid == os.Getpid()).
+//
+// NO /T (kill the child tree), deliberately. During an auto-update the daemon is
+// the process that spawned `blamely install`, so /T here killed the installer
+// itself — the daemon's own child — right at this line: the autostart entry was
+// never re-registered and, worse, nothing ever started the new daemon, leaving
+// the machine with no daemon (and silently dropping every AI edit) until the
+// 15-minute keepalive happened to fire. Killing the one PID leaves our caller's
+// other descendants — us included — alone. The daemon's own children are
+// short-lived `git` invocations that exit on their own, and uninstall's detached
+// cleanup script still does a `taskkill /f /t` sweep once we're all gone.
 func killProcess(pid int) error {
-	return procattr.Hide(exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid))).Run()
+	return procattr.Hide(exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid))).Run()
 }
 
 // killOtherDaemonProcesses synchronously kills every blamely.exe EXCEPT this
 // uninstaller. `/FI "PID ne <self>"` is what makes `/IM blamely.exe` safe to call
 // from a process that is itself blamely.exe — it spares us while reaping the
 // daemon (and any leftover daemons from earlier upgrades), by the real, exact
-// image name, with no PID-file or filter-wildcard dependency. /T takes child
-// trees. Synchronous (Run waits), so the daemon is dead before the detached bin
-// cleanup runs — the fix for "uninstall removed the files but blamely kept
-// running and kept the dir locked".
+// image name, with no PID-file or filter-wildcard dependency. Synchronous (Run
+// waits), so the daemon is dead before the detached bin cleanup runs — the fix
+// for "uninstall removed the files but blamely kept running and kept the dir
+// locked".
+//
+// NO /T, for the same reason as killProcess and one more: `blamely update` runs
+// this install as a CHILD, and the updater is itself a blamely.exe that this
+// filter matches. /T therefore reached us through our own parent's tree and
+// killed the installer mid-run — which is why an update used to end with no
+// daemon running at all. The `PID ne <self>` filter cannot help there: it
+// excludes us from being MATCHED, not from being swept up as a descendant of
+// something that was.
 func killOtherDaemonProcesses() {
 	self := "PID ne " + strconv.Itoa(os.Getpid())
-	_ = procattr.Hide(exec.Command("taskkill", "/F", "/T", "/IM", "blamely.exe", "/FI", self)).Run()
+	_ = procattr.Hide(exec.Command("taskkill", "/F", "/IM", "blamely.exe", "/FI", self)).Run()
 }
 
 // createNewConsole is CREATE_NEW_CONSOLE: the cleanup shell gets a console of
@@ -83,6 +100,22 @@ func removeInstalledBinary(p string, extraFiles []string, purgeRoot string) erro
 	if _, err := os.Stat(p); os.IsNotExist(err) && len(extraFiles) == 0 && purgeRoot == "" {
 		return nil
 	}
+	if err := runDetachedShell(binCleanupScript(p, extraFiles, purgeRoot)); err != nil {
+		return fmt.Errorf("schedule binary removal: %w", err)
+	}
+	return nil
+}
+
+// binCleanupScript builds the cmd.exe one-liner removeInstalledBinary defers.
+//
+// Split out so a test can assert what the script actually contains without
+// running its destructive lines against the developer's own machine. One thing
+// in particular has to stay true: this is the ONLY kill in the uninstall path
+// that still reaps child trees (/t). The synchronous kills in killRunningDaemon
+// deliberately dropped /t — it was killing the installer itself through its
+// caller's tree — and they can afford to because this script sweeps up whatever
+// they left, three times, after every blamely process of ours has exited.
+func binCleanupScript(p string, extraFiles []string, purgeRoot string) string {
 	binDir := filepath.Dir(p)
 	exeName := filepath.Base(p) // blamely.exe — the daemon's image name too
 	// del the runtime/data files that live in ~/.blamely (NOT in bin): logs,
@@ -148,14 +181,10 @@ func removeInstalledBinary(p string, extraFiles []string, purgeRoot string) erro
 	// own image, which releases the instant it exits — right after this returns.
 	// The extra passes with longer waits are just insurance against a transient
 	// handle (e.g. an editor's sqlite3 query) still open on the first try.
-	script := fmt.Sprintf(
+	return fmt.Sprintf(
 		`ping 127.0.0.1 -n 2 >nul & %s & ping 127.0.0.1 -n 3 >nul & %s & ping 127.0.0.1 -n 3 >nul & %s`,
 		killClean, killClean, killClean,
 	)
-	if err := runDetachedShell(script); err != nil {
-		return fmt.Errorf("schedule binary removal: %w", err)
-	}
-	return nil
 }
 
 // runDetachedShell starts script in a cmd.exe that keeps running after this

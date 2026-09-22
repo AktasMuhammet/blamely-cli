@@ -326,6 +326,7 @@ func Run(installPlugins bool) error {
 	default:
 		s.LaunchAgentInstalled = true
 		ok("Daemon agent", agentRef)
+		reportAutostartIssues(binPath)
 
 		// Block until the daemon actually answers /health, so the user knows
 		// hooks are being listened to before this command exits. 25s, not a
@@ -404,11 +405,12 @@ func runtimeArtifacts(keepDB bool) []string {
 			files = append(files, p)
 		}
 	}
-	add(config.LogFile())    // daemon.log
-	add(config.SocketFile()) // daemon.sock (unix)
-	add(config.PortFile())   // daemon.port (windows)
-	add(config.PidFile())    // daemon.pid
-	add(config.StateFile())  // state.json
+	add(config.LogFile())       // daemon.log
+	add(config.UpdateLogFile()) // update.log (the update history, same class as the log)
+	add(config.SocketFile())    // daemon.sock (unix)
+	add(config.PortFile())      // daemon.port (windows)
+	add(config.PidFile())       // daemon.pid
+	add(config.StateFile())     // state.json
 	if dir, err := config.BlamelyDir(); err == nil {
 		files = append(files, filepath.Join(dir, "blamely.db")) // legacy, pre-db.sqlite
 	}

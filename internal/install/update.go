@@ -85,6 +85,11 @@ type UpdateResult struct {
 	To      string
 	Updated bool
 	Reason  string
+	// Channel is where this attempt actually got its release from — the
+	// --channel flag, the configured default, or "local" for an archive handed
+	// over with --from. Recorded because the update history is unreadable
+	// without it: "1.8.1 -> 1.8.2" means something different on beta.
+	Channel string
 }
 
 // runInstaller executes the staged binary's own `install`, sending its output to
@@ -308,7 +313,23 @@ func CheckForUpdate(ctx context.Context, current string) (rel Release, newer boo
 // Update downloads, verifies and installs a newer blamely. See the numbered
 // steps below; nothing on disk is touched until the final hand-off, so a failure
 // at any earlier point leaves the running install exactly as it was.
-func Update(ctx context.Context, opts UpdateOptions) (UpdateResult, error) {
+func Update(ctx context.Context, opts UpdateOptions) (res UpdateResult, err error) {
+	// One line per attempt in ~/.blamely/update.log, whatever happens. Named
+	// returns exist for this: the failure paths below are many and spread out,
+	// and an auto-update from the daemon has no terminal to print to — so
+	// without this, "it stopped updating in March" is unanswerable.
+	//
+	// The SUCCESS line is written by step 8 instead, the moment the binary is
+	// swapped, because this defer cannot be relied on to run: the hand-off in
+	// step 9 runs `blamely install`, which on Windows kills this process with
+	// its tree. `logged` keeps the two from writing the same attempt twice.
+	var logged bool
+	defer func() {
+		if !logged {
+			logUpdateOutcome(res, err)
+		}
+	}()
+
 	out := opts.Out
 	if out == nil {
 		out = os.Stdout
@@ -316,7 +337,7 @@ func Update(ctx context.Context, opts UpdateOptions) (UpdateResult, error) {
 	if strings.TrimSpace(opts.Current) == "" {
 		opts.Current = Version
 	}
-	res := UpdateResult{From: opts.Current, To: opts.Current}
+	res = UpdateResult{From: opts.Current, To: opts.Current}
 
 	dst, err := InstalledBinaryPath()
 	if err != nil {
@@ -360,11 +381,13 @@ func Update(ctx context.Context, opts UpdateOptions) (UpdateResult, error) {
 		archiveSrc = opts.FromArchive
 		wantSHA = strings.ToLower(strings.TrimSpace(opts.ExpectSHA))
 		tag = "local"
+		res.Channel = "local"
 	} else {
 		channel := opts.Channel
 		if strings.TrimSpace(channel) == "" {
 			channel = UpdateChannel()
 		}
+		res.Channel = channel
 		mctx, cancel := context.WithTimeout(ctx, updateManifestTimeout)
 		rel, err := LatestRelease(mctx, channel)
 		cancel()
@@ -490,6 +513,15 @@ func Update(ctx context.Context, opts UpdateOptions) (UpdateResult, error) {
 	_ = os.RemoveAll(stage)
 	res.Updated = true
 
+	// Record the success NOW. The swap above is what "updated" means — the new
+	// version is what every hook, task and agent will run from here on — and the
+	// hand-off below may never return: on Windows `blamely install` kills this
+	// process along with the daemon. Logging from the deferred writer instead
+	// left the successful Windows updates, the ones worth having a history of,
+	// unrecorded.
+	logUpdateOutcome(res, nil)
+	logged = true
+
 	// 9. Hand the REST off to the now-installed binary: re-register every tool
 	// hook (a new release may add one) and restart the daemon agent so the new
 	// version takes over immediately instead of at the next start.
@@ -500,6 +532,10 @@ func Update(ctx context.Context, opts UpdateOptions) (UpdateResult, error) {
 	// itself) down; the keepalive task then revives the daemon from the stable
 	// path, which now holds the new binary.
 	if err := runInstaller(installedPath, out, postUpdateInstallArgs(opts)...); err != nil {
+		// A second line, not a replacement: the update itself stands (logged
+		// above), and this says which part of it didn't finish.
+		appendUpdateLog(fmt.Sprintf("post-install step after %s did not finish: %s",
+			versionOrUnknown(res.To), oneLine(err.Error())))
 		res.Reason = "installed; the post-install step did not finish"
 		fmt.Fprintf(out, "blamely %s is in place, but finishing the install failed: %v\n"+
 			"Hooks keep working through the unchanged path. Run `blamely install` to refresh them.\n",
@@ -618,6 +654,17 @@ func extractBinary(archivePath, destDir string) (string, error) {
 	if err := os.Chmod(dst, 0o755); err != nil {
 		return "", err
 	}
+	// Sidecar: the Windows archives also carry blamelyw.exe, the windowless
+	// launcher the autostart tasks point at. Staging it next to the binary is
+	// what lets CopyBinary (step 8) install the pair together.
+	//
+	// Best-effort on purpose. Only .zip archives can hold it, an archive from
+	// before the launcher existed holds none, and a missing launcher just means
+	// the autostart entries keep naming blamely.exe directly — none of which is
+	// a reason to fail an update that already has a verified binary.
+	if strings.HasSuffix(strings.ToLower(archivePath), ".zip") {
+		_, _ = extractZipEntry(archivePath, filepath.Join(destDir, launcherName), isLauncherEntry)
+	}
 	return dst, nil
 }
 
@@ -680,26 +727,44 @@ func extractBinaryTarGz(src, dst string) error {
 }
 
 func extractBinaryZip(src, dst string) error {
+	found, err := extractZipEntry(src, dst, isBinaryEntry)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("archive %s contains no blamely binary", filepath.Base(src))
+	}
+	return nil
+}
+
+// extractZipEntry writes the first entry matching `match` to dst and reports
+// whether one was found. "Not found" is a value, not an error, because the
+// launcher sidecar is optional — only the binary's absence is fatal, and that
+// judgment belongs to the caller.
+func extractZipEntry(src, dst string, match func(string) bool) (bool, error) {
 	zr, err := zip.OpenReader(src)
 	if err != nil {
-		return fmt.Errorf("open zip: %w", err)
+		return false, fmt.Errorf("open zip: %w", err)
 	}
 	defer zr.Close()
 	for _, e := range zr.File {
 		if err := safeArchivePath(e.Name); err != nil {
-			return err
+			return false, err
 		}
-		if e.FileInfo().IsDir() || !isBinaryEntry(e.Name) {
+		if e.FileInfo().IsDir() || !match(e.Name) {
 			continue
 		}
 		rc, err := e.Open()
 		if err != nil {
-			return err
+			return false, err
 		}
 		defer rc.Close()
-		return writeFileFrom(io.LimitReader(rc, maxUpdateArchiveBytes), dst)
+		if err := writeFileFrom(io.LimitReader(rc, maxUpdateArchiveBytes), dst); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
-	return fmt.Errorf("archive %s contains no blamely binary", filepath.Base(src))
+	return false, nil
 }
 
 func writeFileFrom(r io.Reader, dst string) error {

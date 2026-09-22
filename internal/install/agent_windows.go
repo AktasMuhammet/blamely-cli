@@ -33,9 +33,15 @@ const keepaliveTaskName = "Blamely Daemon Keepalive"
 // Scheduled Task is, behaviourally, indistinguishable from malware refusing to
 // stay killed — it was part of what tripped Defender (see the file comment on
 // startupShortcutName). 15 minutes still recovers a crashed daemon without a
-// human noticing, and it is not the only recovery path: the editor plugins
-// respawn the daemon when their /health probe fails, and EnsureDaemonAgent
-// self-heals on every daemon start.
+// human noticing.
+//
+// It is load-bearing, not a bonus: the editor plugins only REPORT a dead daemon
+// (CliHealth's daemon_offline warning) — neither respawns it — and `record`
+// drops the edit it was handed when nothing answers /edit. `blamely update` also
+// leans on this task, since finishing an update on Windows kills the daemon and
+// this is what brings the new binary up. So the flashing console window it used
+// to cause every 15 minutes was fixed by making the launch windowless
+// (daemonCommand → cmd/blamelyw), never by slowing the timer down.
 const keepaliveMinutes = 15
 
 // startupShortcutName is the non-admin autostart fallback: a plain .lnk pointing
@@ -56,9 +62,11 @@ const keepaliveMinutes = 15
 // verified publisher, but Defender never saw that signature on the thing that
 // actually started at boot, because the thing that started was an unsigned .vbs.
 //
-// Everything here now launches the signed blamely.exe directly. The console
-// window that used to justify the VBScript is handled inside the binary
-// (`daemon --background`, see cmd/blamely/console_windows.go).
+// Everything here now launches a signed binary of ours directly: blamelyw.exe,
+// the windowless launcher, which starts blamely.exe with no console at all (see
+// cmd/blamelyw and daemonCommand), or blamely.exe itself where that launcher
+// isn't installed — which then drops the console it was handed from inside the
+// process (`daemon --background`, see cmd/blamely/console_windows.go).
 const startupShortcutName = "Blamely.lnk"
 
 // Legacy artifact names, removed on install/ensure/uninstall so machines that
@@ -96,9 +104,22 @@ func isWindowsAdmin() bool {
 	return r != 0
 }
 
-// daemonCommand is the command line every autostart entry runs: the signed
-// binary, with the flag that makes it drop the launcher's console window.
+// daemonCommand is the command line every autostart entry runs.
+//
+// Preferred form: blamelyw.exe, the windowless launcher (cmd/blamelyw). It is a
+// GUI-subsystem binary, so Task Scheduler cannot give it a console — which is
+// the whole point. It takes no arguments and starts exactly one thing: the
+// blamely.exe next to it, with CREATE_NO_WINDOW.
+//
+// Fallback: blamely.exe with the flag that makes it drop the console the task
+// handed it. That is what this always did, and what an install without the
+// launcher (dev build, pre-launcher archive, failed sidecar copy) still gets: a
+// working daemon whose console flashes for a few hundred milliseconds at every
+// launch. Correct, just visible.
 func daemonCommand(binaryPath string) string {
+	if launcher, ok := launcherPath(binaryPath); ok {
+		return fmt.Sprintf("\"%s\"", launcher)
+	}
 	return fmt.Sprintf("\"%s\" daemon --background", binaryPath)
 }
 
@@ -215,8 +236,22 @@ func windowsStartupDir() (string, error) {
 }
 
 // startDaemonNow launches the daemon for the current session with no console
-// window (CREATE_NO_WINDOW). HideWindow is kept as a belt-and-suspenders hint.
+// window.
+//
+// It asks the Task Scheduler to run the autostart task first, and only spawns
+// the daemon itself if that isn't possible. The difference is what the new
+// daemon's PARENT is: a task-launched daemon belongs to the Task Scheduler
+// service, so it survives anything aimed at our own process tree — including
+// `blamely update`, which kills the old daemon and the updater around this very
+// call. A daemon spawned here is our child and could be swept up with us, which
+// is how an update used to finish with no daemon running. It also goes through
+// blamelyw.exe, so there is no console window either way.
 func startDaemonNow(binaryPath string) error {
+	if startDaemonViaTask(binaryPath) {
+		return nil
+	}
+	// No usable task (a Startup-shortcut install, a policy-restricted box, or a
+	// task registered to run something else): spawn it ourselves.
 	// procattr.Hide is what supplies CREATE_NO_WINDOW here — the same flag every
 	// other subprocess now gets, rather than a second hand-rolled copy of it.
 	cmd := procattr.Hide(exec.Command(binaryPath, "daemon"))
@@ -225,6 +260,28 @@ func startDaemonNow(binaryPath string) error {
 	}
 	_ = cmd.Process.Release() // detach: the daemon outlives this installer
 	return nil
+}
+
+// startDaemonViaTask runs a registered autostart task on demand and reports
+// whether one actually started.
+//
+// Only a task that runs EXACTLY what we would register is used. A task left
+// behind by an elevated install (see CheckAutostartTasks) can name an old path
+// or an old command line, and starting that would launch the wrong binary — the
+// direct spawn is both safer and more predictable than "run whatever is
+// registered".
+func startDaemonViaTask(binaryPath string) bool {
+	want := normalizeCommand(daemonCommand(binaryPath))
+	for _, name := range []string{scheduledTaskName, keepaliveTaskName} {
+		registered, ok := registeredTaskCommand(name)
+		if !ok || normalizeCommand(registered) != want {
+			continue
+		}
+		if err := procattr.Hide(exec.Command("schtasks", "/Run", "/TN", name)).Run(); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func isSchtasksAccessDenied(err error) bool {
@@ -279,13 +336,25 @@ func EnsureDaemonAgent(binaryPath string) error {
 	// The keepalive is a per-user time trigger — no elevation needed, so ensure
 	// it on every path. installKeepaliveTask is idempotent (/Delete + /Create /F)
 	// and re-applies the battery settings itself.
-	if err := installKeepaliveTask(binaryPath); err != nil {
-		if taskExists(scheduledTaskName) {
-			return nil // logon coverage is registered; keepalive is a bonus
-		}
+	if err := installKeepaliveTask(binaryPath); err != nil && !taskExists(scheduledTaskName) {
+		// The keepalive couldn't be written AND there is no logon coverage —
+		// fall back to the Startup shortcut. (With the logon task registered, a
+		// failed keepalive is a missing bonus, not a missing autostart.)
 		if _, serr := installStartupAgentEntry(binaryPath); serr != nil {
 			return serr
 		}
+	}
+
+	// Verify what is ACTUALLY registered now. A task created from an elevated
+	// session refuses our rewrite with "Access is denied", and every branch
+	// above treats that as acceptable — so without this check the machine keeps
+	// running the old command line and nothing anywhere says so. The returned
+	// error is logged to daemon.log by the caller (cmd/blamely), which on an
+	// unattended machine is the only place it can be seen.
+	if issues := CheckAutostartTasks(binaryPath); len(issues) > 0 {
+		i := issues[0]
+		return fmt.Errorf("autostart task %q runs %s but should run %s, and could not be rewritten (%s)",
+			i.Task, i.Registered, i.Expected, i.Fix)
 	}
 	return nil
 }
@@ -301,7 +370,13 @@ func installStartupAgentEntry(binaryPath string) (string, error) {
 		return "", fmt.Errorf("mkdir startup: %w", err)
 	}
 	lnk := filepath.Join(startupDir, startupShortcutName)
-	if err := writeShortcut(lnk, binaryPath, "daemon --background"); err != nil {
+	// Same preference as daemonCommand: point at the windowless launcher when
+	// it's installed (it needs no arguments), else at the binary itself.
+	target, args := binaryPath, "daemon --background"
+	if launcher, ok := launcherPath(binaryPath); ok {
+		target, args = launcher, ""
+	}
+	if err := writeShortcut(lnk, target, args); err != nil {
 		return "", err
 	}
 	return lnk, nil

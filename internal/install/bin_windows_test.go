@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -59,5 +60,38 @@ func TestRunDetachedShell_DeliversQuotedPaths(t *testing.T) {
 	}
 	if !gone(dir) {
 		t.Errorf("quoted directory %s survived: the script did not reach cmd.exe intact", dir)
+	}
+}
+
+// TestBinCleanupScript_KeepsTreeKill guards the one invariant the synchronous
+// kills now depend on.
+//
+// killProcess and killOtherDaemonProcesses deliberately DROPPED /t: during an
+// update the process they were killing is the parent of the running installer,
+// so a tree kill took the installer down with it and the machine ended up with
+// no daemon at all until the 15-minute keepalive fired. That trade is only safe
+// because this deferred script still sweeps child trees — after every blamely
+// process of ours has exited — and still deletes the respawn tasks first so a
+// keepalive can't start a new daemon mid-cleanup.
+func TestBinCleanupScript_KeepsTreeKill(t *testing.T) {
+	root := t.TempDir()
+	bin := filepath.Join(root, "bin", "blamely.exe")
+	data := filepath.Join(root, "db file.sqlite")
+	script := binCleanupScript(bin, []string{data}, "")
+
+	if !strings.Contains(script, `taskkill /f /t /im "blamely.exe"`) {
+		t.Errorf("the deferred cleanup must still kill child trees (/t):\n%s", script)
+	}
+	for _, tn := range []string{scheduledTaskName, keepaliveTaskName, legacyWatchdogTaskName} {
+		if !strings.Contains(script, fmt.Sprintf(`schtasks /delete /f /tn "%s"`, tn)) {
+			t.Errorf("cleanup does not delete task %q, so it could be resurrected mid-cleanup", tn)
+		}
+	}
+	// A path with a space must arrive quoted, or cmd.exe splits it.
+	if !strings.Contains(script, `"`+data+`"`) {
+		t.Errorf("data file not quoted in:\n%s", script)
+	}
+	if !strings.Contains(script, `rmdir /s /q "`+filepath.Dir(bin)+`"`) {
+		t.Errorf("bin dir not wiped in:\n%s", script)
 	}
 }

@@ -109,9 +109,55 @@ jobs:
           CGO_ENABLED: '0'      # static binary; SQLite uses modernc.org/sqlite (pure Go)
         run: |
           set -e
-          out_dir="dist/blamely_${{ steps.tag.outputs.tag }}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          tag="${{ steps.tag.outputs.tag }}"
+          out_dir="dist/blamely_${tag}_${{ matrix.goos }}_${{ matrix.goarch }}"
           bin_name="blamely${{ matrix.ext }}"
           mkdir -p "$out_dir"
+
+          # Stamp the Windows version resources with the tag being released, so a
+          # shipped exe's file properties say the version it actually is. Must
+          # run BEFORE the builds below: the linker picks up the .syso at compile
+          # time.
+          #
+          # The .syso files are committed (a local build still gets an icon and
+          # the company/description fields), but a hand-maintained number goes
+          # stale the moment someone forgets to bump it — which is what happened
+          # to blamely.exe, whose committed resource still claims 1.6.7. An
+          # executable whose properties disagree with its real version is one
+          # more thing for a security reviewer to be suspicious about, and for
+          # blamelyw.exe — a small helper that starts another program from a
+          # scheduled task — that suspicion is the whole problem.
+          #
+          # GOOS/GOARCH are pinned to the RUNNER's platform for `go run`: the
+          # step sets them to the build target, which would have Go compile the
+          # generator itself for windows/arm64 and then fail to execute it.
+          #
+          # A non-semver tag (the rolling `latest`/`beta` publishes reuse these
+          # same artifacts) keeps the committed resource instead of failing.
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            ver="${tag#v}"
+            case "$ver" in
+              [0-9]*.[0-9]*.[0-9]*)
+                maj="${ver%%.*}"; rest="${ver#*.}"; min="${rest%%.*}"
+                patch="${rest#*.}"; patch="${patch%%-*}"
+                armflag=""
+                [ "${{ matrix.goarch }}" = "arm64" ] && armflag="-arm"
+                for c in blamely blamelyw; do
+                  GOOS=windows GOARCH=amd64 go run \
+                    github.com/josephspurrier/goversioninfo/cmd/goversioninfo@v1.7.0 \
+                    -64 $armflag \
+                    -icon packaging/windows/blamely.ico \
+                    -ver-major "$maj" -ver-minor "$min" -ver-patch "$patch" \
+                    -product-ver-major "$maj" -product-ver-minor "$min" -product-ver-patch "$patch" \
+                    -file-version "$ver" -product-version "$ver" \
+                    -o "cmd/$c/resource_windows_${{ matrix.goarch }}.syso" \
+                    "cmd/$c/versioninfo.json"
+                done
+                ;;
+              *) echo "tag $tag is not semver — keeping the committed version resources" ;;
+            esac
+          fi
+
           # Standard release build flags:
           #   -trimpath        remove build paths
           #   -buildvcs=false  don't stamp git metadata
@@ -123,6 +169,24 @@ jobs:
             -ldflags="-s -w -X main.version=${{ steps.tag.outputs.tag }}" \
             -o "$out_dir/$bin_name" \
             ./cmd/blamely
+
+          # blamelyw.exe — the windowless daemon launcher (cmd/blamelyw), which
+          # the Windows autostart tasks point at instead of blamely.exe so that
+          # Task Scheduler never puts a console window on screen.
+          #
+          # -H=windowsgui is the entire point: it stamps the PE header as GUI
+          # subsystem, which is what makes Windows refuse to allocate the
+          # process a console. Built here, into the same directory, so the
+          # signing step (files-folder-filter: exe) signs it alongside
+          # blamely.exe and the release .zip carries both.
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            go build \
+              -trimpath \
+              -buildvcs=false \
+              -ldflags="-s -w -H=windowsgui" \
+              -o "$out_dir/blamelyw.exe" \
+              ./cmd/blamelyw
+          fi
 
       - name: Smoke-test binary (native arch only)
         # Run the just-built binary on the matching-arch runner:
@@ -231,12 +295,22 @@ jobs:
           7z x -y "incoming/${dir}.zip" -owork >/dev/null || unzip -q -o "incoming/${dir}.zip" -d work
           bin="work/${dir}/blamely.exe"
           [ -f "$bin" ] || { echo "binary missing: $bin"; ls -R work; exit 1; }
+          # The windowless launcher must ship with it: without it the autostart
+          # tasks fall back to blamely.exe and the console window flashes again.
+          # Fail loudly rather than publish a silently degraded release.
+          launcher="work/${dir}/blamelyw.exe"
+          [ -f "$launcher" ] || { echo "launcher missing: $launcher"; ls -R work; exit 1; }
           echo "path=$bin" >> "$GITHUB_OUTPUT"
           echo "dir=$(dirname "$bin")" >> "$GITHUB_OUTPUT"
 
-      # Sign the binary BEFORE it's packaged, so the .exe inside the installer is
-      # also signed (Defender scans the extracted exe, not just the installer).
-      - name: Sign blamely.exe (Azure Trusted Signing)
+      # Sign the binaries BEFORE they're packaged, so the .exe files inside the
+      # installer are also signed (Defender scans the extracted exe, not just the
+      # installer). files-folder-filter: exe means this covers both blamely.exe
+      # and blamelyw.exe — and the launcher being signed by the same verified
+      # publisher is what keeps an autostart entry that runs a tiny helper on a
+      # timer from looking like the unsigned-script persistence shape Defender
+      # flagged before (see internal/install/agent_windows.go).
+      - name: Sign Windows binaries (Azure Trusted Signing)
         if: env.AZURE_TS_ACCOUNT != ''
         # NOTE: this action is the former azure/trusted-signing-action — Microsoft
         # rebranded it to "Artifact Signing" at v1.0.0 GA (old name/tags are gone;

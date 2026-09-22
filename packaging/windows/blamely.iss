@@ -74,6 +74,13 @@ UninstallDisplayIcon={app}\blamely.exe
 
 [Files]
 Source: "{#SourceDir}\blamely.exe"; DestDir: "{app}"; Flags: ignoreversion
+; blamelyw.exe — the windowless daemon launcher. `blamely install` copies it from
+; {app} into ~/.blamely/bin next to the stable binary and points the autostart
+; Scheduled Tasks at it, so the daemon starts with no console window instead of
+; flashing one every time the keepalive task fires. Optional by design in the
+; code (the tasks fall back to blamely.exe), but the release zip always carries
+; it, so skipping it here would only ship a worse install.
+Source: "{#SourceDir}\blamelyw.exe"; DestDir: "{app}"; Flags: ignoreversion
 #if Sqlite != ""
 ; The IDE plugins read the attribution DB via sqlite3, which Windows lacks. They
 ; look in ~/.blamely/bin FIRST (PATH-independent — a GUI-launched VS Code can't
