@@ -123,6 +123,18 @@ jobs:
             -ldflags="-s -w -X main.version=${{ steps.tag.outputs.tag }}" \
             -o "$out_dir/$bin_name" \
             ./cmd/blamely
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            # blamelyw.exe: console-less (GUI-subsystem, -H=windowsgui) launcher
+            # that the autostart Scheduled Tasks run so no console window ever
+            # flashes. See cmd/blamelyw and internal/install/launcher_windows.go.
+            # Signed later by the same files-folder-filter:exe pass as blamely.exe.
+            go build \
+              -trimpath \
+              -buildvcs=false \
+              -ldflags="-s -w -H=windowsgui" \
+              -o "$out_dir/blamelyw.exe" \
+              ./cmd/blamelyw
+          fi
 
       - name: Smoke-test binary (native arch only)
         # Run the just-built binary on the matching-arch runner:

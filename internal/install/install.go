@@ -70,6 +70,11 @@ func Run(installPlugins bool) error {
 		return fmt.Errorf("install binary: %w", err)
 	}
 
+	// Windows: also install the console-less launcher (blamelyw.exe) shipped
+	// next to the binary, so the autostart tasks run without flashing a console
+	// window. Best-effort: without it the tasks run blamely.exe directly.
+	launcherPath, launcherErr := CopyLauncher(srcBinPath)
+
 	// Tee the full step-by-step report to ~/.blamely/last-install.log so the
 	// native installers can display exactly what was set up WITHOUT any shell
 	// redirection (`blamely install > log`) — that pattern is what EDR/SmartScreen
@@ -86,6 +91,11 @@ func Run(installPlugins bool) error {
 
 	printDetected(detected)
 	info("Binary", binPath)
+	if launcherPath != "" {
+		info("Launcher", launcherPath)
+	} else if launcherErr != nil {
+		fail("Launcher", fmt.Sprintf("blamelyw.exe not installed (%v); the daemon tasks will run blamely.exe directly", launcherErr))
+	}
 
 	s, err := LoadState()
 	if err != nil {

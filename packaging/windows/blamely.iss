@@ -74,6 +74,10 @@ UninstallDisplayIcon={app}\blamely.exe
 
 [Files]
 Source: "{#SourceDir}\blamely.exe"; DestDir: "{app}"; Flags: ignoreversion
+; blamelyw.exe: console-less launcher for the daemon Scheduled Tasks (no
+; console window flash). skipifsourcedoesntexist keeps pre-launcher / local
+; builds working — `blamely install` falls back to blamely.exe directly.
+Source: "{#SourceDir}\blamelyw.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 #if Sqlite != ""
 ; The IDE plugins read the attribution DB via sqlite3, which Windows lacks. They
 ; look in ~/.blamely/bin FIRST (PATH-independent — a GUI-launched VS Code can't

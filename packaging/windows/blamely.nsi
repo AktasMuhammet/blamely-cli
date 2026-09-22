@@ -90,6 +90,9 @@ BrandingText "Blamely ${VERSION}"
 Section "Blamely CLI" SecMain
   SetOutPath "$INSTDIR"
   File "${SRCDIR}/blamely.exe"
+  ; Console-less launcher for the daemon Scheduled Tasks (optional; older
+  ; source dirs may not have it).
+  File /nonfatal "${SRCDIR}/blamelyw.exe"
 
   ; sqlite3.exe → ~/.blamely/bin (the IDE plugins look there FIRST, PATH-independent;
   ; a GUI-launched VS Code can't see PATH). Same source the curl installer uses.
@@ -127,6 +130,7 @@ Section "Uninstall"
   Pop $0
 
   Delete "$INSTDIR\blamely.exe"
+  Delete "$INSTDIR\blamelyw.exe"
   Delete "$INSTDIR\uninstall.exe"
   RMDir  "$INSTDIR"
   DeleteRegKey HKCU "${REGKEY}"

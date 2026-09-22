@@ -96,10 +96,32 @@ func isWindowsAdmin() bool {
 	return r != 0
 }
 
-// daemonCommand is the command line every autostart entry runs: the signed
-// binary, with the flag that makes it drop the launcher's console window.
+// daemonCommand is the command line every autostart entry runs.
 func daemonCommand(binaryPath string) string {
-	return fmt.Sprintf("\"%s\" daemon --background", binaryPath)
+	return fmt.Sprintf("\"%s\" daemon --background", daemonLaunchTarget(binaryPath))
+}
+
+// daemonLaunchTarget picks what the autostart entries actually execute.
+//
+// blamely.exe is a console-subsystem image, and Task Scheduler runs its tasks
+// in the interactive session: Windows creates and SHOWS a console window for
+// it before any of our code runs. hideConsole() (cmd/blamely/console_windows.go)
+// can only hide that window after process start, so a console still flashes on
+// every keepalive fire — every 15 minutes, forever. blamelyw.exe (cmd/blamelyw,
+// built -H=windowsgui) is a GUI-subsystem launcher for which Windows never
+// creates a console at all; it starts the sibling blamely.exe with
+// CREATE_NO_WINDOW and exits. Signed binary → signed binary, no
+// cmd/powershell/wscript in the chain (see the EDR history above).
+//
+// Falls back to the binary itself when the launcher isn't installed (a dev
+// build, or an install from a pre-launcher archive) — functional, with the
+// old flash.
+func daemonLaunchTarget(binaryPath string) string {
+	l := filepath.Join(filepath.Dir(binaryPath), launcherName)
+	if _, err := os.Stat(l); err == nil {
+		return l
+	}
+	return binaryPath
 }
 
 // createOnLogonTask registers (or force-overwrites) the ONLOGON task that
@@ -301,7 +323,7 @@ func installStartupAgentEntry(binaryPath string) (string, error) {
 		return "", fmt.Errorf("mkdir startup: %w", err)
 	}
 	lnk := filepath.Join(startupDir, startupShortcutName)
-	if err := writeShortcut(lnk, binaryPath, "daemon --background"); err != nil {
+	if err := writeShortcut(lnk, daemonLaunchTarget(binaryPath), "daemon --background"); err != nil {
 		return "", err
 	}
 	return lnk, nil
