@@ -1,0 +1,35 @@
+.github/workflows/release.yml
+  s_8cc69077e743f3::t_635bd4046d740f 126-137
+cmd/blamelyw/main_other.go
+  s_8cc69077e743f3::t_26fb4237c73bb6 1-15
+cmd/blamelyw/main_windows.go
+  s_8cc69077e743f3::t_59d0bfd2f8139c 1-52
+internal/install/agent_windows.go
+  s_8cc69077e743f3::t_ee38fb96145bb4 99,101-124,326
+internal/install/install.go
+  s_8cc69077e743f3::t_d308dc27a3fcc8 73-77,94-98
+internal/install/launcher_other.go
+  s_8cc69077e743f3::t_f9b6834f3fcf14 1-8
+internal/install/launcher_windows.go
+  s_8cc69077e743f3::t_084a0420bbf3dd 1-83
+packaging/windows/blamely.iss
+  s_8cc69077e743f3::t_7d28d61c868f5a 77-80
+packaging/windows/blamely.nsi
+  s_8cc69077e743f3::t_d83e1a09c043d1 93-95,133
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f61a813772bb5495016a4a7fb31ab6fe0545e1a8",
+  "prompts": {},
+  "sessions": {
+    "s_8cc69077e743f3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_8cc69077e743f3",
+        "model": "unknown"
+      },
+      "human_author": "muhammet.aktas <muhammet@oobeya.io>"
+    }
+  }
+}
