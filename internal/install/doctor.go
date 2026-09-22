@@ -31,6 +31,9 @@ func Doctor(w io.Writer) error {
 	d := &doctor{w: w}
 	d.daemon()
 	d.binary()
+	// After binary(), because what the autostart entry SHOULD run depends on
+	// which files are installed next to the binary (the windowless launcher).
+	d.autostart()
 	// Called from here, not inside binary(), so an available update is still
 	// reported when the binary check itself bails out early.
 	d.updateHint()
@@ -122,12 +125,63 @@ func (d *doctor) binary() {
 		return
 	}
 	d.ok("stable binary path", p)
+
+	// Windows only: is the windowless launcher installed next to the binary?
+	// Without it the autostart Scheduled Tasks name blamely.exe directly and
+	// Windows flashes a console window at every logon and every keepalive tick —
+	// a working install, but the single most-reported annoyance, and the one
+	// thing a support answer needs to distinguish. A warning, never a fault.
+	if runtime.GOOS == "windows" {
+		// note, not warn: a source build (`go build ./cmd/blamely`) has no
+		// launcher by design, so counting it as a problem would report a fault
+		// on every developer machine.
+		if launcher, ok := launcherPath(p); ok {
+			d.ok("windowless launcher", launcher)
+		} else {
+			d.note("windowless launcher", fmt.Sprintf(
+				"not installed (%s) — the daemon still starts, but a console window flashes when it does; re-install from a release to get it",
+				launcher))
+		}
+	}
 }
 
 // updateHint surfaces what the daemon's periodic check last found. It reads the
 // recorded hint only — doctor never makes a network call of its own, so it stays
 // instant and works offline.
+// autostart reports an autostart entry that is registered but runs something
+// other than what this build would register — on Windows, the signature of a
+// task created by an elevated install that no later non-elevated install can
+// rewrite (see CheckAutostartTasks). Silent when everything matches, and a
+// no-op off Windows.
+//
+// This is a `bad`, not a `note`: the machine is running an autostart entry we
+// have already replaced, it will not fix itself, and the repair needs a human
+// with the right privileges.
+func (d *doctor) autostart() {
+	p, err := InstalledBinaryPath()
+	if err != nil {
+		return // binary() already reported this
+	}
+	for _, i := range CheckAutostartTasks(p) {
+		d.bad(fmt.Sprintf("autostart %q", i.Task),
+			fmt.Sprintf("runs %s, expected %s", i.Registered, i.Expected), i.Fix)
+	}
+}
+
 func (d *doctor) updateHint() {
+	// The last update attempt, successful or not. An auto-update runs unattended
+	// from the daemon, so when a machine is stuck on an old version this line is
+	// the only thing that says why — and doctor is where people look.
+	if line, ok := LastUpdateLogLine(); ok {
+		// A failed attempt is a real warning — the machine is not getting new
+		// versions — while a successful one is just useful context.
+		if strings.Contains(line, "update failed") {
+			d.warn("last update attempt", line,
+				"retry with `blamely update`; the full history is in ~/.blamely/update.log")
+		} else {
+			d.ok("last update attempt", line)
+		}
+	}
 	h, ok := updatehint.Read()
 	if !ok {
 		return

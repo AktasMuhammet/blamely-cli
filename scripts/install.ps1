@@ -42,6 +42,11 @@ $ErrorActionPreference = 'Stop'
 $RepoRoot   = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $StableDir  = Join-Path $env:USERPROFILE '.blamely\bin'
 $StableBin  = Join-Path $StableDir 'blamely.exe'
+# The windowless daemon launcher (cmd/blamelyw). Built here too, because without
+# it a local install registers its Scheduled Tasks against blamely.exe and gets
+# the flashing console window the launcher exists to remove - i.e. a dev install
+# would not reproduce what users actually run.
+$LauncherBin = Join-Path $StableDir 'blamelyw.exe'
 
 function Die($msg) { Write-Host "error: $msg" -ForegroundColor Red; exit 1 }
 function Ok($msg)  { Write-Host ("  [+] {0}" -f $msg) -ForegroundColor Green }
@@ -64,11 +69,17 @@ function Build-Binary {
         # -buildvcs=false don't stamp git metadata.
         & go build -trimpath -buildvcs=false -ldflags="-s -w" -o $StableBin .\cmd\blamely
         if ($LASTEXITCODE -ne 0) { Die "go build failed" }
+        # -H=windowsgui marks the PE header GUI-subsystem, which is the only
+        # thing that reliably stops Windows from handing a Scheduled Task's
+        # process a visible console. Same flag the release pipeline uses.
+        & go build -trimpath -buildvcs=false -ldflags="-s -w -H=windowsgui" -o $LauncherBin .\cmd\blamelyw
+        if ($LASTEXITCODE -ne 0) { Die "go build failed (blamelyw launcher)" }
     } finally {
         Pop-Location
     }
     $size = "{0:N1} MB" -f ((Get-Item $StableBin).Length / 1MB)
     Ok "Binary built: $StableBin ($size)"
+    Ok "Launcher built: $LauncherBin (windowless daemon starter)"
 }
 
 function Add-ToUserPath {
@@ -150,6 +161,11 @@ function Do-Uninstall {
         Write-Host "    git config --global --unset core.hooksPath"
     }
 
+    if (Test-Path $LauncherBin) {
+        # Remove it before the emptiness check below, or the leftover launcher
+        # keeps the bin dir alive after an uninstall.
+        Remove-Item -Force $LauncherBin -ErrorAction SilentlyContinue
+    }
     if (Test-Path $StableBin) {
         Remove-Item -Force $StableBin
         if ((Get-ChildItem -Path $StableDir -Force | Measure-Object).Count -eq 0) {

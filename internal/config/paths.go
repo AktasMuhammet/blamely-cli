@@ -18,6 +18,7 @@ const (
 	stateFileName       = "state.json"
 	hooksDirName        = "git-hooks"
 	logFileName         = "daemon.log"
+	updateLogFileName   = "update.log"
 	excludeFileName     = "exclude"
 	claudeDirName       = ".claude"
 	claudeSettings      = "settings.json"
@@ -127,6 +128,22 @@ func LogFile() (string, error) {
 		return "", err
 	}
 	return filepath.Join(d, logFileName), nil
+}
+
+// UpdateLogFile returns the path of the append-only update history: one line per
+// update ATTEMPT, successful or not.
+//
+// daemon.log is rotated and drowned in watcher chatter, and last-install.log
+// holds only the most recent install — so "when did this machine go from 1.8.1
+// to 1.8.2, and why did the auto-update stop working in March" had no answer
+// anywhere on disk. Auto-updates run unattended from the daemon, which is
+// exactly the case where nobody sees the error message.
+func UpdateLogFile() (string, error) {
+	d, err := BlamelyDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, updateLogFileName), nil
 }
 
 // ExcludeFile returns the path to the user's exclude list. Paths matching

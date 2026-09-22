@@ -149,6 +149,11 @@ func CopyBinary(src string) (string, error) {
 	// ad-hoc re-sign) so the daemon agent and git hook can launch it without a
 	// "Killed: 9". No-op on Linux/Windows. Best-effort — never block install.
 	_ = prepareInstalledBinary(dst)
+	// Bring the Windows windowless launcher along, if one shipped next to src.
+	// Runs after the binary is in place (a launcher is worthless without it),
+	// and is deliberately not fatal: the autostart entries fall back to the
+	// binary itself whenever the launcher is missing. No-op off Windows.
+	_ = syncLauncher(src, dst)
 	return dst, nil
 }
 
