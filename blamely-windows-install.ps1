@@ -345,6 +345,23 @@ function Download-And-Install {
         Unblock-File -LiteralPath $StableBin -ErrorAction SilentlyContinue
         Ok "Binary installed: $StableBin"
 
+        # blamelyw.exe - the windowless daemon launcher. `blamely install` points
+        # the autostart Scheduled Tasks at it instead of blamely.exe, because a
+        # task that launches a console binary gets a real console window: users
+        # saw a cmd window flash open and shut every 15 minutes when the keepalive
+        # task fired. The launcher is GUI-subsystem, so Windows never gives it
+        # one. It must land BEFORE `blamely install` runs, which is what registers
+        # those tasks. Optional: if a release did not bundle it, install falls back
+        # to blamely.exe and only the flashing window comes back.
+        $launcherSrc = Get-ChildItem -Path $tmpdir -Recurse -Filter 'blamelyw.exe' -File -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($launcherSrc) {
+            $launcherDst = Join-Path $StableDir 'blamelyw.exe'
+            Copy-Item -Path $launcherSrc.FullName -Destination $launcherDst -Force
+            Unblock-File -LiteralPath $launcherDst -ErrorAction SilentlyContinue
+            Ok "Launcher installed: $launcherDst"
+        }
+
         # If the release bundles sqlite3.exe, install it next to blamely.exe. The
         # VS Code / JetBrains plugins read the attribution DB through the sqlite3
         # CLI, and Windows ships none — co-locating it in the on-PATH,
