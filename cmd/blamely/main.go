@@ -129,6 +129,7 @@ func main() {
 	root.AddCommand(cmdAttribute())
 	root.AddCommand(cmdAttributeMerged())
 	root.AddCommand(cmdPostRewrite())
+	root.AddCommand(cmdSyncNotes())
 	root.AddCommand(cmdAuthorship())
 	root.AddCommand(cmdRecordDeletion())
 	root.AddCommand(cmdReport())
@@ -853,6 +854,43 @@ func cmdPostRewrite() *cobra.Command {
 			pairs := gitnotes.ParseRewritePairs(cmd.InOrStdin())
 			gitnotes.HandlePostRewrite(args[0], args[1], pairs)
 			return nil // best-effort by contract: never fail the user's rebase
+		},
+	}
+}
+
+func cmdSyncNotes() *cobra.Command {
+	return &cobra.Command{
+		Use: "sync-notes <repo> <remote> [<url>]",
+		// Hidden: called by the global pre-push hook (see
+		// internal/install/hookspath.go) with its remote name and URL, and
+		// git's pre-push stdin. Publishes each annotated commit's note in a
+		// notes commit carrying that commit's message, so servers that require
+		// an issue key in every commit message accept it.
+		Hidden: true,
+		Short:  "Internal: push attribution notes to a remote",
+		Args:   cobra.RangeArgs(2, 3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var info gitnotes.PrePushInfo
+			// Only read piped stdin (the hook's): a terminal would block forever.
+			if fi, err := os.Stdin.Stat(); err == nil && fi.Mode()&os.ModeCharDevice == 0 {
+				info = gitnotes.ParsePrePushStdin(cmd.InOrStdin())
+			}
+			url := ""
+			if len(args) == 3 {
+				url = args[2]
+			}
+			if err := gitnotes.SyncNotes(args[0], args[1], url, info.Tips); err != nil {
+				// Visible — silence is what once let a rejected notes push go
+				// unnoticed for good — but never fatal to the user's own push.
+				fmt.Fprintf(os.Stderr, "blamely: could not sync %s to %s - attribution stays local\n  %s\n",
+					gitnotes.NotesRef, args[1], strings.ReplaceAll(err.Error(), "\n", "\n  "))
+			}
+			if info.PushesNotesRef {
+				fmt.Fprintf(os.Stderr, "blamely: %s is published automatically on every push. Pushing it yourself\n"+
+					"  sends git's own notes commits, which servers requiring an issue key reject;\n"+
+					"  leave it out of the push (and out of remote.<name>.push).\n", gitnotes.NotesRef)
+			}
+			return nil // best-effort by contract
 		},
 	}
 }

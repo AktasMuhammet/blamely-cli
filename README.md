@@ -88,7 +88,7 @@ blamely stats          # deep single-commit view
 
 Attribution data lives in two places, both local:
 
-- **Git notes** at `refs/notes/blamely` — travels with the repo, shareable via `git push` (notes are not pushed by default; use `git push origin refs/notes/blamely` if you want them on the remote).
+- **Git notes** at `refs/notes/blamely` — travels with the repo. The global `pre-push` hook publishes it to the same remote on every `git push`, merging teammates' notes first — don't push `refs/notes/blamely` by hand.
 - **SQLite database** at `~/.blamely/db.sqlite` — raw edit events used to compute attribution.
 
 ## Commands
